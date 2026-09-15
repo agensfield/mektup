@@ -16,7 +16,7 @@ func TestBlockerUpsertIsOneMetadataRowPerCorrelation(t *testing.T) {
 	if err := j.UpsertBlocker(context.Background(), BlockerObservation{Method: "item/requestUserInput", CorrelationID: "req-1", SeenAt: first, EndpointID: "ep-1", ThreadID: "thread-1", OperationID: "op-1"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.UpsertBlocker(context.Background(), BlockerObservation{Method: "item/requestUserInput", CorrelationID: "req-1", SeenAt: last, ThreadID: "thread-1", MessageID: "msg-1"}); err != nil {
+	if err := j.UpsertBlocker(context.Background(), BlockerObservation{Method: "item/requestUserInput", CorrelationID: "req-1", SeenAt: last, EndpointID: "ep-1", ThreadID: "thread-1", MessageID: "msg-1"}); err != nil {
 		t.Fatal(err)
 	}
 	var count int

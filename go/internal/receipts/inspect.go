@@ -57,13 +57,10 @@ func (s Store) Inspect(ctx context.Context, target string, inspector TargetInspe
 	if err != nil {
 		return InspectResult{}, err
 	}
-	receipts, err := s.Journal.ListReceipts(ctx, journal.ReceiptQuery{Limit: limit})
+	receipts, err := s.Journal.ListReceipts(ctx, journal.ReceiptQuery{EndpointID: identity.EndpointID, ThreadID: identity.ThreadID, Limit: limit})
 	if err != nil {
 		return InspectResult{}, err
 	}
-	// The journal query itself is bounded. Filter only metadata identity fields
-	// and never hydrate transcript content as an inspection side effect.
-	receipts = filterRelatedReceipts(receipts, identity)
 	result := InspectResult{Target: identity, Receipts: receipts}
 	if options.Blockers {
 		result.Blockers, err = s.Journal.ListBlockers(ctx, journal.BlockerQuery{EndpointID: identity.EndpointID, ThreadID: identity.ThreadID, Limit: limit})
@@ -72,19 +69,4 @@ func (s Store) Inspect(ctx context.Context, target string, inspector TargetInspe
 		}
 	}
 	return result, nil
-}
-
-func filterRelatedReceipts(receipts []mektup.Receipt, identity TargetIdentity) []mektup.Receipt {
-	if identity.EndpointID == "" && identity.ThreadID == "" {
-		return receipts
-	}
-	out := make([]mektup.Receipt, 0, len(receipts))
-	for _, receipt := range receipts {
-		matchesSource := (identity.EndpointID == "" || receipt.Source.EndpointID == identity.EndpointID) && (identity.ThreadID == "" || receipt.Source.ThreadID == identity.ThreadID)
-		matchesTarget := (identity.EndpointID == "" || receipt.Target.EndpointID == identity.EndpointID) && (identity.ThreadID == "" || receipt.Target.ThreadID == identity.ThreadID)
-		if matchesSource || matchesTarget {
-			out = append(out, receipt)
-		}
-	}
-	return out
 }

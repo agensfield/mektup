@@ -23,9 +23,11 @@ var (
 // time. A zero limit uses the package default; values over the hard bound fail
 // instead of silently producing an incomplete answer.
 type ReceiptQuery struct {
-	State mektup.EvidenceState
-	Since time.Time
-	Limit int
+	State      mektup.EvidenceState
+	Since      time.Time
+	EndpointID string
+	ThreadID   string
+	Limit      int
 }
 
 func (q ReceiptQuery) limit() (int, error) {
@@ -61,10 +63,10 @@ func (j *Journal) PutReceipt(ctx context.Context, receipt mektup.Receipt) error 
 	if err != nil {
 		return err
 	}
-	_, err = j.db.ExecContext(ctx, `INSERT INTO receipts(receipt_id,operation_id,message_id,state,created_at,updated_at,document)
-VALUES(?,?,?,?,?,?,?)
-ON CONFLICT(receipt_id) DO UPDATE SET operation_id=excluded.operation_id,message_id=excluded.message_id,state=excluded.state,created_at=excluded.created_at,updated_at=excluded.updated_at,document=excluded.document`,
-		receipt.ReceiptID, receipt.OperationID, receipt.Message.MessageID, string(receipt.State), created.UnixNano(), updated.UnixNano(), string(document))
+	_, err = j.db.ExecContext(ctx, `INSERT INTO receipts(receipt_id,operation_id,message_id,state,created_at,updated_at,source_endpoint_id,source_thread_id,target_endpoint_id,target_thread_id,document)
+VALUES(?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(receipt_id) DO UPDATE SET operation_id=excluded.operation_id,message_id=excluded.message_id,state=excluded.state,created_at=excluded.created_at,updated_at=excluded.updated_at,source_endpoint_id=excluded.source_endpoint_id,source_thread_id=excluded.source_thread_id,target_endpoint_id=excluded.target_endpoint_id,target_thread_id=excluded.target_thread_id,document=excluded.document`,
+		receipt.ReceiptID, receipt.OperationID, receipt.Message.MessageID, string(receipt.State), created.UnixNano(), updated.UnixNano(), receipt.Source.EndpointID, receipt.Source.ThreadID, receipt.Target.EndpointID, receipt.Target.ThreadID, string(document))
 	return err
 }
 
@@ -134,6 +136,14 @@ func (j *Journal) ListReceipts(ctx context.Context, query ReceiptQuery) ([]mektu
 	if !query.Since.IsZero() {
 		where = append(where, "created_at>=?")
 		args = append(args, query.Since.UTC().UnixNano())
+	}
+	if query.EndpointID != "" {
+		where = append(where, "(source_endpoint_id=? OR target_endpoint_id=?)")
+		args = append(args, query.EndpointID, query.EndpointID)
+	}
+	if query.ThreadID != "" {
+		where = append(where, "(source_thread_id=? OR target_thread_id=?)")
+		args = append(args, query.ThreadID, query.ThreadID)
 	}
 	args = append(args, limit)
 	rows, err := j.db.QueryContext(ctx, `SELECT document FROM receipts WHERE `+strings.Join(where, " AND ")+` ORDER BY created_at DESC, receipt_id DESC LIMIT ?`, args...)

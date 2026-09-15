@@ -15,6 +15,7 @@ const MaxBlockerQueryLimit = 100
 type Blocker struct {
 	Method        string
 	CorrelationID string
+	Generation    string
 	FirstSeen     time.Time
 	LastSeen      time.Time
 	ResolvedAt    *time.Time
@@ -29,6 +30,7 @@ type Blocker struct {
 type BlockerObservation struct {
 	Method        string
 	CorrelationID string
+	Generation    string
 	SeenAt        time.Time
 	ResolvedAt    *time.Time
 	EndpointID    string
@@ -40,8 +42,8 @@ type BlockerObservation struct {
 }
 
 type BlockerQuery struct {
-	EndpointID, ThreadID, OperationID string
-	Limit                             int
+	EndpointID, Generation, ThreadID, OperationID string
+	Limit                                         int
 }
 
 func (q BlockerQuery) limit() (int, error) {
@@ -70,9 +72,9 @@ func (j *Journal) UpsertBlocker(ctx context.Context, observation BlockerObservat
 	if observation.ResolvedAt != nil {
 		resolved = observation.ResolvedAt.UTC().UnixNano()
 	}
-	_, err := j.db.ExecContext(ctx, `INSERT INTO blockers(method,correlation_id,first_seen,last_seen,resolved_at,endpoint_id,thread_id,turn_id,item_id,operation_id,message_id)
-VALUES(?,?,?,?,?,?,?,?,?,?,?)
-ON CONFLICT(method,correlation_id) DO UPDATE SET
+	_, err := j.db.ExecContext(ctx, `INSERT INTO blockers(method,correlation_id,generation,first_seen,last_seen,resolved_at,endpoint_id,thread_id,turn_id,item_id,operation_id,message_id)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+ON CONFLICT(endpoint_id,generation,method,correlation_id) DO UPDATE SET
  last_seen=CASE WHEN excluded.last_seen>blockers.last_seen THEN excluded.last_seen ELSE blockers.last_seen END,
  resolved_at=COALESCE(excluded.resolved_at,blockers.resolved_at),
  endpoint_id=CASE WHEN excluded.endpoint_id<>'' THEN excluded.endpoint_id ELSE blockers.endpoint_id END,
@@ -81,7 +83,7 @@ ON CONFLICT(method,correlation_id) DO UPDATE SET
  item_id=CASE WHEN excluded.item_id<>'' THEN excluded.item_id ELSE blockers.item_id END,
  operation_id=CASE WHEN excluded.operation_id<>'' THEN excluded.operation_id ELSE blockers.operation_id END,
  message_id=CASE WHEN excluded.message_id<>'' THEN excluded.message_id ELSE blockers.message_id END`,
-		observation.Method, observation.CorrelationID, seen.UnixNano(), seen.UnixNano(), resolved,
+		observation.Method, observation.CorrelationID, observation.Generation, seen.UnixNano(), seen.UnixNano(), resolved,
 		observation.EndpointID, observation.ThreadID, observation.TurnID, observation.ItemID, observation.OperationID, observation.MessageID)
 	return err
 }
@@ -97,6 +99,10 @@ func (j *Journal) ListBlockers(ctx context.Context, query BlockerQuery) ([]Block
 		where = append(where, "endpoint_id=?")
 		args = append(args, query.EndpointID)
 	}
+	if query.Generation != "" {
+		where = append(where, "generation=?")
+		args = append(args, query.Generation)
+	}
 	if query.ThreadID != "" {
 		where = append(where, "thread_id=?")
 		args = append(args, query.ThreadID)
@@ -106,7 +112,7 @@ func (j *Journal) ListBlockers(ctx context.Context, query BlockerQuery) ([]Block
 		args = append(args, query.OperationID)
 	}
 	args = append(args, limit)
-	rows, err := j.db.QueryContext(ctx, `SELECT method,correlation_id,first_seen,last_seen,resolved_at,endpoint_id,thread_id,turn_id,item_id,operation_id,message_id FROM blockers WHERE `+strings.Join(where, " AND ")+` ORDER BY last_seen DESC, method, correlation_id LIMIT ?`, args...)
+	rows, err := j.db.QueryContext(ctx, `SELECT method,correlation_id,generation,first_seen,last_seen,resolved_at,endpoint_id,thread_id,turn_id,item_id,operation_id,message_id FROM blockers WHERE `+strings.Join(where, " AND ")+` ORDER BY last_seen DESC, method, correlation_id LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -116,7 +122,7 @@ func (j *Journal) ListBlockers(ctx context.Context, query BlockerQuery) ([]Block
 		var b Blocker
 		var first, last int64
 		var resolved sql.NullInt64
-		if err := rows.Scan(&b.Method, &b.CorrelationID, &first, &last, &resolved, &b.EndpointID, &b.ThreadID, &b.TurnID, &b.ItemID, &b.OperationID, &b.MessageID); err != nil {
+		if err := rows.Scan(&b.Method, &b.CorrelationID, &b.Generation, &first, &last, &resolved, &b.EndpointID, &b.ThreadID, &b.TurnID, &b.ItemID, &b.OperationID, &b.MessageID); err != nil {
 			return nil, err
 		}
 		b.FirstSeen = time.Unix(0, first).UTC()
