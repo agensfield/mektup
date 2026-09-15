@@ -495,10 +495,11 @@ func TestOriginalResolverConflictsOnChangedReplyRoute(t *testing.T) {
 func TestVisibleItemRejectsMalformedPinnedShapes(t *testing.T) {
 	for _, raw := range []string{
 		`{"type":"userMessage","content":[]}`,
-		`{"id":"u","type":"userMessage","content":[]}`,
 		`{"id":"u","type":"userMessage","clientId":42,"content":[]}`,
 		`{"id":"u","type":"userMessage","content":["body"]}`,
 		`{"id":"u","type":"userMessage","clientId":null,"content":[{"type":"future"}]}`,
+		`{"id":"u","type":"userMessage","content":[{"type":"text","text":"body","text_elements":42}]}`,
+		`{"id":"u","type":"userMessage","content":[{"type":"image","url":"https://example.invalid/x","detail":42}]}`,
 	} {
 		if _, ok := visibleItem(json.RawMessage(raw), "thread-1", "turn-1", ""); ok {
 			t.Fatalf("malformed native item accepted: %s", raw)
@@ -507,6 +508,13 @@ func TestVisibleItemRejectsMalformedPinnedShapes(t *testing.T) {
 	valid, ok := visibleItem(json.RawMessage(`{"id":"u","type":"userMessage","clientId":"msg-1","text":"phantom","content":[{"type":"text","text":"body"}]}`), "thread-1", "turn-1", "")
 	if !ok || valid.NativeType != "userMessage" || valid.ClientMessageID != "msg-1" || valid.Text != "body" {
 		t.Fatalf("valid native user item rejected: %#v", valid)
+	}
+	omitted, ok := visibleItem(json.RawMessage(`{"id":"u","type":"userMessage","content":[{"type":"text","text":"body"}]}`), "thread-1", "turn-1", "")
+	if !ok || omitted.Text != "body" {
+		t.Fatalf("valid omitted clientId rejected: %#v", omitted)
+	}
+	if _, ok := visibleItem(json.RawMessage(`{"id":"u","type":"userMessage","content":[{"type":"image","url":"https://example.invalid/x","text":"phantom"}]}`), "thread-1", "turn-1", ""); ok {
+		t.Fatal("additive image text became authoritative user body")
 	}
 }
 

@@ -251,11 +251,7 @@ func validUserMessageShape(object map[string]json.RawMessage) bool {
 	if json.Unmarshal(content, &parts) != nil {
 		return false
 	}
-	client, present := object["clientId"]
-	if !present {
-		return false
-	}
-	if present && string(client) != "null" {
+	if client, present := object["clientId"]; present && string(client) != "null" {
 		var value string
 		if json.Unmarshal(client, &value) != nil {
 			return false
@@ -275,12 +271,21 @@ func validUserMessageShape(object map[string]json.RawMessage) bool {
 			if _, ok := requiredStringField(value, "text"); !ok {
 				return false
 			}
+			if !validTextElements(value) {
+				return false
+			}
 		case "image", "audio":
 			if _, ok := requiredStringField(value, "url"); !ok {
 				return false
 			}
+			if typ == "image" && !validImageDetail(value) {
+				return false
+			}
 		case "localImage", "localAudio":
 			if _, ok := requiredStringField(value, "path"); !ok {
+				return false
+			}
+			if typ == "localImage" && !validImageDetail(value) {
 				return false
 			}
 		case "skill":
@@ -304,6 +309,60 @@ func validUserMessageShape(object map[string]json.RawMessage) bool {
 	return true
 }
 
+func validImageDetail(object map[string]json.RawMessage) bool {
+	raw, ok := object["detail"]
+	if !ok || string(raw) == "null" {
+		return true
+	}
+	value := stringField(object, "detail")
+	switch value {
+	case "auto", "low", "high", "original":
+		return true
+	default:
+		return false
+	}
+}
+
+func validTextElements(object map[string]json.RawMessage) bool {
+	raw, ok := object["text_elements"]
+	if !ok {
+		return true
+	}
+	var elements []json.RawMessage
+	if json.Unmarshal(raw, &elements) != nil {
+		return false
+	}
+	for _, rawElement := range elements {
+		var element map[string]json.RawMessage
+		if json.Unmarshal(rawElement, &element) != nil {
+			return false
+		}
+		rangeRaw, ok := element["byteRange"]
+		if !ok {
+			return false
+		}
+		var byteRange map[string]json.RawMessage
+		if json.Unmarshal(rangeRaw, &byteRange) != nil || !validNonNegativeInteger(byteRange["start"]) || !validNonNegativeInteger(byteRange["end"]) {
+			return false
+		}
+		if placeholder, present := element["placeholder"]; present && string(placeholder) != "null" {
+			var value string
+			if json.Unmarshal(placeholder, &value) != nil {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validNonNegativeInteger(raw json.RawMessage) bool {
+	if len(raw) == 0 || string(raw) == "null" {
+		return false
+	}
+	var value uint64
+	return json.Unmarshal(raw, &value) == nil
+}
+
 func itemText(object map[string]json.RawMessage) string {
 	if stringField(object, "type") == "agentMessage" {
 		return stringField(object, "text")
@@ -314,13 +373,10 @@ func itemText(object map[string]json.RawMessage) string {
 		for _, part := range content {
 			var value map[string]json.RawMessage
 			if json.Unmarshal(part, &value) == nil {
-				if text := stringField(value, "text"); text != "" {
-					out.WriteString(text)
-				}
-			} else {
-				var text string
-				if json.Unmarshal(part, &text) == nil {
-					out.WriteString(text)
+				if stringField(value, "type") == "text" {
+					if text := stringField(value, "text"); text != "" {
+						out.WriteString(text)
+					}
 				}
 			}
 		}
