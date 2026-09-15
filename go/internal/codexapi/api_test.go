@@ -273,6 +273,16 @@ func TestInvalidCWDAndOutboundCursorRejectBeforeDispatch(t *testing.T) {
 	}
 }
 
+func TestReconcileHistoryCountsNestedItems(t *testing.T) {
+	item := `{"id":"i","type":"userMessage","content":[]}`
+	items := strings.TrimSuffix(strings.Repeat(item+",", MaxReconciliationItems+1), ",")
+	result := json.RawMessage(`{"data":[{"id":"turn","items":[` + items + `],"status":"completed","itemsView":"full"}]}`)
+	r := &recordingCaller{result: result}
+	if _, err := New(r, Options{}).ReconcileHistory(context.Background(), "thread"); !errors.Is(err, ErrPaginationExceeded) {
+		t.Fatalf("nested item budget was not enforced: %v", err)
+	}
+}
+
 func lifecycleFixture() json.RawMessage {
 	return json.RawMessage(`{"thread":{"id":"t","cliVersion":"x","createdAt":1,"cwd":"/tmp","ephemeral":false,"modelProvider":"openai","preview":"p","projectId":null,"sessionId":"s","source":"cli","status":{"type":"idle"},"turns":[],"updatedAt":1},"model":"m","modelProvider":"openai","cwd":"/tmp","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"workspace-write"}`)
 }
