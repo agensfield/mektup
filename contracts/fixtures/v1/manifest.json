@@ -18,6 +18,8 @@
     { "kind": "control", "schema": "mektup/control/v1", "path": "control-status-without-receipt.json" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-with-token.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-existing-with-token.invalid.json", "expected": "invalid" },
+    { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-existing-with-null-token.invalid.json", "expected": "invalid" },
+    { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-existing-with-null-lease.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-commit-without-token.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-heartbeat-without-lease.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-abandon-without-token.invalid.json", "expected": "invalid" }

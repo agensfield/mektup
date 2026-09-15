@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -65,6 +66,16 @@ func TestControlClaimExistingResultIsTokenless(t *testing.T) {
 	withToken := []byte(`{"schema":"mektup/control/v1","kind":"result","operation":"claim","operationId":"op_0198f0e0-0000-7000-8000-000000000013","replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007","originalMessageId":"msg_0198f0e0-0000-7000-8000-000000000003","custody":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","storeId":"store_0198f0e0-0000-7000-8000-000000000002"},"replyDestination":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","threadId":"thread-local-001"},"result":{"disposition":"existing","state":"reply_accepted","fencingToken":"owner-token"}}`)
 	if _, err := ValidateControlRequest(withToken); !errors.Is(err, ErrControlValidation) {
 		t.Fatalf("existing claim result with token accepted: %v", err)
+	}
+	for name, tampered := range map[string][]byte{
+		"null fencingToken": bytes.Replace(result, []byte(`"result":{"disposition"`), []byte(`"result":{"fencingToken":null,"disposition"`), 1),
+		"null lease":        bytes.Replace(result, []byte(`"result":{"disposition"`), []byte(`"result":{"lease":null,"disposition"`), 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ValidateControlRequest(tampered); !errors.Is(err, ErrControlValidation) {
+				t.Fatalf("existing claim result with explicit null accepted: %v", err)
+			}
+		})
 	}
 }
 

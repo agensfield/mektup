@@ -358,7 +358,10 @@ func (r ControlRequest) Validate() error {
 					return fmt.Errorf("%w: claimed result requires fencingToken and lease", ErrControlValidation)
 				}
 			case "existing":
-				if result.FencingToken != "" || result.Lease != nil {
+				if _, present := resultObject["fencingToken"]; present {
+					return fmt.Errorf("%w: existing result forbids fencingToken and lease", ErrControlValidation)
+				}
+				if _, present := resultObject["lease"]; present {
 					return fmt.Errorf("%w: existing result forbids fencingToken and lease", ErrControlValidation)
 				}
 				if len(result.Winner) > 0 && string(result.Winner) != "null" {
