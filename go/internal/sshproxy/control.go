@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	mektup "github.com/agensfield/mektup/go"
 )
 
 // ControlRequest is the metadata-only seam between SSH transport and the
@@ -371,32 +373,7 @@ func (r ControlRequest) Validate() error {
 }
 
 func validID(value, prefix string) bool {
-	// This mirrors the public mektup.ValidateID contract used by the
-	// integration branch. The appserver foundation branch intentionally does
-	// not yet contain that public package, so the transport keeps the same
-	// UUIDv7 shape locally until integration supplies the shared helper.
-	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+36 {
-		return false
-	}
-	uuid := value[len(prefix):]
-	for i, r := range uuid {
-		if i == 8 || i == 13 || i == 18 || i == 23 {
-			if r != '-' {
-				return false
-			}
-			continue
-		}
-		if i == 14 && r != '7' {
-			return false
-		}
-		if i == 19 && r != '8' && r != '9' && r != 'a' && r != 'b' {
-			return false
-		}
-		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
-			return false
-		}
-	}
-	return true
+	return mektup.ValidateID(value, prefix) == nil
 }
 
 func validTimestamp(value string) bool {
