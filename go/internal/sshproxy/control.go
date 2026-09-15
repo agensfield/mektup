@@ -1,6 +1,7 @@
 package sshproxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -85,6 +86,9 @@ func ValidateControlRequest(data []byte) (ControlRequest, error) {
 			return ControlRequest{}, fmt.Errorf("%w: field %q is not permitted", ErrControlValidation, forbidden)
 		}
 	}
+	if err := validateKnownFields(raw); err != nil {
+		return ControlRequest{}, err
+	}
 	var req ControlRequest
 	if err := json.Unmarshal(data, &req); err != nil {
 		return ControlRequest{}, fmt.Errorf("%w: %v", ErrControlValidation, err)
@@ -93,11 +97,83 @@ func ValidateControlRequest(data []byte) (ControlRequest, error) {
 		return ControlRequest{}, err
 	}
 	if req.Kind == "request" && req.Operation == "claim" {
-		if _, present := raw["lease"]; present {
-			return ControlRequest{}, fmt.Errorf("%w: claim cannot contain lease, including null", ErrControlValidation)
+		for _, field := range []string{"lease", "fencingToken"} {
+			if _, present := raw[field]; present {
+				return ControlRequest{}, fmt.Errorf("%w: claim cannot contain %s, including null", ErrControlValidation, field)
+			}
+		}
+	}
+	if req.Kind == "request" && (req.Operation == "heartbeat" || req.Operation == "commit" || req.Operation == "abandon") {
+		if _, present := raw["requestedLease"]; present {
+			return ControlRequest{}, fmt.Errorf("%w: %s cannot contain requestedLease, including null", ErrControlValidation, req.Operation)
+		}
+	}
+	if req.Kind == "result" {
+		for _, field := range []string{"lease", "fencingToken"} {
+			if _, present := raw[field]; present {
+				return ControlRequest{}, fmt.Errorf("%w: result cannot contain top-level %s", ErrControlValidation, field)
+			}
 		}
 	}
 	return req, nil
+}
+
+func validateKnownFields(raw map[string]json.RawMessage) error {
+	for _, field := range []string{"bodySha256", "replyStatus", "replyErrorCode", "fencingToken", "attemptOwner", "requestedAt"} {
+		value, present := raw[field]
+		if !present {
+			continue
+		}
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("%w: known field %s cannot be null", ErrControlValidation, field)
+		}
+		var textValue string
+		if err := json.Unmarshal(value, &textValue); err != nil || textValue == "" {
+			return fmt.Errorf("%w: known field %s must be a nonempty string", ErrControlValidation, field)
+		}
+		switch field {
+		case "bodySha256":
+			if !validSHA256(textValue) {
+				return fmt.Errorf("%w: bodySha256 must be sha256:<64 lowercase hex>", ErrControlValidation)
+			}
+		case "replyStatus":
+			if textValue != "success" && textValue != "error" {
+				return fmt.Errorf("%w: invalid reply status", ErrControlValidation)
+			}
+		case "requestedAt":
+			if !validTimestamp(textValue) {
+				return fmt.Errorf("%w: invalid requestedAt timestamp", ErrControlValidation)
+			}
+		}
+	}
+	if value, present := raw["bodyBytes"]; present {
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("%w: bodyBytes cannot be null", ErrControlValidation)
+		}
+		var number int64
+		if err := json.Unmarshal(value, &number); err != nil || number < 0 {
+			return fmt.Errorf("%w: bodyBytes must be a nonnegative integer", ErrControlValidation)
+		}
+	}
+	if value, present := raw["requestedLease"]; present {
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("%w: requestedLease cannot be null", ErrControlValidation)
+		}
+		var lease LeaseRequest
+		if err := json.Unmarshal(value, &lease); err != nil || lease.DurationMS <= 0 {
+			return fmt.Errorf("%w: requestedLease must contain a positive durationMs", ErrControlValidation)
+		}
+	}
+	if value, present := raw["lease"]; present {
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return fmt.Errorf("%w: lease cannot be null", ErrControlValidation)
+		}
+		var lease Lease
+		if err := json.Unmarshal(value, &lease); err != nil || !lease.valid() {
+			return fmt.Errorf("%w: invalid lease", ErrControlValidation)
+		}
+	}
+	return nil
 }
 
 func (r ControlRequest) Validate() error {
@@ -133,6 +209,12 @@ func (r ControlRequest) Validate() error {
 	}
 	if r.RequestedLease != nil && r.RequestedLease.DurationMS <= 0 {
 		return fmt.Errorf("%w: requested lease must be positive", ErrControlValidation)
+	}
+	if r.BodySHA256 != "" && !validSHA256(r.BodySHA256) {
+		return fmt.Errorf("%w: bodySha256 must be sha256:<64 lowercase hex>", ErrControlValidation)
+	}
+	if r.ReplyStatus != "" && r.ReplyStatus != "success" && r.ReplyStatus != "error" {
+		return fmt.Errorf("%w: invalid reply status", ErrControlValidation)
 	}
 	if r.Operation != "claim" && r.Operation != "status" && r.Operation != "reconcile" && r.RequestedLease != nil {
 		return fmt.Errorf("%w: %s cannot contain requestedLease", ErrControlValidation, r.Operation)
@@ -178,12 +260,6 @@ func (r ControlRequest) Validate() error {
 			}
 		}
 	case "status", "reconcile":
-	}
-	if r.BodySHA256 != "" && !validSHA256(r.BodySHA256) {
-		return fmt.Errorf("%w: bodySha256 must be sha256:<64 lowercase hex>", ErrControlValidation)
-	}
-	if r.ReplyStatus != "" && r.ReplyStatus != "success" && r.ReplyStatus != "error" {
-		return fmt.Errorf("%w: invalid reply status", ErrControlValidation)
 	}
 	return nil
 }

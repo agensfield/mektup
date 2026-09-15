@@ -57,6 +57,50 @@ func TestControlV1Fixtures(t *testing.T) {
 	}
 }
 
+func TestControlKnownFieldPresenceAndResultShapes(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{name: "claim-fencing-token-null", mutate: func(raw map[string]any) { raw["fencingToken"] = nil }},
+		{name: "commit-requested-lease-null", mutate: func(raw map[string]any) {
+			raw["operation"] = "commit"
+			raw["fencingToken"] = "fence"
+			raw["lease"] = map[string]any{"expiresAt": "2026-09-15T03:00:31.900000Z"}
+			raw["requestedLease"] = nil
+		}},
+		{name: "result-bodySha256-invalid", mutate: func(raw map[string]any) {
+			raw["kind"] = "result"
+			raw["bodySha256"] = "invalid"
+			raw["result"] = map[string]any{"fencingToken": "fence", "lease": map[string]any{"expiresAt": "2026-09-15T03:00:31.900000Z"}}
+		}},
+		{name: "result-replyStatus-invalid", mutate: func(raw map[string]any) {
+			raw["kind"] = "result"
+			raw["replyStatus"] = "invalid"
+			raw["result"] = map[string]any{"fencingToken": "fence", "lease": map[string]any{"expiresAt": "2026-09-15T03:00:31.900000Z"}}
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			rawBytes, err := json.Marshal(validControlRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var raw map[string]any
+			if err := json.Unmarshal(rawBytes, &raw); err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(raw)
+			rawBytes, err = json.Marshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ValidateControlRequest(rawBytes); !errors.Is(err, ErrControlValidation) {
+				t.Fatalf("accepted known invalid shape: %v", err)
+			}
+		})
+	}
+}
+
 func mustJSON(t *testing.T, value ControlRequest) []byte {
 	t.Helper()
 	data, err := json.Marshal(value)

@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -74,6 +75,16 @@ func (p *fakeProcess) releaseWait() { p.releaseOnce.Do(func() { close(p.waitRele
 type fakeFactory struct {
 	process *fakeProcess
 	argv    []string
+}
+
+type waitCountingProcess struct {
+	*fakeProcess
+	waits atomic.Int32
+}
+
+func (p *waitCountingProcess) Wait() error {
+	p.waits.Add(1)
+	return p.fakeProcess.Wait()
 }
 
 func (f *fakeFactory) New(argv []string) (Process, error) {

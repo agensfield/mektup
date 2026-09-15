@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func validControlRequest() ControlRequest {
@@ -127,4 +129,25 @@ func TestInvokeControlRejectsSwappedResponseIdentity(t *testing.T) {
 	if !errors.As(err, &failure) || failure.Kind != FailureProxy || failure.Evidence != WriteComplete || !errors.Is(err, ErrControlValidation) {
 		t.Fatalf("swapped response error = %T %+v", err, err)
 	}
+}
+
+func TestInvokeControlEarlyFailuresStillReapChild(t *testing.T) {
+	t.Run("short-write", func(t *testing.T) {
+		process := &waitCountingProcess{fakeProcess: newFakeProcess()}
+		process.stdinOverride = shortWriter{}
+		_, err := InvokeControl(context.Background(), Config{Host: "remote", CleanupTimeout: 20 * time.Millisecond}, validControlRequest(), ProcessFactoryFunc(func([]string) (Process, error) { return process, nil }), nil)
+		if !errors.Is(err, io.ErrShortWrite) || process.waits.Load() != 1 {
+			t.Fatalf("err=%v waits=%d", err, process.waits.Load())
+		}
+	})
+	t.Run("encode-failure", func(t *testing.T) {
+		process := &waitCountingProcess{fakeProcess: newFakeProcess()}
+		request := validControlRequest()
+		request.Operation = "status"
+		request.Result = json.RawMessage("{")
+		_, err := InvokeControl(context.Background(), Config{Host: "remote", CleanupTimeout: 20 * time.Millisecond}, request, ProcessFactoryFunc(func([]string) (Process, error) { return process, nil }), nil)
+		if err == nil || process.waits.Load() != 1 {
+			t.Fatalf("err=%v waits=%d", err, process.waits.Load())
+		}
+	})
 }

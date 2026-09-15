@@ -313,6 +313,10 @@ func (c *child) close() error {
 		var result error
 		_ = c.stdin.Close()
 		_ = c.stdout.Close()
+		// An early caller failure may happen before a proxy/control reader is
+		// installed. Closing stdout is the intentional abort of that stream;
+		// release the Wait gate so the child is still reaped.
+		c.markStdoutDone()
 		_ = c.stderr.Close()
 		if err := c.process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			result = err
