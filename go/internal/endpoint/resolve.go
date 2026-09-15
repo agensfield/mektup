@@ -38,6 +38,21 @@ func (s EndpointStore) ResolveEndpoint(selector, codexHome string) (Endpoint, er
 	return Endpoint{}, fmt.Errorf("%w: %s", ErrEndpointNotFound, selector)
 }
 
+// ResolveEndpointID resolves a portable stable endpoint identity without
+// treating an alias as authority. Built-in identities are looked up from the
+// owner-private identity registry; configured endpoints are matched by ID.
+func (s EndpointStore) ResolveEndpointID(id, codexHome string) (Endpoint, error) {
+	if id == "" {
+		return Endpoint{}, ErrEndpointNotFound
+	}
+	if builtin, ok, err := s.builtinByID(id); err != nil {
+		return Endpoint{}, err
+	} else if ok {
+		return builtin, nil
+	}
+	return s.ResolveEndpoint(id, codexHome)
+}
+
 // ResolveDestination resolves only the destination selector. It does not
 // inspect CODEX_THREAD_ID and cannot accidentally rebind source identity when
 // the caller supplies an endpoint override.

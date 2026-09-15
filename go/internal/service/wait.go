@@ -62,7 +62,7 @@ func (s *Service) Wait(ctx context.Context, req WaitRequest) (WaitResult, error)
 	if s.Observe == nil {
 		return s.pollCustody(ctx, status)
 	}
-	pinnedTarget := ResolvedTarget{EndpointID: status.ReplyEndpointID, URI: pinnedRoute, ThreadID: pinnedThread, Loaded: true}
+	pinnedTarget := ResolvedTarget{EndpointID: status.ReplyEndpointID, URI: pinnedRoute, ThreadID: pinnedThread, Loaded: true, Persistent: true}
 	if pinnedTarget.EndpointID == "" {
 		pinnedTarget.EndpointID = status.SourceEndpointID
 	}

@@ -14,6 +14,11 @@ type OriginalMessage struct {
 	CurrentThread string
 }
 
+// ErrOriginalIdentityConflict means exact lookup found more than one
+// materially different valid envelope for the requested identity. Callers
+// must not choose a fuzzy or ranked candidate.
+var ErrOriginalIdentityConflict = errors.New("service: original message identity conflict")
+
 // OriginalResolver is deliberately separate from endpoint resolution. It may
 // use current history, a local receipt, or an explicitly imported receipt, but
 // it must prove that the envelope addresses the current thread.
@@ -66,6 +71,9 @@ func (s *Service) Reply(ctx context.Context, resolver OriginalResolver, req Repl
 
 	original, err := resolver.ResolveOriginal(ctx, req.Reference)
 	if err != nil {
+		if errors.Is(err, ErrOriginalIdentityConflict) {
+			return ReplyResult{}, semantic(mektup.ErrMessageIdentityConflict, "original message identity is ambiguous", nil, err)
+		}
 		return ReplyResult{}, semantic(mektup.ErrMessageNotFound, "original message could not be resolved", nil, err)
 	}
 	if err := original.Envelope.Validate(); err != nil {
