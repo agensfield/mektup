@@ -311,8 +311,11 @@ func validUserMessageShape(object map[string]json.RawMessage) bool {
 
 func validImageDetail(object map[string]json.RawMessage) bool {
 	raw, ok := object["detail"]
-	if !ok || string(raw) == "null" {
+	if !ok {
 		return true
+	}
+	if string(raw) == "null" {
+		return false
 	}
 	value := stringField(object, "detail")
 	switch value {
@@ -327,6 +330,9 @@ func validTextElements(object map[string]json.RawMessage) bool {
 	raw, ok := object["text_elements"]
 	if !ok {
 		return true
+	}
+	if string(raw) == "null" {
+		return false
 	}
 	var elements []json.RawMessage
 	if json.Unmarshal(raw, &elements) != nil {
@@ -345,7 +351,11 @@ func validTextElements(object map[string]json.RawMessage) bool {
 		if json.Unmarshal(rangeRaw, &byteRange) != nil || !validNonNegativeInteger(byteRange["start"]) || !validNonNegativeInteger(byteRange["end"]) {
 			return false
 		}
-		if placeholder, present := element["placeholder"]; present && string(placeholder) != "null" {
+		placeholder, present := element["placeholder"]
+		if !present {
+			return false
+		}
+		if string(placeholder) != "null" {
 			var value string
 			if json.Unmarshal(placeholder, &value) != nil {
 				return false

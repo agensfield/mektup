@@ -499,7 +499,10 @@ func TestVisibleItemRejectsMalformedPinnedShapes(t *testing.T) {
 		`{"id":"u","type":"userMessage","content":["body"]}`,
 		`{"id":"u","type":"userMessage","clientId":null,"content":[{"type":"future"}]}`,
 		`{"id":"u","type":"userMessage","content":[{"type":"text","text":"body","text_elements":42}]}`,
+		`{"id":"u","type":"userMessage","content":[{"type":"text","text":"body","text_elements":[{"byteRange":{"start":0,"end":4}}]}]}`,
+		`{"id":"u","type":"userMessage","content":[{"type":"text","text":"body","text_elements":null}]}`,
 		`{"id":"u","type":"userMessage","content":[{"type":"image","url":"https://example.invalid/x","detail":42}]}`,
+		`{"id":"u","type":"userMessage","content":[{"type":"image","url":"https://example.invalid/x","detail":null}]}`,
 	} {
 		if _, ok := visibleItem(json.RawMessage(raw), "thread-1", "turn-1", ""); ok {
 			t.Fatalf("malformed native item accepted: %s", raw)
