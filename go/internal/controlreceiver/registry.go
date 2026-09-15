@@ -92,13 +92,20 @@ func (r FileRegistry) Resolve(ctx context.Context, endpointID, storeID string) (
 			return Store{}, fmt.Errorf("%w: registered state directory unavailable", ErrStoreUnavailable)
 		}
 		dbPath := filepath.Join(entry.StateDir, "journal.sqlite3")
-		dbInfo, statErr := os.Lstat(dbPath)
-		if statErr != nil || !dbInfo.Mode().IsRegular() || dbInfo.Mode().Perm()&0077 != 0 {
-			return Store{}, fmt.Errorf("%w: registered journal database does not exist privately", ErrStoreUnavailable)
+		dbFile, identity, err := openExistingDatabase(dbPath)
+		if err != nil {
+			return Store{}, err
 		}
 		j, err := journal.Open(ctx, journal.Options{StateDir: entry.StateDir})
 		if err != nil {
+			_ = dbFile.Close()
 			return Store{}, fmt.Errorf("%w: open registered journal: %v", ErrStoreUnavailable, err)
+		}
+		_ = dbFile.Close()
+		currentIdentity, identityErr := existingDatabaseIdentity(dbPath)
+		if identityErr != nil || currentIdentity != identity {
+			_ = j.Close()
+			return Store{}, fmt.Errorf("%w: registered journal was replaced during open", ErrStoreUnavailable)
 		}
 		canonical, err := j.ResolveStoreID(ctx, storeID)
 		if err != nil || canonical != j.StoreID() {

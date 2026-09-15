@@ -139,6 +139,37 @@ func TestControlKnownFieldPresenceAndResultShapes(t *testing.T) {
 	}
 }
 
+func TestClaimResultUnionPresenceRules(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		result map[string]any
+	}{
+		{name: "existing-null-token", result: map[string]any{"disposition": "existing", "state": "reply_accepted", "fencingToken": nil}},
+		{name: "existing-empty-lease", result: map[string]any{"disposition": "existing", "state": "reply_accepted", "lease": map[string]any{}}},
+		{name: "claimed-null-token", result: map[string]any{"disposition": "claimed", "state": "reply_dispatch_claimed", "fencingToken": nil, "lease": map[string]any{"expiresAt": "2026-09-15T03:00:31.900000Z"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			raw, err := json.Marshal(validControlRequest())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var object map[string]any
+			if err := json.Unmarshal(raw, &object); err != nil {
+				t.Fatal(err)
+			}
+			object["kind"] = "result"
+			object["result"] = test.result
+			raw, err = json.Marshal(object)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ValidateControlRequest(raw); !errors.Is(err, ErrControlValidation) {
+				t.Fatalf("accepted invalid union: %v", err)
+			}
+		})
+	}
+}
+
 func TestURIWhitespaceMatchesSchemaWhitespaceClass(t *testing.T) {
 	for _, whitespace := range []string{"\f", "\v"} {
 		t.Run(whitespace, func(t *testing.T) {

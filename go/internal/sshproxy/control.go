@@ -341,6 +341,10 @@ func (r ControlRequest) Validate() error {
 			return fmt.Errorf("%w: result must be an object", ErrControlValidation)
 		}
 		if r.Operation == "claim" {
+			var resultObject map[string]json.RawMessage
+			if err := json.Unmarshal(r.Result, &resultObject); err != nil || resultObject == nil {
+				return fmt.Errorf("%w: claim result must be an object", ErrControlValidation)
+			}
 			var result struct {
 				Disposition  string          `json:"disposition"`
 				State        string          `json:"state"`

@@ -9,6 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/agensfield/mektup/go/internal/journal"
@@ -127,11 +130,31 @@ func (r Receiver) Receive(ctx context.Context, data []byte) ([]byte, error) {
 }
 
 func validateOriginal(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) error {
+	if err := validateDestinationThread(req); err != nil {
+		return err
+	}
 	op, err := j.OperationByMessage(ctx, req.OriginalMessageID)
 	if err != nil {
 		return fmt.Errorf("%w: original operation unavailable: %v", ErrRelationshipMismatch, err)
 	}
 	if op.CustodyRoute != req.Custody.EndpointID || op.CustodyStoreID != storeID || op.ReplyRoute == "" || op.ReplyRoute != req.ReplyDestination.URI {
+		return ErrRelationshipMismatch
+	}
+	return nil
+}
+
+func validateDestinationThread(req sshproxy.ControlRequest) error {
+	u, err := url.Parse(req.ReplyDestination.URI)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ErrRelationshipMismatch
+	}
+	segment, err := url.PathUnescape(path.Base(strings.TrimSuffix(u.Path, "/")))
+	if err != nil || segment == "." || segment == "/" || segment == "" {
+		return ErrRelationshipMismatch
+	}
+	// Existing local fixtures use the presentation form thread-<id>; Codex
+	// URIs normally carry the raw thread ID as their final path segment.
+	if req.ReplyDestination.ThreadID != segment && req.ReplyDestination.ThreadID != "thread-"+segment {
 		return ErrRelationshipMismatch
 	}
 	return nil

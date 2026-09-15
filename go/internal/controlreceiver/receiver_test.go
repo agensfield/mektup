@@ -169,6 +169,17 @@ func TestReceiverRejectsWrongStoreRouteAndConflict(t *testing.T) {
 	}
 }
 
+func TestReceiverRejectsWrongThreadForMatchingDestination(t *testing.T) {
+	j, state := openReceiverJournal(t, time.Minute)
+	prepareOriginal(t, j)
+	receiver := Receiver{Registry: makeRegistry(t, state, j.StoreID()), LocalEndpointID: receiverEndpoint}
+	wrong := request(j)
+	wrong.ReplyDestination.ThreadID = "thread-other"
+	if _, err := receiver.Receive(context.Background(), mustMarshal(t, wrong)); !errors.Is(err, ErrRelationshipMismatch) {
+		t.Fatalf("wrong thread err = %v", err)
+	}
+}
+
 func TestReceiverExpiredTokenAndUnknownStatus(t *testing.T) {
 	now := atomic.Int64{}
 	now.Store(time.Now().UnixNano())
