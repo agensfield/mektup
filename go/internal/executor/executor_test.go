@@ -308,6 +308,19 @@ func TestEmptyInlineParamsAreRejectedBeforeRPC(t *testing.T) {
 	}
 }
 
+func TestExplicitRPCOutputRequiresArtifactPort(t *testing.T) {
+	rpc := &fakeRPC{}
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}, RPC: rpc, Receipts: &fakeReceipts{}})
+	i := invocation("rpc", "thread/list")
+	i.Options["output"] = []string{"/tmp/response.json"}
+	if _, err := e.Execute(context.Background(), i); err == nil {
+		t.Fatal("explicit RPC output was silently ignored")
+	}
+	if rpc.count != 0 {
+		t.Fatalf("RPC dispatched without artifact port: %d", rpc.count)
+	}
+}
+
 func TestMutationDoesNotRunWithoutReceiptJournal(t *testing.T) {
 	connections := &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}
 	endpoints := &fakeEndpoints{}

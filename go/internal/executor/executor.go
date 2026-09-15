@@ -476,6 +476,9 @@ func (e *Executor) rpc(ctx context.Context, inv cli.Invocation) (cli.ExecutionRe
 	}
 	defer conn.Close()
 	var output rawrpc.OutputOptions
+	if (has(inv, "output") || has(inv, "force")) && e.ports.Artifacts == nil {
+		return cli.ExecutionResult{}, missing("artifact")
+	}
 	if e.ports.Artifacts != nil {
 		output, err = e.ports.Artifacts.RPCOutput(ctx, inv)
 		if err != nil {
@@ -522,6 +525,9 @@ func (e *Executor) params(ctx context.Context, inv cli.Invocation) (json.RawMess
 		return json.RawMessage(value), rawrpc.ParamsInline, nil
 	}
 	if has(inv, "params-file") {
+		if strings.TrimSpace(inv.Option("params-file")) == "" {
+			return nil, "", usage("--params-file requires a path")
+		}
 		if e.ports.Input == nil {
 			return nil, "", missing("input")
 		}
