@@ -783,6 +783,90 @@ func TestV3PartialUpgradeIsCompletedIdempotently(t *testing.T) {
 	}
 }
 
+func TestV4MissingEvidenceFailsClosed(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	if err := j.MarkDispatchStarted(context.Background(), "op-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordAccepted(context.Background(), "op-1", "durable-reference"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("DROP TABLE operation_acceptances"); err != nil {
+		t.Fatal(err)
+	}
+	dir = j.StateDir()
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if k, err := Open(context.Background(), Options{StateDir: dir}); err == nil {
+		k.Close()
+		t.Fatal("v4 missing evidence table was recreated")
+	} else if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("missing schema error: %v", err)
+	}
+}
+
+func TestV3PositiveReconciliationRepairPreservesWinner(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	in := claimInput()
+	in.ReplyID = "old-observed"
+	old, err := j.ClaimReply(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.AbandonReply(context.Background(), old.ReplyID, old.Owner, old.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.ReconcileReplyObservation(context.Background(), old.ReplyID, "old-native", old.Digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("DELETE FROM reply_winners WHERE original_id=?", old.OriginalID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("UPDATE reply_claims SET accepted_at=NULL,commit_seq=NULL WHERE reply_id=?", old.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("PRAGMA user_version=3"); err != nil {
+		t.Fatal(err)
+	}
+	dir = j.StateDir()
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	k, err := Open(context.Background(), Options{StateDir: dir, Now: func() time.Time { return time.Unix(0, now.Load()) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer k.Close()
+	if err := k.ReconcileReplyObservation(context.Background(), old.ReplyID, "old-native", old.Digest); err != nil {
+		t.Fatal(err)
+	}
+	next := claimInput()
+	next.ReplyID = "new-accepted"
+	c, err := k.ClaimReply(context.Background(), next)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.CommitReply(context.Background(), c.ReplyID, c.Owner, c.Token); err != nil {
+		t.Fatal(err)
+	}
+	got, err := k.Wait(context.Background(), old.OriginalID, time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ReplyID != old.ReplyID {
+		t.Fatalf("repaired winner displaced by %s", got.ReplyID)
+	}
+}
+
 func TestMetadataNeverStoresBodies(t *testing.T) {
 	dir := t.TempDir()
 	var now atomic.Int64
