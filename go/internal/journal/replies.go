@@ -9,40 +9,42 @@ import (
 )
 
 type ReplyClaim struct {
-	ReplyID      string
-	OriginalID   string
-	Digest       string
-	BodySize     int64
-	Status       string
-	ReplyRoute   string
-	CustodyRoute string
-	Owner        string
-	Token        string
-	LeaseUntil   int64
-	State        EvidenceState
-	CreatedAt    int64
-	UpdatedAt    int64
-	AcceptedAt   int64
-	CommitSeq    int64
-	Joined       bool
-	Won          bool
+	ReplyID        string
+	OriginalID     string
+	Digest         string
+	BodySize       int64
+	Status         string
+	ReplyRoute     string
+	CustodyRoute   string
+	CustodyStoreID string
+	Owner          string
+	Token          string
+	LeaseUntil     int64
+	State          EvidenceState
+	CreatedAt      int64
+	UpdatedAt      int64
+	AcceptedAt     int64
+	CommitSeq      int64
+	Joined         bool
+	Won            bool
 }
 
 // ClaimInput is the complete identity fence. Every field is compared for a
 // duplicate reply ID, including routes and terminal status.
 type ClaimInput struct {
-	ReplyID      string
-	OriginalID   string
-	Digest       string
-	BodySize     int64
-	Status       string
-	ReplyRoute   string
-	CustodyRoute string
-	Owner        string
+	ReplyID        string
+	OriginalID     string
+	Digest         string
+	BodySize       int64
+	Status         string
+	ReplyRoute     string
+	CustodyRoute   string
+	CustodyStoreID string
+	Owner          string
 }
 
 func (in ClaimInput) valid() bool {
-	return in.ReplyID != "" && in.OriginalID != "" && in.Digest != "" && in.BodySize >= 0 && (in.Status == "success" || in.Status == "error") && in.ReplyRoute != "" && in.CustodyRoute != "" && in.Owner != ""
+	return in.ReplyID != "" && in.OriginalID != "" && in.Digest != "" && in.BodySize >= 0 && (in.Status == "success" || in.Status == "error") && in.ReplyRoute != "" && in.CustodyRoute != "" && in.CustodyStoreID != "" && in.Owner != ""
 }
 
 // ClaimReply atomically fences one reply ID before a body write. Identical
@@ -52,17 +54,19 @@ func (j *Journal) ClaimReply(ctx context.Context, in ClaimInput) (ReplyClaim, er
 	if !in.valid() {
 		return ReplyClaim{}, fmt.Errorf("journal: invalid reply claim")
 	}
-	now := j.nowUnix()
 	var out ReplyClaim
+	expired := false
 	err := j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
 		var existing ReplyClaim
-		err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", in.ReplyID), &existing)
+		err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", in.ReplyID), &existing)
 		if err == nil {
-			if existing.OriginalID != in.OriginalID || existing.Digest != in.Digest || existing.BodySize != in.BodySize || existing.Status != in.Status || existing.ReplyRoute != in.ReplyRoute || existing.CustodyRoute != in.CustodyRoute {
+			if existing.OriginalID != in.OriginalID || existing.Digest != in.Digest || existing.BodySize != in.BodySize || existing.Status != in.Status || existing.ReplyRoute != in.ReplyRoute || existing.CustodyRoute != in.CustodyRoute || existing.CustodyStoreID != in.CustodyStoreID {
 				return ErrIdentityConflict
 			}
 			if existing.State == StateReplyAccepted || existing.State == StateReplyObserved {
 				existing.Joined = true
+				existing.Token = ""
 				out = existing
 				return nil
 			}
@@ -76,10 +80,13 @@ func (j *Journal) ClaimReply(ctx context.Context, in ClaimInput) (ReplyClaim, er
 				}
 				existing.State = StateReplyOutcomeUnknown
 				existing.UpdatedAt = now
+				existing.Token = ""
 				out = existing
-				return ErrClaimExpired
+				expired = true
+				return nil
 			}
 			existing.Joined = true
+			existing.Token = ""
 			out = existing
 			return nil
 		}
@@ -88,28 +95,34 @@ func (j *Journal) ClaimReply(ctx context.Context, in ClaimInput) (ReplyClaim, er
 		}
 		// The original request relationship is established by Prepare. A reply
 		// receiver cannot introduce an arbitrary relationship through control.
-		var one int
-		if err := tx.QueryRow("SELECT 1 FROM operations WHERE message_id=? LIMIT 1", in.OriginalID).Scan(&one); err != nil {
+		var originalReplyRoute, originalCustodyRoute, originalStoreID string
+		if err := tx.QueryRow("SELECT reply_route,custody_route,custody_store_id FROM operations WHERE message_id=?", in.OriginalID).Scan(&originalReplyRoute, &originalCustodyRoute, &originalStoreID); err != nil {
 			if err == sql.ErrNoRows {
 				return ErrNotFound
 			}
 			return err
+		}
+		if originalReplyRoute != in.ReplyRoute || originalCustodyRoute != in.CustodyRoute || originalStoreID != in.CustodyStoreID {
+			return ErrIdentityConflict
 		}
 		token, err := randomToken()
 		if err != nil {
 			return err
 		}
 		lease := now + j.leaseDuration.Nanoseconds()
-		_, err = tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,owner,token,lease_until,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", in.ReplyID, in.OriginalID, in.Digest, in.BodySize, in.Status, in.ReplyRoute, in.CustodyRoute, in.Owner, token, lease, string(StateReplyClaimed), now, now)
+		_, err = tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", in.ReplyID, in.OriginalID, in.Digest, in.BodySize, in.Status, in.ReplyRoute, in.CustodyRoute, in.CustodyStoreID, in.Owner, token, lease, string(StateReplyClaimed), now, now)
 		if err != nil {
 			return err
 		}
 		if err = emit(tx, "reply.claimed", "", in.ReplyID, StateReplyClaimed, now); err != nil {
 			return err
 		}
-		out = ReplyClaim{ReplyID: in.ReplyID, OriginalID: in.OriginalID, Digest: in.Digest, BodySize: in.BodySize, Status: in.Status, ReplyRoute: in.ReplyRoute, CustodyRoute: in.CustodyRoute, Owner: in.Owner, Token: token, LeaseUntil: lease, State: StateReplyClaimed, CreatedAt: now, UpdatedAt: now}
+		out = ReplyClaim{ReplyID: in.ReplyID, OriginalID: in.OriginalID, Digest: in.Digest, BodySize: in.BodySize, Status: in.Status, ReplyRoute: in.ReplyRoute, CustodyRoute: in.CustodyRoute, CustodyStoreID: in.CustodyStoreID, Owner: in.Owner, Token: token, LeaseUntil: lease, State: StateReplyClaimed, CreatedAt: now, UpdatedAt: now}
 		return nil
 	})
+	if err == nil && expired {
+		return out, ErrClaimExpired
+	}
 	return out, err
 }
 
@@ -122,9 +135,9 @@ func randomToken() (string, error) {
 }
 
 func (j *Journal) Heartbeat(ctx context.Context, replyID, owner, token string) (ReplyClaim, error) {
-	now := j.nowUnix()
-	lease := now + j.leaseDuration.Nanoseconds()
 	err := j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
+		lease := now + j.leaseDuration.Nanoseconds()
 		res, err := tx.Exec("UPDATE reply_claims SET lease_until=?,updated_at=? WHERE reply_id=? AND owner=? AND token=? AND state=? AND lease_until>?", lease, now, replyID, owner, token, string(StateReplyClaimed), now)
 		if err != nil {
 			return err
@@ -150,11 +163,12 @@ type CommitResult struct {
 // transaction. Winner selection is by this transaction's custody commit
 // order, never by app-server response or item timestamp.
 func (j *Journal) CommitReply(ctx context.Context, replyID, owner, token string) (CommitResult, error) {
-	now := j.nowUnix()
 	var result CommitResult
+	expired := false
 	err := j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
 		var claim ReplyClaim
-		if err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", replyID), &claim); err != nil {
+		if err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", replyID), &claim); err != nil {
 			if err == sql.ErrNoRows {
 				return ErrNotFound
 			}
@@ -170,7 +184,8 @@ func (j *Journal) CommitReply(ctx context.Context, replyID, owner, token string)
 			if err := expireClaimTx(tx, replyID, now); err != nil {
 				return err
 			}
-			return ErrClaimExpired
+			expired = true
+			return nil
 		}
 		var seq int64
 		if err := tx.QueryRow("SELECT COALESCE(MAX(commit_seq),0)+1 FROM reply_claims").Scan(&seq); err != nil {
@@ -195,6 +210,9 @@ func (j *Journal) CommitReply(ctx context.Context, replyID, owner, token string)
 		result.Claim = claim
 		return nil
 	})
+	if err == nil && expired {
+		return result, ErrClaimExpired
+	}
 	return result, err
 }
 
@@ -213,8 +231,8 @@ func expireClaimTx(tx *sql.Tx, replyID string, now int64) error {
 // ExpireClaims is safe for a waiter/status process to call and is the wake
 // path when the delivery process has disappeared.
 func (j *Journal) ExpireClaims(ctx context.Context) error {
-	now := j.nowUnix()
 	return j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
 		rows, err := tx.Query("SELECT reply_id FROM reply_claims WHERE state=? AND lease_until<=?", string(StateReplyClaimed), now)
 		if err != nil {
 			return err
@@ -252,15 +270,18 @@ func (j *Journal) AbandonReply(ctx context.Context, replyID, owner, token string
 
 func (j *Journal) Reply(ctx context.Context, replyID string) (ReplyClaim, error) {
 	var out ReplyClaim
-	err := scanClaim(j.db.QueryRowContext(ctx, "SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", replyID), &out)
+	err := scanClaim(j.db.QueryRowContext(ctx, "SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", replyID), &out)
 	if err == sql.ErrNoRows {
 		return out, ErrNotFound
 	}
+	// Status inspection never grants body-dispatch authority. The creator
+	// retains the token returned by ClaimReply; joined/status callers do not.
+	out.Token = ""
 	return out, err
 }
 
 func (j *Journal) RepliesFor(ctx context.Context, originalID string) ([]ReplyClaim, error) {
-	rows, err := j.db.QueryContext(ctx, "SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE original_id=? ORDER BY created_at,reply_id", originalID)
+	rows, err := j.db.QueryContext(ctx, "SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE original_id=? ORDER BY created_at,reply_id", originalID)
 	if err != nil {
 		return nil, err
 	}
@@ -271,13 +292,14 @@ func (j *Journal) RepliesFor(ctx context.Context, originalID string) ([]ReplyCla
 		if err := scanClaim(rows, &c); err != nil {
 			return nil, err
 		}
+		c.Token = ""
 		out = append(out, c)
 	}
 	return out, rows.Err()
 }
 
 func scanClaim(row interface{ Scan(...any) error }, out *ReplyClaim) error {
-	return row.Scan(&out.ReplyID, &out.OriginalID, &out.Digest, &out.BodySize, &out.Status, &out.ReplyRoute, &out.CustodyRoute, &out.Owner, &out.Token, &out.LeaseUntil, &out.State, &out.CreatedAt, &out.UpdatedAt, &out.AcceptedAt, &out.CommitSeq)
+	return row.Scan(&out.ReplyID, &out.OriginalID, &out.Digest, &out.BodySize, &out.Status, &out.ReplyRoute, &out.CustodyRoute, &out.CustodyStoreID, &out.Owner, &out.Token, &out.LeaseUntil, &out.State, &out.CreatedAt, &out.UpdatedAt, &out.AcceptedAt, &out.CommitSeq)
 }
 
 // Wait polls durable metadata and expires abandoned claims. It never returns a
@@ -291,9 +313,10 @@ func (j *Journal) Wait(ctx context.Context, originalID string, poll time.Duratio
 			return ReplyClaim{}, err
 		}
 		var out ReplyClaim
-		err := scanClaim(j.db.QueryRowContext(ctx, `SELECT c.reply_id,c.original_id,c.digest,c.body_size,c.status,c.reply_route,c.custody_route,c.owner,c.token,c.lease_until,c.state,c.created_at,c.updated_at,COALESCE(c.accepted_at,0),COALESCE(c.commit_seq,0)
+		err := scanClaim(j.db.QueryRowContext(ctx, `SELECT c.reply_id,c.original_id,c.digest,c.body_size,c.status,c.reply_route,c.custody_route,c.custody_store_id,c.owner,c.token,c.lease_until,c.state,c.created_at,c.updated_at,COALESCE(c.accepted_at,0),COALESCE(c.commit_seq,0)
 FROM reply_claims c WHERE c.original_id=? AND c.state IN (?,?,?) ORDER BY CASE WHEN c.state IN (?,?) THEN 0 ELSE 1 END, c.commit_seq LIMIT 1`, originalID, string(StateReplyAccepted), string(StateReplyObserved), string(StateReplyOutcomeUnknown), string(StateReplyAccepted), string(StateReplyObserved)), &out)
 		if err == nil {
+			out.Token = ""
 			return out, nil
 		}
 		if err != sql.ErrNoRows {

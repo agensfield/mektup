@@ -2,6 +2,7 @@ package journal
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -23,7 +24,7 @@ func testJournal(t *testing.T, dir string, now *atomic.Int64) *Journal {
 
 func prepared(t *testing.T, j *Journal) OperationRecord {
 	t.Helper()
-	r, err := j.Prepare(context.Background(), Operation{OperationID: "op-1", MessageID: "msg-1", SourceRoute: "src", TargetRoute: "dst", Semantics: "send", Digest: "digest-1", BodySize: 7})
+	r, err := j.Prepare(context.Background(), Operation{OperationID: "op-1", MessageID: "msg-1", SourceRoute: "src", TargetRoute: "dst", Semantics: "send", ReplyRoute: "reply-route", CustodyRoute: "custody", CustodyStoreID: "store-test", AttemptOwner: "owner-1", Digest: "digest-1", BodySize: 7})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,7 +32,7 @@ func prepared(t *testing.T, j *Journal) OperationRecord {
 }
 
 func claimInput() ClaimInput {
-	return ClaimInput{ReplyID: "reply-1", OriginalID: "msg-1", Digest: "reply-digest", BodySize: 9, Status: "success", ReplyRoute: "src", CustodyRoute: "custody", Owner: "receiver-a"}
+	return ClaimInput{ReplyID: "reply-1", OriginalID: "msg-1", Digest: "reply-digest", BodySize: 9, Status: "success", ReplyRoute: "reply-route", CustodyRoute: "custody", CustodyStoreID: "store-test", Owner: "receiver-a"}
 }
 
 func TestOpenCreatesPrivateWALStoreAndStableIdentity(t *testing.T) {
@@ -42,6 +43,9 @@ func TestOpenCreatesPrivateWALStoreAndStableIdentity(t *testing.T) {
 	id := j.StoreID()
 	if id == "" {
 		t.Fatal("empty store id")
+	}
+	if !validStoreID(id) {
+		t.Fatalf("store id is not UUIDv7: %q", id)
 	}
 	info, err := os.Stat(dir)
 	if err != nil {
@@ -81,6 +85,13 @@ func TestOpenCreatesPrivateWALStoreAndStableIdentity(t *testing.T) {
 	if fk != 1 {
 		t.Fatalf("foreign keys %d", fk)
 	}
+	var sqliteVersion string
+	if err := j2.db.QueryRow("SELECT sqlite_version()").Scan(&sqliteVersion); err != nil {
+		t.Fatal(err)
+	}
+	if !atLeastSQLite(sqliteVersion, 3, 51, 3) {
+		t.Fatalf("unsafe SQLite %s", sqliteVersion)
+	}
 }
 
 func TestPreparedAndDispatchRecoveryIsConservative(t *testing.T) {
@@ -89,6 +100,7 @@ func TestPreparedAndDispatchRecoveryIsConservative(t *testing.T) {
 	now.Store(1_000_000_000)
 	j := testJournal(t, dir, &now)
 	prepared(t, j)
+	now.Add(31 * int64(time.Second))
 	if err := j.RecoverOrphans(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -105,6 +117,7 @@ func TestPreparedAndDispatchRecoveryIsConservative(t *testing.T) {
 	if err := j.MarkDispatchStarted(context.Background(), "op-2"); err != nil {
 		t.Fatal(err)
 	}
+	now.Add(31 * int64(time.Second))
 	if err := j.RecoverOrphans(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -114,6 +127,98 @@ func TestPreparedAndDispatchRecoveryIsConservative(t *testing.T) {
 	}
 	if r.State != StateOutcomeUnknown {
 		t.Fatalf("dispatch recovery %s", r.State)
+	}
+}
+
+func TestRecoveryDoesNotTouchLiveAttempt(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	if err := j.RecoverOrphans(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	r, err := j.Operation(context.Background(), "op-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.State != StatePrepared {
+		t.Fatalf("live attempt recovered: %s", r.State)
+	}
+	if _, err := j.HeartbeatAttempt(context.Background(), "op-1", r.AttemptOwner, r.AttemptToken); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUnknownCannotBeRejectedButMayBeManuallyResolved(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	if err := j.MarkDispatchStarted(context.Background(), "op-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordResult(context.Background(), "op-1", StateOutcomeUnknown, "transport_lost"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordResult(context.Background(), "op-1", StateRejected, "late_guess"); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("unknown rejected: %v", err)
+	}
+	if err := j.RecordAccepted(context.Background(), "op-1", "native-acceptance-1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordManualResolution(context.Background(), "op-1", ManualResolution{Assertion: "not_delivered", Actor: "operator", Reason: "verified external logs", EvidenceRef: "incident-1"}); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("resolved accepted operation: %v", err)
+	}
+	if _, err := j.Prepare(context.Background(), Operation{OperationID: "op-2", MessageID: "msg-2", SourceRoute: "s", TargetRoute: "d", Semantics: "x", Digest: "d2", BodySize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.MarkDispatchStarted(context.Background(), "op-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordResult(context.Background(), "op-2", StateOutcomeUnknown, "transport_lost"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordManualResolution(context.Background(), "op-2", ManualResolution{Assertion: "not_delivered", Actor: "operator", Reason: "verified external logs", EvidenceRef: "incident-1"}); err != nil {
+		t.Fatal(err)
+	}
+	r, err := j.Operation(context.Background(), "op-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.State != StateManuallyResolved {
+		t.Fatalf("resolution state %s", r.State)
+	}
+}
+
+func TestReplyRouteRelationshipIsFenced(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	in := claimInput()
+	in.ReplyRoute = "other-route"
+	if _, err := j.ClaimReply(context.Background(), in); !errors.Is(err, ErrIdentityConflict) {
+		t.Fatalf("route conflict: %v", err)
+	}
+}
+
+func TestQuestionMarkStatePathIsEscaped(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state?literal")
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	if _, err := j.Prepare(context.Background(), Operation{OperationID: "q-op", MessageID: "q-msg", SourceRoute: "s", TargetRoute: "t", Semantics: "x", Digest: "q", BodySize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "journal.sqlite3")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "state")); !os.IsNotExist(err) {
+		t.Fatalf("unescaped query path created sibling: %v", err)
 	}
 }
 
@@ -149,6 +254,10 @@ func TestConcurrentIdenticalClaimsJoinAndConflict(t *testing.T) {
 	for c := range results {
 		if c.Joined {
 			joined++
+			if c.Token != "" {
+				t.Fatal("joined claim received fencing token")
+			}
+			continue
 		}
 		if token == "" {
 			token = c.Token
@@ -206,6 +315,35 @@ func TestExpiryFencesLateCommitAndWaitWakesUnknown(t *testing.T) {
 	// A second receiver cannot redispatch the expired reply.
 	if _, err := j.ClaimReply(context.Background(), claimInput()); !errors.Is(err, ErrClaimExpired) {
 		t.Fatalf("redispatch: %v", err)
+	}
+}
+
+func TestDirectExpiryAndLateCommitPersistUnknown(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	c, err := j.ClaimReply(context.Background(), claimInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now.Add(2 * int64(time.Second))
+	if _, err := j.ClaimReply(context.Background(), claimInput()); !errors.Is(err, ErrClaimExpired) {
+		t.Fatalf("claim expiry: %v", err)
+	}
+	r, err := j.Reply(context.Background(), c.ReplyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.State != StateReplyOutcomeUnknown {
+		t.Fatalf("expiry rolled back: %s", r.State)
+	}
+	if r.Token != "" {
+		t.Fatal("status exposed expired token")
+	}
+	if _, err := j.CommitReply(context.Background(), c.ReplyID, c.Owner, c.Token); !errors.Is(err, ErrClaimExpired) {
+		t.Fatalf("late commit: %v", err)
 	}
 }
 
@@ -329,8 +467,47 @@ func TestForeignKeyAndMigrationAreTransactional(t *testing.T) {
 	if err := j.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 {
+	if version != 3 {
 		t.Fatalf("schema version %d", version)
+	}
+}
+
+func TestV1MigrationAddsFencesAndRoutesTransactionally(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "journal.sqlite3")
+	db, err := sql.Open("sqlite", "file:"+escapedSQLitePath(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := `CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+CREATE TABLE operations(operation_id TEXT PRIMARY KEY,message_id TEXT NOT NULL UNIQUE,source_route TEXT NOT NULL,target_route TEXT NOT NULL,semantics TEXT NOT NULL,digest TEXT NOT NULL,body_size INTEGER NOT NULL,state TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,dispatch_started_at INTEGER,terminal_at INTEGER,error_code TEXT NOT NULL DEFAULT '');
+CREATE TABLE attempts(operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id),state TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+CREATE TABLE reply_claims(reply_id TEXT PRIMARY KEY,original_id TEXT NOT NULL,digest TEXT NOT NULL,body_size INTEGER NOT NULL,status TEXT NOT NULL,reply_route TEXT NOT NULL,custody_route TEXT NOT NULL,owner TEXT NOT NULL,token TEXT NOT NULL,lease_until INTEGER NOT NULL,state TEXT NOT NULL,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,accepted_at INTEGER,commit_seq INTEGER,error_code TEXT NOT NULL DEFAULT '');
+PRAGMA user_version=1;`
+	if _, err := db.Exec(old); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	j := testJournal(t, dir, new(atomic.Int64))
+	r, err := j.Operation(context.Background(), "missing")
+	if !errors.Is(err, ErrNotFound) || r.OperationID != "" {
+		t.Fatalf("migration operation lookup: %v", err)
+	}
+	var version int
+	if err := j.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 3 {
+		t.Fatalf("migrated version %d", version)
+	}
+	var columns int
+	if err := j.db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('attempts') WHERE name IN ('owner','token','lease_until')").Scan(&columns); err != nil {
+		t.Fatal(err)
+	}
+	if columns != 3 {
+		t.Fatalf("attempt columns %d", columns)
 	}
 }
 

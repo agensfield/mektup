@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -90,7 +91,7 @@ func Open(ctx context.Context, opts Options) (*Journal, error) {
 	// URI pragmas apply to every connection in database/sql's pool. WAL is
 	// required for concurrent swarm processes; FK and busy handling are not
 	// optional safety settings.
-	dsn := "file:" + dbPath + "?_pragma=busy_timeout(" + fmt.Sprint(timeout.Milliseconds()) + ")&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
+	dsn := "file:" + escapedSQLitePath(dbPath) + "?_pragma=busy_timeout(" + fmt.Sprint(timeout.Milliseconds()) + ")&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
@@ -106,6 +107,14 @@ func Open(ctx context.Context, opts Options) (*Journal, error) {
 		return nil, err
 	}
 	return j, nil
+}
+
+func escapedSQLitePath(path string) string {
+	parts := strings.Split(path, string(os.PathSeparator))
+	for i, part := range parts {
+		parts[i] = url.PathEscape(part)
+	}
+	return strings.Join(parts, string(os.PathSeparator))
 }
 
 func statePath(requested string) (string, error) {
@@ -140,6 +149,13 @@ func (j *Journal) init(ctx context.Context) error {
 	if err := j.db.PingContext(ctx); err != nil {
 		return fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
+	var sqliteVersion string
+	if err := j.db.QueryRowContext(ctx, "SELECT sqlite_version()").Scan(&sqliteVersion); err != nil {
+		return fmt.Errorf("journal sqlite version: %w", err)
+	}
+	if !atLeastSQLite(sqliteVersion, 3, 51, 3) {
+		return fmt.Errorf("journal: SQLite %s is below required 3.51.3", sqliteVersion)
+	}
 	// Set pragmas explicitly as well as in the URI. This gives deterministic
 	// behavior for drivers that ignore URI pragma parameters.
 	for _, pragma := range []string{
@@ -162,15 +178,23 @@ func (j *Journal) init(ctx context.Context) error {
 	if err = tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
-	if version > 1 {
+	if version > 3 {
 		return fmt.Errorf("journal: unsupported schema version %d", version)
 	}
 	if version == 0 {
 		if _, err = tx.ExecContext(ctx, schemaV1); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
 		}
-		if _, err = tx.ExecContext(ctx, "PRAGMA user_version=1"); err != nil {
+		if _, err = tx.ExecContext(ctx, "PRAGMA user_version=3"); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
+		}
+	} else if version == 1 {
+		if err = migrateV1ToV3(ctx, tx); err != nil {
+			return err
+		}
+	} else if version == 2 {
+		if err = migrateV2ToV3(ctx, tx); err != nil {
+			return err
 		}
 	}
 	if err = tx.Commit(); err != nil {
@@ -183,6 +207,20 @@ func (j *Journal) init(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+func atLeastSQLite(got string, wantMajor, wantMinor, wantPatch int) bool {
+	var major, minor, patch int
+	if _, err := fmt.Sscanf(got, "%d.%d.%d", &major, &minor, &patch); err != nil {
+		return false
+	}
+	if major != wantMajor {
+		return major > wantMajor
+	}
+	if minor != wantMinor {
+		return minor > wantMinor
+	}
+	return patch >= wantPatch
 }
 
 func (j *Journal) secureFiles() error {
@@ -204,19 +242,22 @@ CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS operations (
  operation_id TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE,
  source_route TEXT NOT NULL, target_route TEXT NOT NULL, semantics TEXT NOT NULL,
+ reply_route TEXT NOT NULL DEFAULT '', custody_route TEXT NOT NULL DEFAULT '', custody_store_id TEXT NOT NULL DEFAULT '',
  digest TEXT NOT NULL, body_size INTEGER NOT NULL CHECK(body_size >= 0),
  state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
  dispatch_started_at INTEGER, terminal_at INTEGER, error_code TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS attempts (
  operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
- state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+ state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+ owner TEXT NOT NULL, token TEXT NOT NULL, lease_until INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS reply_claims (
  reply_id TEXT PRIMARY KEY, original_id TEXT NOT NULL,
  digest TEXT NOT NULL, body_size INTEGER NOT NULL CHECK(body_size >= 0),
  status TEXT NOT NULL CHECK(status IN ('success','error')),
  reply_route TEXT NOT NULL, custody_route TEXT NOT NULL,
+ custody_store_id TEXT NOT NULL DEFAULT '',
  owner TEXT NOT NULL, token TEXT NOT NULL, lease_until INTEGER NOT NULL,
  state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
  accepted_at INTEGER, commit_seq INTEGER, error_code TEXT NOT NULL DEFAULT '',
@@ -237,23 +278,80 @@ CREATE TABLE IF NOT EXISTS events (
  operation_id TEXT, reply_id TEXT, state TEXT NOT NULL, at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS events_operation ON events(operation_id, seq);
+CREATE TABLE IF NOT EXISTS manual_resolutions (
+ operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
+ assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL,
+ evidence_ref TEXT NOT NULL, resolved_at INTEGER NOT NULL
+);
 `
+
+func migrateV1ToV3(ctx context.Context, tx *sql.Tx) error {
+	stmts := []string{
+		`ALTER TABLE attempts ADD COLUMN owner TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE attempts ADD COLUMN token TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE attempts ADD COLUMN lease_until INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE operations ADD COLUMN reply_route TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE operations ADD COLUMN custody_route TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE operations ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE reply_claims ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE TABLE IF NOT EXISTS manual_resolutions (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, evidence_ref TEXT NOT NULL, resolved_at INTEGER NOT NULL)`,
+		`PRAGMA user_version=3`,
+	}
+	for _, stmt := range stmts {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+	}
+	return nil
+}
+
+func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`ALTER TABLE operations ADD COLUMN reply_route TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE operations ADD COLUMN custody_route TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE operations ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE reply_claims ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE TABLE IF NOT EXISTS manual_resolutions (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, evidence_ref TEXT NOT NULL, resolved_at INTEGER NOT NULL)`,
+		`PRAGMA user_version=3`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+	}
+	return nil
+}
 
 func (j *Journal) loadOrCreateStoreID(ctx context.Context) error {
 	var id string
 	err := j.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='store_id'").Scan(&id)
 	if err == nil && id != "" {
-		j.storeID = id
+		if validStoreID(id) {
+			j.storeID = id
+			return nil
+		}
+		newID, genErr := newStoreID()
+		if genErr != nil {
+			return genErr
+		}
+		res, updateErr := j.db.ExecContext(ctx, "UPDATE meta SET value=? WHERE key='store_id' AND value=?", newID, id)
+		if updateErr != nil {
+			return fmt.Errorf("journal store identity: %w", updateErr)
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			if scanErr := j.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='store_id'").Scan(&newID); scanErr != nil {
+				return scanErr
+			}
+		}
+		j.storeID = newID
 		return nil
 	}
 	if err != sql.ErrNoRows && err != nil {
 		return fmt.Errorf("journal store identity: %w", err)
 	}
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
+	id, err = newStoreID()
+	if err != nil {
 		return err
 	}
-	id = "store_" + hex.EncodeToString(b)
 	if _, err := j.db.ExecContext(ctx, "INSERT INTO meta(key,value) VALUES('store_id',?)", id); err != nil {
 		// A concurrent opener may have won creation. Read it back rather than
 		// generating an unstable identity.
@@ -263,6 +361,27 @@ func (j *Journal) loadOrCreateStoreID(ctx context.Context) error {
 	}
 	j.storeID = id
 	return nil
+}
+
+func newStoreID() (string, error) {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	ms := uint64(time.Now().UnixMilli())
+	b[0], b[1], b[2], b[3], b[4], b[5] = byte(ms>>40), byte(ms>>32), byte(ms>>24), byte(ms>>16), byte(ms>>8), byte(ms)
+	b[6] = (b[6] & 0x0f) | 0x70
+	b[8] = (b[8] & 0x3f) | 0x80
+	h := hex.EncodeToString(b[:])
+	return "store_" + h[0:8] + "-" + h[8:12] + "-" + h[12:16] + "-" + h[16:20] + "-" + h[20:32], nil
+}
+
+func validStoreID(id string) bool {
+	if !strings.HasPrefix(id, "store_") || len(id) != len("store_")+36 {
+		return false
+	}
+	b, err := hex.DecodeString(strings.ReplaceAll(id[len("store_"):], "-", ""))
+	return err == nil && len(b) == 16 && b[6]>>4 == 7 && b[8]>>6 == 2
 }
 
 func (j *Journal) Close() error     { return j.db.Close() }
