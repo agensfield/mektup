@@ -2,11 +2,12 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agensfield.dev/mektup/contracts/control-v1.schema.json",
   "title": "Mektup custody control document v1",
-  "description": "Metadata-only stdin protocol for the fenced reply custody receiver. It never carries a local path, executable path, shell fragment, or reply body.",
+  "description": "Metadata-only stdin protocol for the fenced reply custody receiver. A claim request cannot choose a fencing token or current lease; the receiver issues both in its claim result. Heartbeat, commit, and abandon requests must present the issued values. Receipt identity is optional because operation plus original/reply message identity is the custody authority. This protocol never carries a local path, executable path, shell fragment, or reply body.",
   "type": "object",
-  "required": ["schema", "operation", "operationId", "receiptId", "replyMessageId", "originalMessageId", "custody", "replyDestination"],
+  "required": ["schema", "kind", "operation", "operationId", "replyMessageId", "originalMessageId", "custody", "replyDestination"],
   "properties": {
     "schema": { "const": "mektup/control/v1" },
+    "kind": { "enum": ["request", "result"] },
     "operation": {
       "enum": ["claim", "heartbeat", "commit", "abandon", "status", "reconcile"]
     },
@@ -37,6 +38,14 @@
     "bodySha256": { "$ref": "common-v1.schema.json#/$defs/sha256" },
     "replyStatus": { "enum": ["success", "error"] },
     "replyErrorCode": { "type": "string", "minLength": 1 },
+    "requestedLease": {
+      "type": "object",
+      "required": ["durationMs"],
+      "properties": {
+        "durationMs": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": true
+    },
     "fencingToken": { "type": "string", "minLength": 1 },
     "lease": {
       "type": "object",
@@ -55,26 +64,82 @@
   "allOf": [
     {
       "if": {
-        "required": ["operation"],
-        "properties": { "operation": { "enum": ["claim", "heartbeat", "commit", "abandon"] } }
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "request" },
+          "operation": { "enum": ["claim", "heartbeat", "commit", "abandon"] }
+        }
       },
       "then": {
-        "required": ["bodyBytes", "bodySha256", "replyStatus"]
+        "required": ["bodyBytes", "bodySha256", "replyStatus", "attemptOwner"]
       }
     },
     {
       "if": {
-        "required": ["operation"],
-        "properties": { "operation": { "enum": ["claim", "heartbeat", "commit", "abandon"] } }
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "request" },
+          "operation": { "enum": ["heartbeat", "commit", "abandon"] }
+        }
       },
-      "then": { "required": ["fencingToken", "attemptOwner"] }
+      "then": {
+        "required": ["fencingToken", "lease"],
+        "not": { "required": ["requestedLease"] }
+      }
     },
     {
       "if": {
-        "required": ["operation"],
-        "properties": { "operation": { "const": "claim" } }
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "request" },
+          "operation": { "const": "claim" }
+        }
       },
-      "then": { "required": ["lease"] }
+      "then": {
+        "not": {
+          "anyOf": [
+            { "required": ["fencingToken"] },
+            { "required": ["lease"] },
+            { "required": ["result"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["kind"],
+        "properties": { "kind": { "const": "result" } }
+      },
+      "then": {
+        "required": ["result"],
+        "not": {
+          "anyOf": [
+            { "required": ["fencingToken"] },
+            { "required": ["lease"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "result" },
+          "operation": { "const": "claim" }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "type": "object",
+            "required": ["fencingToken", "lease"],
+            "properties": {
+              "fencingToken": { "type": "string", "minLength": 1 },
+              "lease": { "type": "object" }
+            }
+          }
+        }
+      }
     }
   ],
   "not": {

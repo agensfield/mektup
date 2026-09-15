@@ -12,6 +12,12 @@
     { "kind": "warning", "schema": "mektup/warning/v1", "path": "warning-untested-server.json" },
     { "kind": "error", "schema": "mektup/error/v1", "path": "error-outcome-unknown.json" },
     { "kind": "control", "schema": "mektup/control/v1", "path": "control-claim.json" },
-    { "kind": "control", "schema": "mektup/control/v1", "path": "control-commit.json" }
+    { "kind": "control", "schema": "mektup/control/v1", "path": "control-claim-result.json" },
+    { "kind": "control", "schema": "mektup/control/v1", "path": "control-commit.json" },
+    { "kind": "control", "schema": "mektup/control/v1", "path": "control-status-without-receipt.json" },
+    { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-with-token.invalid.json", "expected": "invalid" },
+    { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-commit-without-token.invalid.json", "expected": "invalid" },
+    { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-heartbeat-without-lease.invalid.json", "expected": "invalid" },
+    { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-abandon-without-token.invalid.json", "expected": "invalid" }
   ]
 }
