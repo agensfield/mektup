@@ -13,7 +13,7 @@ import (
 const maxRegistryBytes = 1 << 20
 
 func openExistingDatabase(path string) (*os.File, string, error) {
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, "", fmt.Errorf("%w: registered journal database does not exist privately", ErrStoreUnavailable)
 	}
@@ -53,7 +53,7 @@ func readPrivateRegistry(path string) ([]byte, error) {
 	if err != nil || !parentInfo.IsDir() || parentInfo.Mode().Perm()&0077 != 0 {
 		return nil, fmt.Errorf("%w: registry directory must be owner-private", ErrRegistryInvalid)
 	}
-	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, fmt.Errorf("%w: open registry: %v", ErrRegistryInvalid, err)
 	}

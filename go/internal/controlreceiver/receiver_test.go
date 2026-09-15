@@ -185,6 +185,26 @@ func TestReceiverRejectsWrongThreadForMatchingDestination(t *testing.T) {
 	}
 }
 
+func TestReceiverAllowsDistinctTrustedReplyEndpointTopology(t *testing.T) {
+	j, state := openReceiverJournal(t, time.Minute)
+	receiver := Receiver{Registry: makeRegistry(t, state, j.StoreID()), LocalEndpointID: receiverEndpoint}
+	otherOriginal := "msg_0198f0e0-0000-7000-8000-000000000088"
+	if _, err := j.Prepare(context.Background(), journal.Operation{OperationID: "op_0198f0e0-0000-7000-8000-000000000088", MessageID: otherOriginal, SourceRoute: "src", TargetRoute: "dst", Semantics: "message", ReplyRoute: "codex://replyhost/thread/source", CustodyRoute: receiverEndpoint, CustodyStoreID: j.StoreID(), Digest: "digest", BodySize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	q := request(j)
+	q.OriginalMessageID = otherOriginal
+	q.ReplyDestination.EndpointID = "ep_0198f0e0-0000-7000-8000-000000000099"
+	q.ReplyDestination.URI = "codex://replyhost/thread/source"
+	q.BodyBytes = ptrInt64(1)
+	q.BodySHA256 = "sha256:" + strings.Repeat("d", 64)
+	if _, err := receiver.Receive(context.Background(), mustMarshal(t, q)); err != nil {
+		t.Fatalf("distinct endpoint topology rejected: %v", err)
+	}
+}
+
+func ptrInt64(value int64) *int64 { return &value }
+
 func TestReceiverExpiredTokenAndUnknownStatus(t *testing.T) {
 	now := atomic.Int64{}
 	now.Store(time.Now().UnixNano())

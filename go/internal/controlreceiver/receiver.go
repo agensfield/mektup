@@ -83,7 +83,7 @@ func (r Receiver) Receive(ctx context.Context, data []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer store.Close()
-	if store.Journal == nil || store.EndpointID != r.LocalEndpointID || store.EndpointID != request.Custody.EndpointID || request.ReplyDestination.EndpointID != r.LocalEndpointID {
+	if store.Journal == nil || store.EndpointID != r.LocalEndpointID {
 		return nil, ErrRelationshipMismatch
 	}
 	canonical, err := store.Journal.ResolveStoreID(ctx, request.Custody.StoreID)
@@ -95,6 +95,10 @@ func (r Receiver) Receive(ctx context.Context, data []byte) ([]byte, error) {
 	}
 	if request.Operation == "heartbeat" || request.Operation == "commit" || request.Operation == "abandon" {
 		if err := validateClaimTuple(ctx, store.Journal, request, canonical); err != nil {
+			return nil, err
+		}
+	} else if request.Operation == "status" || request.Operation == "reconcile" {
+		if err := validateClaimIdentity(ctx, store.Journal, request, canonical); err != nil {
 			return nil, err
 		}
 	}
@@ -163,12 +167,29 @@ func validateDestinationThread(req sshproxy.ControlRequest) error {
 func validateClaimTuple(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) error {
 	claim, err := j.Reply(ctx, req.ReplyMessageID)
 	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			return journal.ErrNotFound
+		}
 		return fmt.Errorf("%w: selected claim unavailable: %v", ErrRelationshipMismatch, err)
 	}
 	if claim.OriginalID != req.OriginalMessageID || claim.Digest != req.BodySHA256 ||
 		(req.BodyBytes == nil || claim.BodySize != *req.BodyBytes) || claim.Status != req.ReplyStatus ||
 		claim.ReplyRoute != req.ReplyDestination.URI || claim.CustodyRoute != req.Custody.EndpointID ||
 		claim.CustodyStoreID != storeID || (req.AttemptOwner != "" && claim.Owner != req.AttemptOwner) {
+		return ErrRelationshipMismatch
+	}
+	return nil
+}
+
+func validateClaimIdentity(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) error {
+	claim, err := j.Reply(ctx, req.ReplyMessageID)
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			return journal.ErrNotFound
+		}
+		return fmt.Errorf("%w: selected claim unavailable: %v", ErrRelationshipMismatch, err)
+	}
+	if claim.OriginalID != req.OriginalMessageID || claim.ReplyRoute != req.ReplyDestination.URI || claim.CustodyRoute != req.Custody.EndpointID || claim.CustodyStoreID != storeID {
 		return ErrRelationshipMismatch
 	}
 	return nil

@@ -96,7 +96,7 @@ func (r FileRegistry) Resolve(ctx context.Context, endpointID, storeID string) (
 		if err != nil {
 			return Store{}, err
 		}
-		j, err := journal.Open(ctx, journal.Options{StateDir: entry.StateDir})
+		j, err := journal.OpenExisting(ctx, journal.Options{StateDir: entry.StateDir})
 		if err != nil {
 			_ = dbFile.Close()
 			return Store{}, fmt.Errorf("%w: open registered journal: %v", ErrStoreUnavailable, err)

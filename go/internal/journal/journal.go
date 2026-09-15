@@ -86,11 +86,32 @@ type Journal struct {
 }
 
 func Open(ctx context.Context, opts Options) (*Journal, error) {
+	return open(ctx, opts, false)
+}
+
+// OpenExisting opens a pre-existing journal without creating or repairing its
+// state directory or database. It is used by remote-selected registries where
+// a missing path must fail closed.
+func OpenExisting(ctx context.Context, opts Options) (*Journal, error) {
+	return open(ctx, opts, true)
+}
+
+func open(ctx context.Context, opts Options, existing bool) (*Journal, error) {
 	dir, err := statePath(opts.StateDir)
 	if err != nil {
 		return nil, err
 	}
-	if err := secureDir(dir); err != nil {
+	dbPath := filepath.Join(dir, "journal.sqlite3")
+	if existing {
+		info, statErr := os.Stat(dir)
+		if statErr != nil || !info.IsDir() {
+			return nil, fmt.Errorf("journal: existing state directory unavailable")
+		}
+		dbInfo, statErr := os.Stat(dbPath)
+		if statErr != nil || !dbInfo.Mode().IsRegular() {
+			return nil, fmt.Errorf("journal: existing database unavailable")
+		}
+	} else if err := secureDir(dir); err != nil {
 		return nil, err
 	}
 	timeout := opts.BusyTimeout
@@ -101,11 +122,14 @@ func Open(ctx context.Context, opts Options) (*Journal, error) {
 	if lease <= 0 {
 		lease = leaseDuration
 	}
-	dbPath := filepath.Join(dir, "journal.sqlite3")
 	// URI pragmas apply to every connection in database/sql's pool. WAL is
 	// required for concurrent swarm processes; FK and busy handling are not
 	// optional safety settings.
-	dsn := "file:" + escapedSQLitePath(dbPath) + "?_pragma=busy_timeout(" + fmt.Sprint(timeout.Milliseconds()) + ")&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
+	mode := ""
+	if existing {
+		mode = "mode=rw&"
+	}
+	dsn := "file:" + escapedSQLitePath(dbPath) + "?" + mode + "_pragma=busy_timeout(" + fmt.Sprint(timeout.Milliseconds()) + ")&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
