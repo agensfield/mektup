@@ -229,6 +229,43 @@ func TestCancellationWithdrawsQueuedWriteBeforeClaimingNotSent(t *testing.T) {
 	<-firstDone
 }
 
+func TestActiveCancellationNeverClaimsProvenBeforeWrite(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		f := newFakeTransport()
+		started := make(chan struct{})
+		release := make(chan struct{})
+		f.onWrite = func([]byte) error {
+			close(started)
+			<-release
+			return nil
+		}
+		c := New(f, Options{})
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() {
+			_, err := c.call(ctx, RPCRequest{ID: "active", Method: "write"})
+			done <- err
+		}()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("writer did not become active")
+		}
+		cancel()
+		close(release)
+		select {
+		case err := <-done:
+			var callErr *CallError
+			if !errors.As(err, &callErr) || callErr.Evidence.Phase == WriteProvenBeforeWrite {
+				t.Fatalf("iteration %d active cancellation evidence = %T %+v", i, err, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("iteration %d active cancellation hung", i)
+		}
+		_ = c.Close(context.Background())
+	}
+}
+
 func TestBoundedOverflowProducesGapAndDisconnect(t *testing.T) {
 	f := newFakeTransport()
 	c := New(f, Options{EventCapacity: 1})

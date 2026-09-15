@@ -404,16 +404,24 @@ func (c *Client) enqueue(ctx context.Context, cmd command) error {
 			c.admitMu.Unlock()
 			return errClientClosed
 		}
+		if cmd.kind == commandRequest {
+			// Publish queue ownership before the channel send. The pump may
+			// receive immediately, so publishing after send can leave a stale
+			// marker that makes active-write cancellation look not-written.
+			c.mu.Lock()
+			c.queued[cmd.key] = struct{}{}
+			c.mu.Unlock()
+		}
 		select {
 		case c.commands <- cmd:
-			if cmd.kind == commandRequest {
-				c.mu.Lock()
-				c.queued[cmd.key] = struct{}{}
-				c.mu.Unlock()
-			}
 			c.admitMu.Unlock()
 			return nil
 		default:
+			if cmd.kind == commandRequest {
+				c.mu.Lock()
+				delete(c.queued, cmd.key)
+				c.mu.Unlock()
+			}
 			c.admitMu.Unlock()
 		}
 		select {
