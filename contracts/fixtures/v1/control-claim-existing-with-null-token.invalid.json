@@ -11,7 +11,8 @@
   },
   "replyDestination": {
     "endpointId": "ep_0198f0e0-0000-7000-8000-000000000001",
-    "threadId": "thread-local-001"
+    "threadId": "thread-local-001",
+    "uri": "codex://local/thread/thread-local-001"
   },
   "result": {
     "disposition": "existing",

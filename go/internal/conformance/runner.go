@@ -631,6 +631,9 @@ func validateControlFixture(data []byte) error {
 	if thread, ok := destination["threadId"].(string); !ok || thread == "" {
 		return errors.New("control destination thread is required")
 	}
+	if uri, ok := destination["uri"].(string); !ok || uri == "" || !strings.Contains(uri, "://") {
+		return errors.New("control destination URI is required")
+	}
 	if kind == "request" && op == "claim" {
 		if _, has := value["fencingToken"]; has {
 			return errors.New("claim request cannot select fencingToken")

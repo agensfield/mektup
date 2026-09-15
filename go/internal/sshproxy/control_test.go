@@ -19,7 +19,7 @@ func validControlRequest() ControlRequest {
 		Schema: "mektup/control/v1", Kind: "request", Operation: "claim",
 		OperationID: "op_0198f0e0-0000-7000-8000-00000000000c", ReplyMessageID: "msg_0198f0e0-0000-7000-8000-000000000007", OriginalMessageID: "msg_0198f0e0-0000-7000-8000-000000000003",
 		Custody:          CustodyRef{EndpointID: "ep_0198f0e0-0000-7000-8000-000000000001", StoreID: "store_0198f0e0-0000-7000-8000-000000000002"},
-		ReplyDestination: DestinationRef{EndpointID: "ep_0198f0e0-0000-7000-8000-000000000001", ThreadID: "thread-local-001"},
+		ReplyDestination: DestinationRef{EndpointID: "ep_0198f0e0-0000-7000-8000-000000000001", ThreadID: "thread-local-001", URI: "codex://local/thread/thread-local-001"},
 		BodyBytes:        &bytesCount, BodySHA256: "sha256:" + strings.Repeat("a", 64), ReplyStatus: "success", AttemptOwner: "owner_01",
 	}
 }
@@ -36,6 +36,27 @@ func TestControlValidationRejectsUntrustedPathAndBodyFields(t *testing.T) {
 	}
 	if !reflect.DeepEqual(parsed, req) {
 		t.Fatalf("request = %#v, want %#v", parsed, req)
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"missing URI": func(raw map[string]any) { delete(raw["replyDestination"].(map[string]any), "uri") },
+		"empty URI":   func(raw map[string]any) { raw["replyDestination"].(map[string]any)["uri"] = "" },
+		"null URI":    func(raw map[string]any) { raw["replyDestination"].(map[string]any)["uri"] = nil },
+		"wrong URI":   func(raw map[string]any) { raw["replyDestination"].(map[string]any)["uri"] = 42 },
+	} {
+		t.Run(name, func(t *testing.T) {
+			var raw map[string]any
+			if err := json.Unmarshal(data, &raw); err != nil {
+				t.Fatal(err)
+			}
+			mutate(raw)
+			bad, err := json.Marshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ValidateControlRequest(bad); !errors.Is(err, ErrControlValidation) {
+				t.Fatalf("URI shape accepted: %v", err)
+			}
+		})
 	}
 	for _, field := range []string{"body", "bodyText", "path", "executable", "shell"} {
 		var raw map[string]any

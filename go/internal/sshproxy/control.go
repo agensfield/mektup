@@ -300,8 +300,8 @@ func (r ControlRequest) Validate() error {
 	if !validID(r.ReplyDestination.EndpointID, "ep_") || r.ReplyDestination.ThreadID == "" {
 		return fmt.Errorf("%w: reply destination must use opaque endpoint and nonempty thread ID", ErrControlValidation)
 	}
-	if r.ReplyDestination.URI != "" && !validURI(r.ReplyDestination.URI) {
-		return fmt.Errorf("%w: invalid reply destination URI", ErrControlValidation)
+	if !validURI(r.ReplyDestination.URI) {
+		return fmt.Errorf("%w: reply destination URI is required and must be valid", ErrControlValidation)
 	}
 	if r.RequestedAt != "" && !validTimestamp(r.RequestedAt) {
 		return fmt.Errorf("%w: invalid requestedAt timestamp", ErrControlValidation)

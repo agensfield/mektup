@@ -26,7 +26,7 @@
     },
     "replyDestination": {
       "type": "object",
-      "required": ["endpointId", "threadId"],
+      "required": ["endpointId", "threadId", "uri"],
       "properties": {
         "endpointId": { "$ref": "common-v1.schema.json#/$defs/endpointId" },
         "threadId": { "$ref": "common-v1.schema.json#/$defs/threadId" },

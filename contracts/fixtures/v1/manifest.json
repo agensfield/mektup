@@ -24,6 +24,10 @@
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-existing-with-null-winner.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-with-invalid-expiry.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-with-null-acquired-at.invalid.json", "expected": "invalid" },
+    { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-missing-uri.invalid.json", "expected": "invalid" },
+    { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-empty-uri.invalid.json", "expected": "invalid" },
+    { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-null-uri.invalid.json", "expected": "invalid" },
+    { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-wrong-uri.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-commit-without-token.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-heartbeat-without-lease.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-abandon-without-token.invalid.json", "expected": "invalid" }
