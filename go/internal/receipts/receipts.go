@@ -232,17 +232,49 @@ func (s Store) Resolve(ctx context.Context, request ResolveRequest) (mektup.Rece
 		}
 		return mektup.Receipt{}, ErrHumanGateRequired
 	}
+	op, opErr := s.Journal.Operation(ctx, receipt.OperationID)
+	if opErr != nil {
+		return mektup.Receipt{}, opErr
+	}
+	// Recover a crash between the projection-first write and the journal
+	// transition. The stored assertion is retained and replayed; no new
+	// external effect or route resolution is introduced.
+	if receipt.State == mektup.StateManuallyResolved && op.State == journal.StateOutcomeUnknown && receipt.ManualResolution != nil {
+		resolution := receipt.ManualResolution
+		if err := s.Journal.RecordManualResolution(ctx, receipt.OperationID, journal.ManualResolution{Assertion: resolution.Assertion, Actor: resolution.Actor, Reason: resolution.Reason, EvidenceRef: resolution.EvidenceRef, Presentation: resolution.Presentation, Timestamp: parseResolutionTime(resolution.Timestamp)}); err != nil {
+			return mektup.Receipt{}, err
+		}
+		return receipt, nil
+	}
+	if receipt.State == mektup.StateOutcomeUnknown && op.State == journal.StateManuallyResolved && op.ManualResolution != nil {
+		receipt.State = mektup.StateManuallyResolved
+		receipt.UpdatedAt = s.now().Format(time.RFC3339Nano)
+		receipt.ManualResolution = &mektup.ManualResolution{Assertion: op.ManualResolution.Assertion, Actor: op.ManualResolution.Actor, Reason: op.ManualResolution.Reason, EvidenceRef: op.ManualResolution.EvidenceRef, Presentation: op.ManualResolution.Presentation, Timestamp: op.ManualResolution.ResolvedAt.Format(time.RFC3339Nano)}
+		if err := s.Journal.PutReceipt(ctx, receipt); err != nil {
+			return mektup.Receipt{}, err
+		}
+		return receipt, nil
+	}
 	if receipt.State != mektup.StateOutcomeUnknown {
 		return mektup.Receipt{}, fmt.Errorf("%w: receipt is not outcome-unknown", journal.ErrInvalidTransition)
 	}
 	now := s.now()
-	if err := s.Journal.RecordManualResolution(ctx, receipt.OperationID, journal.ManualResolution{Assertion: request.Assertion, Actor: request.Actor, Reason: request.Reason, EvidenceRef: request.EvidenceRef, Presentation: request.Presentation, Timestamp: now}); err != nil {
-		return mektup.Receipt{}, err
-	}
+	previous := receipt
 	receipt.State = mektup.StateManuallyResolved
 	receipt.UpdatedAt = now.Format(time.RFC3339Nano)
 	receipt.ManualResolution = &mektup.ManualResolution{Assertion: request.Assertion, Actor: request.Actor, Reason: request.Reason, EvidenceRef: request.EvidenceRef, Presentation: request.Presentation, Timestamp: now.Format(time.RFC3339Nano)}
+	// The journal's transition API predates receipt projections. Write the
+	// projection first so an injected/failed receipt write leaves the operation
+	// outcome-unknown and retryable. If the transition then fails, restore the
+	// previous projection. The concrete SQLite journal keeps each write fenced;
+	// callers never observe a successful resolve without both records.
 	if err := s.Journal.PutReceipt(ctx, receipt); err != nil {
+		return mektup.Receipt{}, err
+	}
+	if err := s.Journal.RecordManualResolution(ctx, receipt.OperationID, journal.ManualResolution{Assertion: request.Assertion, Actor: request.Actor, Reason: request.Reason, EvidenceRef: request.EvidenceRef, Presentation: request.Presentation, Timestamp: now}); err != nil {
+		if rollbackErr := s.Journal.PutReceipt(ctx, previous); rollbackErr != nil {
+			return mektup.Receipt{}, fmt.Errorf("%w: projection rollback failed: %v (transition: %v)", ErrReconcileIncomplete, rollbackErr, err)
+		}
 		return mektup.Receipt{}, err
 	}
 	return receipt, nil
@@ -261,4 +293,12 @@ func boundedLimit(limit int) (int, error) {
 func bodyDigest(body []byte) string {
 	sum := sha256.Sum256(body)
 	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func parseResolutionTime(value string) time.Time {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
 }

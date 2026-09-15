@@ -22,10 +22,11 @@ func (s Store) Reconcile(ctx context.Context, reference string, history HistoryP
 	if err != nil {
 		return mektup.Receipt{}, err
 	}
+	previous := receipt
+	previous.Evidence = append([]mektup.EvidenceRecord(nil), receipt.Evidence...)
+	// Native history is always read from the pinned delivery target. Source is
+	// the sender/custody identity and must not retarget a reply reconciliation.
 	endpointID, threadID := receipt.Target.EndpointID, receipt.Target.ThreadID
-	if receipt.Message.InReplyTo != "" || receipt.State == mektup.StateReplyOutcomeUnknown || receipt.State == mektup.StateReplyAccepted {
-		endpointID, threadID = receipt.Source.EndpointID, receipt.Source.ThreadID
-	}
 	if endpointID == "" || threadID == "" {
 		return mektup.Receipt{}, ErrRouteUnavailable
 	}
@@ -56,12 +57,13 @@ func (s Store) Reconcile(ctx context.Context, reference string, history HistoryP
 		if item.TurnID != "" && receipt.Message.TurnID != "" && item.TurnID != receipt.Message.TurnID {
 			continue
 		}
-		if item.PayloadSHA256 == "" || item.PayloadSHA256 != expectedDigest {
-			if len(item.Body) == 0 || bodyDigest(item.Body) != expectedDigest {
-				continue
-			}
+		// Full-history reconciliation is positive evidence only when the full
+		// body is present. Advertised native metadata is an untrusted claim and
+		// must never substitute for hashing the actual bytes.
+		if item.Body == nil || bodyDigest(item.Body) != expectedDigest {
+			continue
 		}
-		if uint64(len(item.Body)) != expectedBytes && len(item.Body) != 0 {
+		if uint64(len(item.Body)) != expectedBytes {
 			continue
 		}
 		if match != nil {
@@ -78,39 +80,47 @@ func (s Store) Reconcile(ctx context.Context, reference string, history HistoryP
 	// portable reply receipt names the original operation, so resolve its
 	// candidate claim by the stored operation relationship and digest.
 	var replyID string
-	originalID := receipt.Message.MessageID
-	if op, opErr := s.Journal.Operation(ctx, receipt.OperationID); opErr == nil && op.MessageID != "" {
-		originalID = op.MessageID
-	}
-	if claims, claimsErr := s.Journal.RepliesFor(ctx, originalID); claimsErr == nil {
+	if receipt.ContentRef != nil {
+		if receipt.ContentRef.ClientMessageID == "" {
+			return mektup.Receipt{}, fmt.Errorf("%w: reply claim identity is absent", ErrIdentityMismatch)
+		}
+		originalID := receipt.Message.MessageID
+		if op, opErr := s.Journal.Operation(ctx, receipt.OperationID); opErr == nil && op.MessageID != "" {
+			originalID = op.MessageID
+		}
+		claims, claimsErr := s.Journal.RepliesFor(ctx, originalID)
+		if claimsErr != nil {
+			return mektup.Receipt{}, claimsErr
+		}
 		for _, claim := range claims {
-			if claim.Digest == expectedDigest && (receipt.ContentRef == nil || receipt.ContentRef.ClientMessageID == "" || claim.ReplyID == receipt.ContentRef.ClientMessageID) {
+			if claim.ReplyID == receipt.ContentRef.ClientMessageID {
+				if claim.OriginalID != originalID || claim.Digest != expectedDigest {
+					return mektup.Receipt{}, ErrIdentityMismatch
+				}
+				if replyID != "" {
+					return mektup.Receipt{}, fmt.Errorf("%w: multiple reply claims", ErrIdentityMismatch)
+				}
 				replyID = claim.ReplyID
-				break
 			}
 		}
-	}
-	if replyID == "" {
-		if _, claimErr := s.Journal.Reply(ctx, receipt.Message.MessageID); claimErr == nil {
-			replyID = receipt.Message.MessageID
+		if replyID == "" {
+			return mektup.Receipt{}, ErrIdentityMismatch
 		}
 	}
+	var transition func() error
 	if replyID != "" {
-		if err := s.Journal.ReconcileReplyObservation(ctx, replyID, match.ItemID, expectedDigest); err != nil {
-			return mektup.Receipt{}, err
-		}
 		receipt.State = mektup.StateReplyObserved
-	} else {
-		if receipt.State == mektup.StateReplyAccepted || receipt.State == mektup.StateReplyOutcomeUnknown {
-			return mektup.Receipt{}, ErrReconcileIncomplete
+		transition = func() error {
+			return s.Journal.ReconcileReplyObservation(ctx, replyID, match.ItemID, expectedDigest)
 		}
+	} else {
 		op, opErr := s.Journal.Operation(ctx, receipt.OperationID)
 		if opErr != nil {
 			return mektup.Receipt{}, opErr
 		}
 		if op.State == journal.StateOutcomeUnknown || op.State == journal.StateDispatchStarted {
-			if err := s.Journal.RecordAccepted(ctx, receipt.OperationID, historyEvidenceReference(*match)); err != nil {
-				return mektup.Receipt{}, err
+			transition = func() error {
+				return s.Journal.RecordAccepted(ctx, receipt.OperationID, historyEvidenceReference(*match))
 			}
 		}
 		if receipt.State == mektup.StateOutcomeUnknown || receipt.State == mektup.StateDispatchStarted {
@@ -125,6 +135,14 @@ func (s Store) Reconcile(ctx context.Context, reference string, history HistoryP
 	}
 	if err := s.Journal.PutReceipt(ctx, receipt); err != nil {
 		return mektup.Receipt{}, err
+	}
+	if transition != nil {
+		if err := transition(); err != nil {
+			if rollbackErr := s.Journal.PutReceipt(ctx, previous); rollbackErr != nil {
+				return mektup.Receipt{}, fmt.Errorf("%w: projection rollback failed: %v (transition: %v)", ErrReconcileIncomplete, rollbackErr, err)
+			}
+			return mektup.Receipt{}, err
+		}
 	}
 	return receipt, nil
 }
