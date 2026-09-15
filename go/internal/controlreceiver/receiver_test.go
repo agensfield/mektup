@@ -158,6 +158,52 @@ func TestReceiverClaimHeartbeatCommitStatusAndDuplicate(t *testing.T) {
 	}
 }
 
+func TestReceiverTerminalClaimDuplicatesAreStatusOnly(t *testing.T) {
+	for _, terminal := range []string{"accepted", "observed", "unknown"} {
+		t.Run(terminal, func(t *testing.T) {
+			j, state := openReceiverJournal(t, time.Minute)
+			prepareOriginal(t, j)
+			receiver := Receiver{Registry: makeRegistry(t, state, j.StoreID()), LocalEndpointID: receiverEndpoint, Destination: localDestination()}
+			claimRequest := request(j)
+			claimResult := receive(t, receiver, claimRequest)
+			var payload struct {
+				FencingToken string         `json:"fencingToken"`
+				Lease        sshproxy.Lease `json:"lease"`
+			}
+			if err := json.Unmarshal(claimResult.Result, &payload); err != nil {
+				t.Fatal(err)
+			}
+			switch terminal {
+			case "accepted", "observed":
+				if _, err := j.CommitReply(context.Background(), claimRequest.ReplyMessageID, claimRequest.AttemptOwner, payload.FencingToken); err != nil {
+					t.Fatal(err)
+				}
+				if terminal == "observed" {
+					if err := j.ObserveReply(context.Background(), claimRequest.ReplyMessageID, "native-item", claimRequest.BodySHA256); err != nil {
+						t.Fatal(err)
+					}
+				}
+			case "unknown":
+				if err := j.AbandonReply(context.Background(), claimRequest.ReplyMessageID, claimRequest.AttemptOwner, payload.FencingToken); err != nil {
+					t.Fatal(err)
+				}
+			}
+			response, err := receiver.Receive(context.Background(), mustMarshal(t, claimRequest))
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := sshproxy.ValidateControlRequest(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(string(parsed.Result), `"disposition":"existing"`) || strings.Contains(string(parsed.Result), "fencingToken") || strings.Contains(string(parsed.Result), "lease") || strings.Contains(string(parsed.Result), "won") {
+				t.Fatalf("terminal result = %s", parsed.Result)
+			}
+			_ = j.Close()
+		})
+	}
+}
+
 func TestReceiverRejectsWrongStoreRouteAndConflict(t *testing.T) {
 	j, state := openReceiverJournal(t, time.Minute)
 	prepareOriginal(t, j)

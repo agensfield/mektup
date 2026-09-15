@@ -219,14 +219,26 @@ func validateClaimIdentity(ctx context.Context, j *journal.Journal, req sshproxy
 func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) (json.RawMessage, error) {
 	switch req.Operation {
 	case "claim":
+		if _, inspectErr := j.Reply(ctx, req.ReplyMessageID); inspectErr == nil {
+			if err := validateClaimTuple(ctx, j, req, storeID); err != nil {
+				return nil, journal.ErrIdentityConflict
+			}
+		}
 		claim, err := j.ClaimReply(ctx, journal.ClaimInput{ReplyID: req.ReplyMessageID, OriginalID: req.OriginalMessageID, Digest: req.BodySHA256, BodySize: deref(req.BodyBytes), Status: req.ReplyStatus, ReplyRoute: req.ReplyDestination.URI, CustodyRoute: req.Custody.EndpointID, CustodyStoreID: storeID, Owner: req.AttemptOwner})
 		if err != nil {
+			if errors.Is(err, journal.ErrClaimExpired) {
+				if terminal, inspectErr := j.Reply(ctx, req.ReplyMessageID); inspectErr == nil {
+					if tupleErr := validateClaimTuple(ctx, j, req, storeID); tupleErr == nil {
+						return existingClaimResult(terminal)
+					}
+				}
+			}
 			return nil, err
 		}
 		if claim.Joined {
 			// Matching retries receive status-only metadata. The existing
 			// disposition never authorizes body dispatch or fencing operations.
-			return resultJSON(map[string]any{"disposition": "existing", "state": claim.State, "replyStatus": claim.Status, "won": claim.Won, "commitSeq": claim.CommitSeq})
+			return existingClaimResult(claim)
 		}
 		return resultJSON(map[string]any{"disposition": "claimed", "state": claim.State, "fencingToken": claim.Token, "lease": leaseJSON(claim.LeaseUntil)})
 	case "heartbeat":
@@ -260,6 +272,10 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 	default:
 		return nil, fmt.Errorf("%w: unsupported operation", sshproxy.ErrControlValidation)
 	}
+}
+
+func existingClaimResult(claim journal.ReplyClaim) (json.RawMessage, error) {
+	return resultJSON(map[string]any{"disposition": "existing", "state": claim.State, "replyStatus": claim.Status, "commitSeq": claim.CommitSeq})
 }
 
 func resultJSON(value map[string]any) (json.RawMessage, error) {
