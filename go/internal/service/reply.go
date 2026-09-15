@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/agensfield/mektup/go"
@@ -170,6 +171,12 @@ func (s *Service) Reply(ctx context.Context, resolver OriginalResolver, req Repl
 					defer cancel()
 				}
 				waitStatus, waitErr := waiter.WaitReply(waitCtx, replyID, req.WaitTimeout)
+				if waitErr == nil {
+					waitErr = waitStateError(waitStatus)
+				}
+				if waitErr != nil && waitStatus.State != mektup.StateReplyOutcomeUnknown && waitStatus.State != mektup.StateReplyAccepted && waitStatus.State != mektup.StateReplyObserved {
+					waitErr = semantic(mektup.ErrWaitIncomplete, "joined reply wait ended before a correlated child reply", nil, waitErr)
+				}
 				out.Wait = &WaitResult{Receipt: receiptFor(op, e, waitStatus.State, ""), State: waitStatus.State, ReplyID: waitStatus.ReplyID, ReplyStatus: waitStatus.ReplyStatus, Incomplete: waitErr != nil}
 				return out, waitErr
 			}
@@ -200,8 +207,9 @@ func (s *Service) Reply(ctx context.Context, resolver OriginalResolver, req Repl
 	// inside a journal transaction and a late commit is fenced by token/lease.
 	heartbeatCtx, stopHeartbeat := context.WithCancel(context.Background())
 	defer stopHeartbeat()
+	heartbeatMonitor := newHeartbeatMonitor()
 	heartbeatErrors := make(chan error, 1)
-	go heartbeat(heartbeatCtx, s.Journal, claim.ReplyID, claim.Owner, claim.Token, heartbeatErrors)
+	go heartbeat(heartbeatCtx, s.Journal, claim.ReplyID, claim.Owner, claim.Token, heartbeatErrors, heartbeatMonitor)
 	if prepared.Token == "" {
 		if resumed {
 			_ = detachTarget(s.Delivery, target)
@@ -229,31 +237,24 @@ func (s *Service) Reply(ctx context.Context, resolver OriginalResolver, req Repl
 	deliveryCtx, cancel := deliveryContext(ctx, req.DeliveryTimeout, req.DisableDeliveryTimeout)
 	defer cancel()
 	delivery, deliveryErr := s.dispatch(deliveryCtx, target, string(payload), replyID)
+	if monitorErr := heartbeatMonitor.wait(deliveryCtx); monitorErr != nil {
+		return ReplyResult{}, s.abortReplyHeartbeat(ctx, target, resumed, claim, prepared, monitorErr)
+	}
 	var heartbeatErr error
 	select {
 	case heartbeatErr = <-heartbeatErrors:
 	default:
 	}
-	if deliveryErr == nil && heartbeatErr != nil {
-		recordCtx, recordCancel := custodyContext(ctx)
-		abandonErr := s.Journal.AbandonReply(recordCtx, claim.ReplyID, claim.Owner, claim.Token)
-		resultErr := s.Journal.RecordResult(recordCtx, prepared.OperationID, mektup.StateOutcomeUnknown, "heartbeat_failed")
-		recordCancel()
-		if abandonErr != nil || resultErr != nil {
-			return ReplyResult{}, semantic(mektup.ErrInternal, "heartbeat failure and conservative outcome could not be journaled", nil, errors.Join(heartbeatErr, abandonErr, resultErr))
-		}
-		if resumed {
-			_ = detachTarget(s.Delivery, target)
-		}
-		return ReplyResult{}, semantic(mektup.ErrReplyOutcomeUnknown, "reply claim heartbeat failed; body outcome is conservatively unknown", nil, heartbeatErr)
-	}
-	if deliveryErr != nil && heartbeatErr != nil {
-		deliveryErr.Err = errors.Join(deliveryErr.Err, heartbeatErr)
+	if heartbeatErr != nil {
+		return ReplyResult{}, s.abortReplyHeartbeat(ctx, target, resumed, claim, prepared, heartbeatErr)
 	}
 	if deliveryErr != nil {
 		state, code, retry := classifyDelivery(deliveryErr)
 		if retry {
-			delivery, deliveryErr, state, code = s.retryNotSubmitted(deliveryCtx, target, string(payload), replyID, deliveryErr, state, code)
+			delivery, deliveryErr, state, code = s.retryNotSubmitted(deliveryCtx, target, string(payload), replyID, deliveryErr, state, code, func() error { return heartbeatMonitor.wait(deliveryCtx) })
+		}
+		if heartbeatErr = readHeartbeatError(heartbeatErrors); heartbeatErr != nil {
+			return ReplyResult{}, s.abortReplyHeartbeat(ctx, target, resumed, claim, prepared, heartbeatErr)
 		}
 		if deliveryErr == nil {
 			// The exact NotSubmitted retry proved non-admission. A successful
@@ -291,6 +292,12 @@ func (s *Service) Reply(ctx context.Context, resolver OriginalResolver, req Repl
 		return ReplyResult{}, semantic(mektup.ErrReplyOutcomeUnknown, "reply body outcome is unknown; it will not be replayed", nil, deliveryErr)
 	}
 replyAccepted:
+	if monitorErr := heartbeatMonitor.wait(deliveryCtx); monitorErr != nil {
+		return ReplyResult{}, s.abortReplyHeartbeat(ctx, target, resumed, claim, prepared, monitorErr)
+	}
+	if heartbeatErr = readHeartbeatError(heartbeatErrors); heartbeatErr != nil {
+		return ReplyResult{}, s.abortReplyHeartbeat(ctx, target, resumed, claim, prepared, heartbeatErr)
+	}
 	commitCtx, commitCancel := custodyContext(ctx)
 	if _, err := s.Journal.CommitReply(commitCtx, claim.ReplyID, claim.Owner, claim.Token); err != nil {
 		commitCancel()
@@ -333,7 +340,87 @@ replyAccepted:
 	return out, nil
 }
 
-func heartbeat(ctx context.Context, journal JournalPort, replyID, owner, token string, failures chan<- error) {
+func readHeartbeatError(failures <-chan error) error {
+	select {
+	case err := <-failures:
+		return err
+	default:
+		return nil
+	}
+}
+
+func (s *Service) abortReplyHeartbeat(ctx context.Context, target ResolvedTarget, resumed bool, claim ReplyClaim, prepared Prepared, heartbeatErr error) error {
+	recordCtx, recordCancel := custodyContext(ctx)
+	abandonErr := s.Journal.AbandonReply(recordCtx, claim.ReplyID, claim.Owner, claim.Token)
+	resultErr := s.Journal.RecordResult(recordCtx, prepared.OperationID, mektup.StateOutcomeUnknown, "heartbeat_failed")
+	recordCancel()
+	if resumed {
+		if detachErr := detachTarget(s.Delivery, target); detachErr != nil {
+			abandonErr = errors.Join(abandonErr, detachErr)
+		}
+	}
+	if abandonErr != nil || resultErr != nil {
+		return semantic(mektup.ErrInternal, "heartbeat failure and conservative outcome could not be journaled", nil, errors.Join(heartbeatErr, abandonErr, resultErr))
+	}
+	return semantic(mektup.ErrReplyOutcomeUnknown, "reply claim heartbeat failed; body outcome is conservatively unknown", nil, heartbeatErr)
+}
+
+type heartbeatMonitor struct {
+	mu     sync.Mutex
+	active int
+	err    error
+	idle   chan struct{}
+}
+
+func newHeartbeatMonitor() *heartbeatMonitor {
+	idle := make(chan struct{})
+	close(idle)
+	return &heartbeatMonitor{idle: idle}
+}
+func (m *heartbeatMonitor) begin() {
+	m.mu.Lock()
+	if m.active == 0 {
+		m.idle = make(chan struct{})
+	}
+	m.active++
+	m.mu.Unlock()
+}
+func (m *heartbeatMonitor) end(err error) {
+	m.mu.Lock()
+	if err != nil && m.err == nil {
+		m.err = err
+	}
+	m.active--
+	if m.active == 0 {
+		close(m.idle)
+	}
+	m.mu.Unlock()
+}
+func (m *heartbeatMonitor) wait(ctx context.Context) error {
+	m.mu.Lock()
+	idle := m.idle
+	m.mu.Unlock()
+	select {
+	case <-idle:
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func heartbeat(ctx context.Context, journal JournalPort, replyID, owner, token string, failures chan<- error, monitor *heartbeatMonitor) {
+	monitor.begin()
+	err := journal.Heartbeat(ctx, replyID, owner, token)
+	monitor.end(err)
+	if err != nil {
+		select {
+		case failures <- err:
+		default:
+		}
+		return
+	}
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -341,7 +428,10 @@ func heartbeat(ctx context.Context, journal JournalPort, replyID, owner, token s
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := journal.Heartbeat(ctx, replyID, owner, token); err != nil {
+			monitor.begin()
+			err := journal.Heartbeat(ctx, replyID, owner, token)
+			monitor.end(err)
+			if err != nil {
 				select {
 				case failures <- err:
 				default:

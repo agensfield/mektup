@@ -248,15 +248,21 @@ func TestRecognizedNotSubmittedRetriesPinnedTargetAndIDOnce(t *testing.T) {
 	}
 }
 
-type repeatedReviewDelivery struct{ calls int }
+type repeatedReviewDelivery struct {
+	mu    sync.Mutex
+	calls int
+}
 
 func (d *repeatedReviewDelivery) Send(context.Context, ResolvedTarget, string, string) (DeliveryResult, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
 	d.calls++
 	if d.calls < 3 {
 		return DeliveryResult{}, &DeliveryError{Server: &codexapi.ServerError{Code: -32603, Message: "failed to submit turn input: ActiveTurnNotSteerable { turn_kind: Review }"}, Phase: WriteComplete}
 	}
 	return DeliveryResult{Accepted: true, TurnID: "turn-repeat", Evidence: "accepted"}, nil
 }
+func (d *repeatedReviewDelivery) count() int { d.mu.Lock(); defer d.mu.Unlock(); return d.calls }
 func (*repeatedReviewDelivery) Resume(context.Context, ResolvedTarget) (string, error) {
 	return "", nil
 }
@@ -440,6 +446,77 @@ func TestReplyReviewRetryReachesCommit(t *testing.T) {
 	out, err := (&Service{Resolver: &r, Delivery: d, Journal: j}).Reply(context.Background(), originalResolver{original: OriginalMessage{Envelope: original, CurrentThread: r.target.URI}}, ReplyRequest{Reference: original.MessageID, MessageID: replyID, Body: "answer", DeliveryTimeout: time.Second})
 	if err != nil || out.Receipt.State != mektup.StateReplyAccepted || j.claims[replyID].State != mektup.StateReplyAccepted {
 		t.Fatalf("retry did not commit: calls=%d receipt=%s claim=%s err=%v", d.calls, out.Receipt.State, j.claims[replyID].State, err)
+	}
+}
+
+type unknownJoinedWaitJournal struct{ *fakeJournal }
+
+func (j unknownJoinedWaitJournal) WaitReply(context.Context, string, time.Duration) (OperationStatus, error) {
+	return OperationStatus{State: mektup.StateReplyOutcomeUnknown}, nil
+}
+
+func TestJoinedUnknownReplyIsTypedAndDoesNotRedispatch(t *testing.T) {
+	r := baseResolver()
+	j := newFakeJournal()
+	original := mektup.Envelope{MessageID: "msg_29999999-9999-7999-8999-999999999999", Kind: mektup.KindMessage, FromEndpointID: epSource, From: r.source.URI, FromKind: "agent", ToEndpointID: epTarget, To: r.target.URI, RequestedTarget: "target", ReplyRequested: true, ReplyEndpointID: epSource, ReplyTo: r.source.URI, ReplyCustodyEndpointID: epSource, ReplyCustodyStoreID: storeID, Body: "question", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	original.PayloadBytes = uint64(len(original.Body))
+	original.PayloadSHA256 = digest(original.Body)
+	rid := "msg_30999999-9999-7999-8999-999999999999"
+	j.claims[rid] = ReplyClaim{ReplyID: rid, OriginalID: original.MessageID, Digest: digest("answer"), BodySize: 6, Status: "success", State: mektup.StateReplyDispatchClaimed, Owner: "first-owner", Token: "first-token"}
+	d := &fakeDelivery{}
+	out, err := (&Service{Resolver: &r, Delivery: d, Journal: unknownJoinedWaitJournal{j}}).Reply(context.Background(), originalResolver{original: OriginalMessage{Envelope: original, CurrentThread: r.target.URI}}, ReplyRequest{Reference: original.MessageID, MessageID: rid, Body: "answer", Wait: true, WaitTimeout: time.Second})
+	var se *Error
+	if !errors.As(err, &se) || se.Code != mektup.ErrReplyOutcomeUnknown || d.count() != 0 || out.Wait == nil {
+		t.Fatalf("joined unknown not typed/fenced: wait=%#v err=%v sends=%d", out.Wait, err, d.count())
+	}
+}
+
+type retryHeartbeatJournal struct {
+	*fakeJournal
+	started chan struct{}
+	release chan struct{}
+	failed  chan struct{}
+	once    sync.Once
+}
+
+func (j *retryHeartbeatJournal) Heartbeat(context.Context, string, string, string) error {
+	j.once.Do(func() { close(j.started) })
+	<-j.release
+	close(j.failed)
+	return errors.New("heartbeat lost during retry")
+}
+
+func TestReplyHeartbeatFailureDuringSafeRetryAbortsUnknown(t *testing.T) {
+	r := baseResolver()
+	d := &repeatedReviewDelivery{}
+	j := &retryHeartbeatJournal{fakeJournal: newFakeJournal(), started: make(chan struct{}), release: make(chan struct{}), failed: make(chan struct{})}
+	original := mektup.Envelope{MessageID: "msg_31999999-9999-7999-8999-999999999999", Kind: mektup.KindMessage, FromEndpointID: epSource, From: r.source.URI, FromKind: "agent", ToEndpointID: epTarget, To: r.target.URI, RequestedTarget: "target", ReplyRequested: true, ReplyEndpointID: epSource, ReplyTo: r.source.URI, ReplyCustodyEndpointID: epSource, ReplyCustodyStoreID: storeID, Body: "question", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	original.PayloadBytes = uint64(len(original.Body))
+	original.PayloadSHA256 = digest(original.Body)
+	done := make(chan error, 1)
+	go func() {
+		_, err := (&Service{Resolver: &r, Delivery: d, Journal: j}).Reply(context.Background(), originalResolver{original: OriginalMessage{Envelope: original, CurrentThread: r.target.URI}}, ReplyRequest{Reference: original.MessageID, Body: "answer", DeliveryTimeout: time.Second})
+		done <- err
+	}()
+	select {
+	case <-j.started:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat did not start")
+	}
+	deadline := time.Now().Add(time.Second)
+	for d.count() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	close(j.release)
+	select {
+	case <-j.failed:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat failure did not complete")
+	}
+	err := <-done
+	var se *Error
+	if !errors.As(err, &se) || se.Code != mektup.ErrReplyOutcomeUnknown || d.count() < 2 {
+		t.Fatalf("retry heartbeat failure was not conservative: calls=%d err=%v", d.count(), err)
 	}
 }
 

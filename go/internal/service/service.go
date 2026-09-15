@@ -500,7 +500,7 @@ func deliveryContext(parent context.Context, timeout time.Duration, disabled boo
 	return context.WithTimeout(parent, timeout)
 }
 
-func (s *Service) retryNotSubmitted(ctx context.Context, target ResolvedTarget, text, messageID string, last *DeliveryError, state mektup.EvidenceState, code string) (DeliveryResult, *DeliveryError, mektup.EvidenceState, string) {
+func (s *Service) retryNotSubmitted(ctx context.Context, target ResolvedTarget, text, messageID string, last *DeliveryError, state mektup.EvidenceState, code string, checks ...func() error) (DeliveryResult, *DeliveryError, mektup.EvidenceState, string) {
 	backoff := 10 * time.Millisecond
 	result := DeliveryResult{}
 	for {
@@ -514,6 +514,11 @@ func (s *Service) retryNotSubmitted(ctx context.Context, target ResolvedTarget, 
 		case <-timer.C:
 		}
 		result, last = s.dispatch(ctx, target, text, messageID)
+		for _, check := range checks {
+			if checkErr := check(); checkErr != nil {
+				return result, &DeliveryError{Err: checkErr, Phase: WriteMayHaveWritten}, mektup.StateOutcomeUnknown, "heartbeat_failed_during_retry"
+			}
+		}
 		if last == nil {
 			return result, nil, mektup.StateAccepted, ""
 		}

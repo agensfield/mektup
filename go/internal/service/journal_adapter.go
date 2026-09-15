@@ -75,7 +75,6 @@ func (a SQLiteJournal) Lookup(ctx context.Context, ref string) (OperationStatus,
 	// putting bodies or relationship prose in the journal schema.
 	if ownClaim, claimErr := a.Inner.Reply(ctx, r.MessageID); claimErr == nil {
 		status.InReplyTo = ownClaim.OriginalID
-		status.State = mektup.EvidenceState(ownClaim.State)
 	}
 	claims, err := a.Inner.RepliesFor(ctx, r.MessageID)
 	if err != nil {
@@ -159,6 +158,14 @@ func (a SQLiteJournal) WaitReply(ctx context.Context, replyID string, timeout ti
 	for {
 		if err := a.ExpireClaims(ctx); err != nil {
 			return OperationStatus{}, err
+		}
+		if ownClaim, ownErr := a.Inner.Reply(ctx, replyID); ownErr == nil && ownClaim.State == journal.StateReplyOutcomeUnknown {
+			status, lookupErr := a.Lookup(ctx, replyID)
+			if lookupErr != nil {
+				return OperationStatus{}, lookupErr
+			}
+			status.State = mektup.StateReplyOutcomeUnknown
+			return status, nil
 		}
 		status, err := a.Lookup(ctx, replyID)
 		if err != nil {

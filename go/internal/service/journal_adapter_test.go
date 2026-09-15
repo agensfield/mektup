@@ -129,3 +129,27 @@ func TestServiceWithSQLiteAdapterMapsPostFencePreWriteToUnknown(t *testing.T) {
 		t.Fatalf("post-fence pre-write state = %s", status.State)
 	}
 }
+
+func TestSQLiteReplyWaitDoesNotCountOwnAcceptance(t *testing.T) {
+	ctx := context.Background()
+	inner, err := journal.Open(ctx, journal.Options{StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	r := baseResolver()
+	original := mektup.Envelope{MessageID: "msg_27999999-9999-7999-8999-999999999999", Kind: mektup.KindMessage, FromEndpointID: epSource, From: r.source.URI, FromKind: "agent", ToEndpointID: epTarget, To: r.target.URI, RequestedTarget: "target", ReplyRequested: true, ReplyEndpointID: epSource, ReplyTo: r.source.URI, ReplyCustodyEndpointID: epSource, ReplyCustodyStoreID: storeID, Body: "question", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	original.PayloadBytes = uint64(len(original.Body))
+	original.PayloadSHA256 = digest(original.Body)
+	if _, err := inner.Prepare(ctx, journal.Operation{OperationID: "op_28999999-9999-7999-8999-999999999999", MessageID: original.MessageID, SourceRoute: original.From, TargetRoute: original.To, Semantics: "message", Digest: original.PayloadSHA256, BodySize: int64(original.PayloadBytes), ReplyRoute: original.ReplyTo, CustodyRoute: original.ReplyCustodyEndpointID, CustodyStoreID: original.ReplyCustodyStoreID}); err != nil {
+		t.Fatal(err)
+	}
+	a := SQLiteJournal{Inner: inner, SourceEndpointID: epSource, TargetEndpointID: epTarget, ReplyEndpointID: epSource}
+	d := &fakeDelivery{}
+	s := &Service{Resolver: &r, Delivery: d, Journal: a}
+	got, err := s.Reply(ctx, originalResolver{original: OriginalMessage{Envelope: original, CurrentThread: original.To}}, ReplyRequest{Reference: original.MessageID, Body: "answer", Wait: true, WaitTimeout: 30 * time.Millisecond})
+	var se *Error
+	if !errors.As(err, &se) || se.Code != mektup.ErrWaitIncomplete || got.Wait == nil || got.Wait.ReplyID != "" {
+		t.Fatalf("own acceptance counted as child reply: wait=%#v err=%v", got.Wait, err)
+	}
+}
