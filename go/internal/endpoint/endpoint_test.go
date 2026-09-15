@@ -144,6 +144,18 @@ func TestEndpointPrecedenceAndSourceIndependence(t *testing.T) {
 	if err := store.Add(Endpoint{Alias: "remote", Route: route}); err != nil {
 		t.Fatal(err)
 	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Default = "remote"
+	if err := store.Save(cfg); err != nil {
+		t.Fatal(err)
+	}
+	defaultEndpoint, err := store.ResolveEndpoint("", filepath.Join(root, "codex-a"))
+	if err != nil || defaultEndpoint.Alias != "remote" {
+		t.Fatalf("configured default = %#v, err=%v", defaultEndpoint, err)
+	}
 	source, err := store.ResolveSource(SourceOptions{CurrentThreadID: "thread-a", CodexHome: filepath.Join(root, "codex-a")})
 	if err != nil {
 		t.Fatal(err)
