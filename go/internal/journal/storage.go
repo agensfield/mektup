@@ -339,6 +339,9 @@ func validateReadOnlySchema(ctx context.Context, db *sql.DB) error {
 	if presentation != 1 {
 		return fmt.Errorf("%w: required v5 manual-resolution presentation column is missing", ErrStorageCorrupt)
 	}
+	if err := validateBlockerStructure(ctx, db); err != nil {
+		return err
+	}
 	for _, column := range []string{"source_endpoint_id", "source_thread_id", "target_endpoint_id", "target_thread_id"} {
 		var count int
 		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('receipts') WHERE name=?", column).Scan(&count); err != nil {

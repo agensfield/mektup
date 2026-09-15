@@ -3,6 +3,7 @@ package journal
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -23,6 +24,40 @@ func TestCurrentSchemaMissingReceiptsFailsClosed(t *testing.T) {
 		t.Fatal("current schema missing receipts silently recreated")
 	} else if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("missing schema error: %v", err)
+	}
+}
+
+func TestV5BlockerStructureFailsClosed(t *testing.T) {
+	for _, shape := range []string{"missing-columns", "missing-primary-key"} {
+		t.Run(shape, func(t *testing.T) {
+			ctx := context.Background()
+			dir := t.TempDir()
+			j, err := Open(ctx, Options{StateDir: dir})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := j.db.Exec("ALTER TABLE blockers RENAME TO old_blockers"); err != nil {
+				t.Fatal(err)
+			}
+			shapeSQL := "CREATE TABLE blockers(generation TEXT)"
+			if shape == "missing-primary-key" {
+				shapeSQL = "CREATE TABLE blockers AS SELECT * FROM old_blockers WHERE 0"
+			}
+			if _, err := j.db.Exec(shapeSQL); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := j.db.Exec("DROP TABLE old_blockers"); err != nil {
+				t.Fatal(err)
+			}
+			_ = j.Close()
+			if _, err := CheckPath(ctx, filepath.Join(dir, "journal.sqlite3")); err == nil {
+				t.Fatal("read-only check accepted malformed blockers")
+			}
+			if again, err := Open(ctx, Options{StateDir: dir}); err == nil {
+				again.Close()
+				t.Fatal("open accepted malformed blockers")
+			}
+		})
 	}
 }
 

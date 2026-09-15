@@ -618,6 +618,9 @@ func validateV5Schema(ctx context.Context, tx *sql.Tx) error {
 			return fmt.Errorf("%w: required v5 table %s is missing", ErrCorrupt, name)
 		}
 	}
+	if err := validateBlockerStructure(ctx, tx); err != nil {
+		return err
+	}
 	var presentation int
 	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('manual_resolutions') WHERE name='presentation'").Scan(&presentation); err != nil {
 		return fmt.Errorf("journal schema validation: %w", err)
@@ -632,6 +635,63 @@ func validateV5Schema(ctx context.Context, tx *sql.Tx) error {
 		}
 		if count != 1 {
 			return fmt.Errorf("%w: required v5 receipt column %s is missing", ErrCorrupt, column)
+		}
+	}
+	return nil
+}
+
+type schemaQueryer interface {
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}
+
+// validateBlockerStructure is shared by normal open validation and read-only
+// CheckPath. A table name alone is insufficient: UpsertBlocker relies on the
+// exact endpoint/generation/method/correlation primary key and metadata
+// columns being present with the expected SQLite types/nullability.
+func validateBlockerStructure(ctx context.Context, queryer schemaQueryer) error {
+	rows, err := queryer.QueryContext(ctx, "PRAGMA table_info('blockers')")
+	if err != nil {
+		return fmt.Errorf("%w: inspect blockers schema: %v", ErrCorrupt, err)
+	}
+	type column struct {
+		typ    string
+		notNil int
+		pk     int
+	}
+	columns := make(map[string]column)
+	for rows.Next() {
+		var cid, notNil, pk int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNil, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("%w: inspect blockers schema: %v", ErrCorrupt, err)
+		}
+		columns[name] = column{typ: typ, notNil: notNil, pk: pk}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("%w: inspect blockers schema: %v", ErrCorrupt, err)
+	}
+	rows.Close()
+	required := map[string]column{
+		"method":         {typ: "TEXT", notNil: 1, pk: 3},
+		"correlation_id": {typ: "TEXT", notNil: 1, pk: 4},
+		"generation":     {typ: "TEXT", notNil: 1, pk: 2},
+		"first_seen":     {typ: "INTEGER", notNil: 1, pk: 0},
+		"last_seen":      {typ: "INTEGER", notNil: 1, pk: 0},
+		"resolved_at":    {typ: "INTEGER", notNil: 0, pk: 0},
+		"endpoint_id":    {typ: "TEXT", notNil: 1, pk: 1},
+		"thread_id":      {typ: "TEXT", notNil: 1, pk: 0},
+		"turn_id":        {typ: "TEXT", notNil: 1, pk: 0},
+		"item_id":        {typ: "TEXT", notNil: 1, pk: 0},
+		"operation_id":   {typ: "TEXT", notNil: 1, pk: 0},
+		"message_id":     {typ: "TEXT", notNil: 1, pk: 0},
+	}
+	for name, want := range required {
+		got, ok := columns[name]
+		if !ok || got.typ != want.typ || got.notNil != want.notNil || got.pk != want.pk {
+			return fmt.Errorf("%w: malformed v5 blockers column %s", ErrCorrupt, name)
 		}
 	}
 	return nil
