@@ -151,7 +151,11 @@ func TestLiveBodyCarryAcceptance(t *testing.T) {
 		t.Fatalf("custody reply ID %q differs from delivered reply %q", sendOutcome.result.Wait.ReplyID, replyID)
 	}
 	originalCount := 0
-	for _, item := range mustHistory(t, observe, targetResolved) {
+	targetItems, historyErr := mustHistory(ctx, observe, targetResolved)
+	if historyErr != nil {
+		t.Fatalf("target history verification: %v", historyErr)
+	}
+	for _, item := range targetItems {
 		if item.NativeType != "userMessage" || item.ClientMessageID != original.Envelope.MessageID {
 			continue
 		}
@@ -178,13 +182,17 @@ func TestLiveBodyCarryAcceptance(t *testing.T) {
 	}
 }
 
-func mustHistory(t *testing.T, observe service.ObservationPort, target service.ResolvedTarget) []service.ObservedItem {
-	t.Helper()
-	items, err := observe.FullHistory(context.Background(), target)
-	if err != nil {
-		t.Fatal(err)
+func mustHistory(ctx context.Context, observe service.ObservationPort, target service.ResolvedTarget) ([]service.ObservedItem, error) {
+	return observe.FullHistory(ctx, target)
+}
+
+func TestMustHistoryHonorsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := mustHistory(ctx, &slowHistoryObservation{started: make(chan struct{})}, service.ResolvedTarget{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("history cancellation error = %v", err)
 	}
-	return items
 }
 
 type liveSendOutcome struct {
