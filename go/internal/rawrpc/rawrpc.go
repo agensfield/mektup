@@ -76,6 +76,14 @@ type Caller interface {
 	Call(context.Context, appserver.RPCRequest) (*appserver.RPCResult, error)
 }
 
+// ExperimentalCapability is the positive connection-level proof required for
+// experimental methods or selected experimental fields. A request boolean is
+// deliberately not accepted as proof: the connection adapter must report the
+// capability it actually negotiated during initialization.
+type ExperimentalCapability interface {
+	ExperimentalAPIEnabled() bool
+}
+
 // FuncCaller adapts a function to Caller and is useful for deterministic
 // tests or a thin connection-layer adapter.
 type FuncCaller func(context.Context, appserver.RPCRequest) (*appserver.RPCResult, error)
@@ -207,6 +215,13 @@ func Execute(ctx context.Context, caller Caller, request Request) (*Response, er
 	if caller == nil {
 		return nil, newError(mektup.ErrInternal, "raw RPC caller is required", mektup.StateNotSent, false, nil, errors.New("nil caller"))
 	}
+	if plan.ExperimentalAPIRequired {
+		capability, ok := caller.(ExperimentalCapability)
+		if !ok || !capability.ExperimentalAPIEnabled() {
+			return nil, newError(mektup.ErrExperimentalMethodUnavailable, "raw RPC requires an initialized experimental API capability", mektup.StateNotSent, false,
+				map[string]any{"method": plan.Request.Method, "experimental": true, "experimentalFields": append([]string(nil), plan.Decision.ExperimentalFields...)}, errors.New("experimentalApi capability was not positively negotiated"))
+		}
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -332,6 +347,24 @@ func stateFor(evidence appserver.WriteEvidence, serverError bool) mektup.Evidenc
 }
 
 func retainResult(ctx context.Context, response *Response, raw json.RawMessage, options OutputOptions) error {
+	// An explicit output path is an output request, not merely a spill
+	// fallback. Publish the complete response even when it fits inline.
+	if options.Path != "" {
+		artifactOptions := artifact.RPCOutputOptions{MaxBytes: options.MaxBytes, MediaType: "application/json", SensitiveOutputPossible: true, Force: options.Force}
+		var receipt artifact.Receipt
+		var err error
+		if options.Store != nil {
+			receipt, err = options.Store.WriteRPCOutputPath(ctx, options.Path, bytes.NewReader(raw), artifactOptions)
+		} else {
+			receipt, err = artifact.WriteRPCOutputPath(ctx, options.Path, bytes.NewReader(raw), artifactOptions)
+		}
+		if err != nil {
+			return newError(mektup.ErrOutputTooLarge, "raw RPC response could not be retained completely", response.EffectState, false,
+				map[string]any{"bytes": len(raw), "outputPath": options.Path, "error": err.Error()}, err)
+		}
+		response.Artifact = &receipt
+		return nil
+	}
 	limit := options.InlineLimit
 	if limit == 0 {
 		limit = DefaultInlineLimit
@@ -349,15 +382,7 @@ func retainResult(ctx context.Context, response *Response, raw json.RawMessage, 
 	}
 	var receipt artifact.Receipt
 	var err error
-	artifactOptions := artifact.RPCOutputOptions{MaxBytes: options.MaxBytes, MediaType: "application/json", SensitiveOutputPossible: true}
-	if options.Path != "" {
-		artifactOptions.Force = options.Force
-		if options.Store != nil {
-			receipt, err = options.Store.WriteRPCOutputPath(ctx, options.Path, bytes.NewReader(raw), artifactOptions)
-		} else {
-			receipt, err = artifact.WriteRPCOutputPath(ctx, options.Path, bytes.NewReader(raw), artifactOptions)
-		}
-	} else if options.Store != nil {
+	if options.Store != nil {
 		receipt, err = options.Store.Spill(ctx, name, bytes.NewReader(raw), artifact.Options{MaxBytes: options.MaxBytes, MediaType: "application/json", SensitiveOutputPossible: true})
 	} else {
 		err = errors.New("raw RPC response exceeds inline limit and no artifact destination was supplied")

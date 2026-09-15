@@ -26,6 +26,13 @@ type recordingCaller struct {
 	err    error
 }
 
+type capableCaller struct {
+	recordingCaller
+	experimental bool
+}
+
+func (c *capableCaller) ExperimentalAPIEnabled() bool { return c.experimental }
+
 func (c *recordingCaller) Call(_ context.Context, request appserver.RPCRequest) (*appserver.RPCResult, error) {
 	c.calls.Add(1)
 	c.method = request.Method
@@ -107,8 +114,15 @@ func TestExperimentalMethodAndFieldRequireCapabilityButNotEffectGrant(t *testing
 	if err != nil || !plan.ExperimentalAPIRequired {
 		t.Fatalf("experimental method plan=%+v err=%v", plan, err)
 	}
-	if _, err := Execute(context.Background(), methodCaller, plan.Request); err != nil || methodCaller.calls.Load() != 1 {
-		t.Fatalf("experimental method execute err=%v calls=%d", err, methodCaller.calls.Load())
+	if _, err := Execute(context.Background(), methodCaller, plan.Request); err == nil || methodCaller.calls.Load() != 0 {
+		rawErr := requireRawError(t, err)
+		if rawErr.Code != mektup.ErrExperimentalMethodUnavailable || rawErr.EffectState != string(mektup.StateNotSent) {
+			t.Fatalf("missing method capability error = %+v", rawErr)
+		}
+	}
+	methodCapable := &capableCaller{recordingCaller: recordingCaller{result: readResult(`{"ok":true}`)}, experimental: true}
+	if _, err := Execute(context.Background(), methodCapable, plan.Request); err != nil || methodCapable.calls.Load() != 1 {
+		t.Fatalf("experimental method execute err=%v calls=%d", err, methodCapable.calls.Load())
 	}
 
 	fieldCaller := &recordingCaller{result: readResult(`{"threadId":"child"}`)}
@@ -116,8 +130,15 @@ func TestExperimentalMethodAndFieldRequireCapabilityButNotEffectGrant(t *testing
 	if err != nil || !plan.ExperimentalAPIRequired || len(plan.Decision.ExperimentalFields) != 1 || plan.Decision.ExperimentalFields[0] != "thread/fork.beforeTurnId" {
 		t.Fatalf("experimental field plan=%+v err=%v", plan, err)
 	}
-	if _, err := Execute(context.Background(), fieldCaller, plan.Request); err != nil || fieldCaller.calls.Load() != 1 {
-		t.Fatalf("experimental field execute err=%v calls=%d", err, fieldCaller.calls.Load())
+	if _, err := Execute(context.Background(), fieldCaller, plan.Request); err == nil || fieldCaller.calls.Load() != 0 {
+		rawErr := requireRawError(t, err)
+		if rawErr.Code != mektup.ErrExperimentalMethodUnavailable || rawErr.EffectState != string(mektup.StateNotSent) {
+			t.Fatalf("missing field capability error = %+v", rawErr)
+		}
+	}
+	fieldCapable := &capableCaller{recordingCaller: recordingCaller{result: readResult(`{"threadId":"child"}`)}, experimental: true}
+	if _, err := Execute(context.Background(), fieldCapable, plan.Request); err != nil || fieldCapable.calls.Load() != 1 {
+		t.Fatalf("experimental field execute err=%v calls=%d", err, fieldCapable.calls.Load())
 	}
 }
 
@@ -232,6 +253,22 @@ func TestExplicitOutputNoClobberAndForce(t *testing.T) {
 	contents, err := os.ReadFile(output)
 	if err != nil || string(contents) != `{"value":"three"}` {
 		t.Fatalf("forced output = %q err=%v", contents, err)
+	}
+}
+
+func TestExplicitOutputPathPublishesSmallResponse(t *testing.T) {
+	output := filepath.Join(t.TempDir(), "small.json")
+	caller := &recordingCaller{result: readResult(`{"small":true}`)}
+	response, err := Execute(context.Background(), caller, Request{Method: "thread/read", Output: OutputOptions{InlineLimit: 1 << 20, Path: output}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.Raw != nil || response.Artifact == nil || response.Artifact.Path != output {
+		t.Fatalf("explicit small response = %+v", response)
+	}
+	contents, err := os.ReadFile(output)
+	if err != nil || string(contents) != `{"small":true}` {
+		t.Fatalf("explicit small output = %q err=%v", contents, err)
 	}
 }
 
