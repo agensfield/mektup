@@ -584,11 +584,11 @@ func (e *Executor) rpc(ctx context.Context, inv cli.Invocation) (result cli.Exec
 	if e.ports.Connections == nil || e.ports.RPC == nil {
 		return cli.ExecutionResult{}, missing("rpc runtime")
 	}
-	if e.ports.Receipts == nil {
-		return cli.ExecutionResult{}, missing("receipt journal")
-	}
 	if has(inv, "force") && !has(inv, "output") {
 		return cli.ExecutionResult{}, usage("--force requires --output")
+	}
+	if e.ports.Receipts == nil {
+		return cli.ExecutionResult{}, missing("receipt journal")
 	}
 	params, source, err := e.params(ctx, inv)
 	if err != nil {
