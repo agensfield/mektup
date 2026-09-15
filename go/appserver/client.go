@@ -397,12 +397,12 @@ func maxInt(a, b int) int {
 var errClientClosed = io.ErrClosedPipe
 var nextGeneration atomic.Uint64
 
-func (c *Client) enqueue(ctx context.Context, cmd command) error {
+func (c *Client) enqueue(ctx context.Context, cmd command) (bool, error) {
 	for {
 		c.admitMu.Lock()
 		if !c.accepting {
 			c.admitMu.Unlock()
-			return errClientClosed
+			return false, errClientClosed
 		}
 		if cmd.kind == commandRequest {
 			// Publish queue ownership before the channel send. The pump may
@@ -415,7 +415,7 @@ func (c *Client) enqueue(ctx context.Context, cmd command) error {
 		select {
 		case c.commands <- cmd:
 			c.admitMu.Unlock()
-			return nil
+			return true, nil
 		default:
 			if cmd.kind == commandRequest {
 				c.mu.Lock()
@@ -426,9 +426,9 @@ func (c *Client) enqueue(ctx context.Context, cmd command) error {
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return false, ctx.Err()
 		case <-c.closed:
-			return errClientClosed
+			return false, errClientClosed
 		case <-c.commandSpace:
 		}
 	}
@@ -653,8 +653,13 @@ func (c *Client) call(ctx context.Context, request RPCRequest) (*RPCResult, erro
 	c.reserved[key] = struct{}{}
 	c.mu.Unlock()
 	cmd := command{kind: commandRequest, ctx: ctx, req: request, key: key, result: resultCh}
-	if err := c.enqueue(ctx, cmd); err != nil {
+	admitted, err := c.enqueue(ctx, cmd)
+	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if !admitted {
+				c.release(key)
+				return nil, &CallError{Err: err, Canceled: true, Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
+			}
 			cancel := c.withdraw(ctx, key)
 			phase := cancel.phase
 			if phase == WriteNotStarted {
@@ -725,7 +730,7 @@ func (c *Client) Notify(ctx context.Context, notification RPCNotification) error
 		ctx = context.Background()
 	}
 	done := make(chan error, 1)
-	if err := c.enqueue(ctx, command{kind: commandNotify, ctx: ctx, notify: notification, notifyDone: done}); err != nil {
+	if _, err := c.enqueue(ctx, command{kind: commandNotify, ctx: ctx, notify: notification, notifyDone: done}); err != nil {
 		return err
 	}
 	select {

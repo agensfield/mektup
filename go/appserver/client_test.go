@@ -266,6 +266,39 @@ func TestActiveCancellationNeverClaimsProvenBeforeWrite(t *testing.T) {
 	}
 }
 
+func TestFailedAdmissionDoesNotCancelActiveWriter(t *testing.T) {
+	f := newFakeTransport()
+	f.onWrite = func([]byte) error {
+		<-f.done
+		return errors.New("closed")
+	}
+	c := New(f, Options{WriterCapacity: 1})
+	defer c.Close(context.Background())
+	go c.call(context.Background(), RPCRequest{ID: "active", Method: "blocked"})
+	_ = waitWrite(t, f)
+	go c.call(context.Background(), RPCRequest{ID: "queued", Method: "queued"})
+	queueDeadline := time.Now().Add(time.Second)
+	for len(c.commands) != 1 && time.Now().Before(queueDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(c.commands) != 1 {
+		t.Fatal("queue not full")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := c.call(ctx, RPCRequest{ID: "never-admitted", Method: "unused"})
+	var callErr *CallError
+	if !errors.As(err, &callErr) || callErr.Evidence.Phase != WriteProvenBeforeWrite {
+		t.Fatalf("failed admission evidence = %+v", err)
+	}
+	select {
+	case <-f.done:
+		t.Fatal("failed admission canceled unrelated active writer")
+	default:
+	}
+	_ = f.Close()
+}
+
 func TestBoundedOverflowProducesGapAndDisconnect(t *testing.T) {
 	f := newFakeTransport()
 	c := New(f, Options{EventCapacity: 1})
