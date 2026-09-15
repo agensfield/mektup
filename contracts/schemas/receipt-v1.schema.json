@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agensfield.dev/mektup/contracts/receipt-v1.schema.json",
+  "title": "Mektup portable receipt v1",
+  "type": "object",
+  "required": [
+    "schema",
+    "receiptId",
+    "operationId",
+    "operation",
+    "state",
+    "source",
+    "target",
+    "message",
+    "evidence",
+    "warnings",
+    "createdAt",
+    "updatedAt"
+  ],
+  "properties": {
+    "schema": { "const": "mektup/receipt/v1" },
+    "receiptId": { "$ref": "common-v1.schema.json#/$defs/receiptId" },
+    "operationId": { "$ref": "common-v1.schema.json#/$defs/operationId" },
+    "operation": { "type": "string", "minLength": 1 },
+    "state": { "$ref": "common-v1.schema.json#/$defs/state" },
+    "source": { "$ref": "#/$defs/identity" },
+    "target": { "$ref": "#/$defs/identity" },
+    "message": { "$ref": "#/$defs/message" },
+    "evidence": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/evidence" }
+    },
+    "warnings": {
+      "type": "array",
+      "items": { "$ref": "warning-v1.schema.json" }
+    },
+    "createdAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+    "updatedAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+    "manualResolution": { "$ref": "#/$defs/manualResolution" }
+  },
+  "$defs": {
+    "identity": {
+      "type": "object",
+      "required": ["endpoint", "thread", "requestedSelector", "resolvedSelector", "fields"],
+      "properties": {
+        "endpoint": { "$ref": "common-v1.schema.json#/$defs/endpoint" },
+        "thread": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "common-v1.schema.json#/$defs/thread" }
+          ]
+        },
+        "requestedSelector": { "type": ["string", "null"] },
+        "resolvedSelector": { "type": ["string", "null"] },
+        "herdr": {
+          "anyOf": [
+            { "type": "null" },
+            { "type": "object" }
+          ]
+        },
+        "fields": {
+          "type": "object",
+          "additionalProperties": { "$ref": "common-v1.schema.json#/$defs/fieldEvidence" }
+        }
+      },
+      "additionalProperties": true
+    },
+    "contentRef": {
+      "type": "object",
+      "required": ["endpointId", "threadId", "locator", "bytes", "sha256"],
+      "properties": {
+        "endpointId": { "$ref": "common-v1.schema.json#/$defs/endpointId" },
+        "threadId": { "$ref": "common-v1.schema.json#/$defs/threadId" },
+        "locator": { "type": "object" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sha256": { "$ref": "common-v1.schema.json#/$defs/sha256" }
+      },
+      "additionalProperties": true
+    },
+    "message": {
+      "type": "object",
+      "required": [
+        "messageId",
+        "inReplyTo",
+        "kind",
+        "replyRequested",
+        "bodyBytes",
+        "bodySha256",
+        "clientUserMessageId",
+        "turnId",
+        "acceptedAt"
+      ],
+      "properties": {
+        "messageId": { "$ref": "common-v1.schema.json#/$defs/messageId" },
+        "inReplyTo": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "common-v1.schema.json#/$defs/messageId" }
+          ]
+        },
+        "kind": { "enum": ["message", "reply"] },
+        "replyRequested": { "type": "boolean" },
+        "bodyBytes": { "type": "integer", "minimum": 0 },
+        "bodySha256": { "$ref": "common-v1.schema.json#/$defs/sha256" },
+        "clientUserMessageId": { "type": "string", "minLength": 1 },
+        "turnId": { "type": ["string", "null"] },
+        "acceptedAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+        "replyAcceptedAt": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "common-v1.schema.json#/$defs/timestamp" }
+          ]
+        },
+        "replyObservedAt": {
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "common-v1.schema.json#/$defs/timestamp" }
+          ]
+        },
+        "replyStatus": { "enum": ["success", "error"] },
+        "replyErrorCode": { "type": "string", "minLength": 1 },
+        "contentRef": { "$ref": "#/$defs/contentRef" }
+      },
+      "not": {
+        "anyOf": [
+          { "required": ["body"] },
+          { "required": ["bodyText"] },
+          { "required": ["replyBody"] }
+        ]
+      },
+      "additionalProperties": true
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["state", "observedAt", "source"],
+      "properties": {
+        "state": { "$ref": "common-v1.schema.json#/$defs/state" },
+        "observedAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+        "source": { "type": "string", "minLength": 1 },
+        "details": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "manualResolution": {
+      "type": "object",
+      "required": ["resolution", "actor", "reason", "timestamp", "evidenceRef", "presentationMode"],
+      "properties": {
+        "resolution": { "enum": ["accepted", "not_delivered"] },
+        "actor": { "type": "string", "minLength": 1 },
+        "reason": { "type": "string", "minLength": 1 },
+        "timestamp": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+        "evidenceRef": { "type": "string", "minLength": 1 },
+        "presentationMode": { "enum": ["human", "agent"] }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

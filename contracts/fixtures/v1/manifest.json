@@ -1,0 +1,17 @@
+{
+  "schema": "mektup/contracts/v1/manifest",
+  "contractVersion": "1.0.1",
+  "fixtures": [
+    { "kind": "envelope-metadata", "schema": "Mektup/1", "path": "envelope-agent-request.json" },
+    { "kind": "envelope-rendered", "schema": "Mektup/1", "path": "envelope-agent-request.txt" },
+    { "kind": "envelope-metadata", "schema": "Mektup/1", "path": "envelope-reply.json" },
+    { "kind": "receipt", "schema": "mektup/receipt/v1", "path": "receipt-accepted.json" },
+    { "kind": "receipt", "schema": "mektup/receipt/v1", "path": "receipt-outcome-unknown.json" },
+    { "kind": "event", "schema": "mektup/event/v1", "path": "event-send-accepted.json" },
+    { "kind": "event", "schema": "mektup/event/v1", "path": "event-reply-accepted.json" },
+    { "kind": "warning", "schema": "mektup/warning/v1", "path": "warning-untested-server.json" },
+    { "kind": "error", "schema": "mektup/error/v1", "path": "error-outcome-unknown.json" },
+    { "kind": "control", "schema": "mektup/control/v1", "path": "control-claim.json" },
+    { "kind": "control", "schema": "mektup/control/v1", "path": "control-commit.json" }
+  ]
+}

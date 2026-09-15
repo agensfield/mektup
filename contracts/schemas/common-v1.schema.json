@@ -1,0 +1,132 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agensfield.dev/mektup/contracts/common-v1.schema.json",
+  "title": "Mektup v1 common definitions",
+  "$defs": {
+    "uuidv7": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "messageId": {
+      "type": "string",
+      "pattern": "^msg_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "operationId": {
+      "type": "string",
+      "pattern": "^op_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "receiptId": {
+      "type": "string",
+      "pattern": "^rcpt_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "endpointId": {
+      "type": "string",
+      "pattern": "^ep_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "eventId": {
+      "type": "string",
+      "pattern": "^evt_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "storeId": {
+      "type": "string",
+      "pattern": "^store_[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "timestamp": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]+Z$"
+    },
+    "uri": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9+.-]*://[^\\s]+$"
+    },
+    "threadId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "turnId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "state": {
+      "type": "string",
+      "enum": [
+        "not_sent",
+        "prepared",
+        "dispatch_started",
+        "reply_dispatch_claimed",
+        "reply_outcome_unknown",
+        "rejected",
+        "accepted",
+        "outcome_unknown",
+        "reply_accepted",
+        "reply_observed",
+        "manually_resolved"
+      ]
+    },
+    "compatibility": {
+      "type": "string",
+      "enum": ["tested", "untested", "unsupported", "unknown"]
+    },
+    "provenance": {
+      "type": "string",
+      "enum": ["caller_supplied", "resolved", "observed", "asserted"]
+    },
+    "effectState": {
+      "type": "string",
+      "enum": [
+        "not_sent",
+        "prepared",
+        "dispatch_started",
+        "rejected",
+        "accepted",
+        "unknown",
+        "outcome_unknown",
+        "reply_outcome_unknown"
+      ]
+    },
+    "fieldEvidence": {
+      "type": "object",
+      "required": ["value", "provenance"],
+      "properties": {
+        "value": {},
+        "provenance": { "$ref": "#/$defs/provenance" }
+      },
+      "additionalProperties": true
+    },
+    "endpoint": {
+      "type": "object",
+      "required": ["id", "alias", "transport", "server"],
+      "properties": {
+        "id": { "$ref": "#/$defs/endpointId" },
+        "alias": { "type": "string", "minLength": 1 },
+        "transport": {
+          "type": "string",
+          "enum": ["unix-websocket", "ssh-proxy"]
+        },
+        "server": {
+          "type": "object",
+          "required": ["version", "compatibility"],
+          "properties": {
+            "version": { "type": ["string", "null"] },
+            "compatibility": { "$ref": "#/$defs/compatibility" }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "thread": {
+      "type": "object",
+      "required": ["id", "uri"],
+      "properties": {
+        "id": { "$ref": "#/$defs/threadId" },
+        "uri": { "$ref": "#/$defs/uri" }
+      },
+      "additionalProperties": true
+    }
+  }
+}

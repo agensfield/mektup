@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agensfield.dev/mektup/contracts/control-v1.schema.json",
+  "title": "Mektup custody control document v1",
+  "description": "Metadata-only stdin protocol for the fenced reply custody receiver. It never carries a local path, executable path, shell fragment, or reply body.",
+  "type": "object",
+  "required": ["schema", "operation", "operationId", "receiptId", "replyMessageId", "originalMessageId", "custody", "replyDestination"],
+  "properties": {
+    "schema": { "const": "mektup/control/v1" },
+    "operation": {
+      "enum": ["claim", "heartbeat", "commit", "abandon", "status", "reconcile"]
+    },
+    "operationId": { "$ref": "common-v1.schema.json#/$defs/operationId" },
+    "receiptId": { "$ref": "common-v1.schema.json#/$defs/receiptId" },
+    "replyMessageId": { "$ref": "common-v1.schema.json#/$defs/messageId" },
+    "originalMessageId": { "$ref": "common-v1.schema.json#/$defs/messageId" },
+    "custody": {
+      "type": "object",
+      "required": ["endpointId", "storeId"],
+      "properties": {
+        "endpointId": { "$ref": "common-v1.schema.json#/$defs/endpointId" },
+        "storeId": { "$ref": "common-v1.schema.json#/$defs/storeId" }
+      },
+      "additionalProperties": true
+    },
+    "replyDestination": {
+      "type": "object",
+      "required": ["endpointId", "threadId"],
+      "properties": {
+        "endpointId": { "$ref": "common-v1.schema.json#/$defs/endpointId" },
+        "threadId": { "$ref": "common-v1.schema.json#/$defs/threadId" },
+        "uri": { "$ref": "common-v1.schema.json#/$defs/uri" }
+      },
+      "additionalProperties": true
+    },
+    "bodyBytes": { "type": "integer", "minimum": 0 },
+    "bodySha256": { "$ref": "common-v1.schema.json#/$defs/sha256" },
+    "replyStatus": { "enum": ["success", "error"] },
+    "replyErrorCode": { "type": "string", "minLength": 1 },
+    "fencingToken": { "type": "string", "minLength": 1 },
+    "lease": {
+      "type": "object",
+      "required": ["expiresAt"],
+      "properties": {
+        "acquiredAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+        "expiresAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+        "heartbeatAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" }
+      },
+      "additionalProperties": true
+    },
+    "attemptOwner": { "type": "string", "minLength": 1 },
+    "requestedAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+    "result": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["operation"],
+        "properties": { "operation": { "enum": ["claim", "heartbeat", "commit", "abandon"] } }
+      },
+      "then": {
+        "required": ["bodyBytes", "bodySha256", "replyStatus"]
+      }
+    },
+    {
+      "if": {
+        "required": ["operation"],
+        "properties": { "operation": { "enum": ["claim", "heartbeat", "commit", "abandon"] } }
+      },
+      "then": { "required": ["fencingToken", "attemptOwner"] }
+    },
+    {
+      "if": {
+        "required": ["operation"],
+        "properties": { "operation": { "const": "claim" } }
+      },
+      "then": { "required": ["lease"] }
+    }
+  ],
+  "not": {
+    "anyOf": [
+      { "required": ["body"] },
+      { "required": ["bodyText"] },
+      { "required": ["bodyContent"] },
+      { "required": ["path"] },
+      { "required": ["executable"] },
+      { "required": ["shell"] }
+    ]
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,105 @@
+{
+  "schema": "mektup/receipt/v1",
+  "receiptId": "rcpt_0198f0e0-0000-7000-8000-000000000005",
+  "operationId": "op_0198f0e0-0000-7000-8000-000000000004",
+  "operation": "send",
+  "state": "reply_accepted",
+  "source": {
+    "endpoint": {
+      "id": "ep_0198f0e0-0000-7000-8000-000000000001",
+      "alias": "local",
+      "transport": "unix-websocket",
+      "server": { "version": "0.154.0", "compatibility": "tested" }
+    },
+    "thread": {
+      "id": "thread-local-001",
+      "uri": "codex://local/thread/thread-local-001"
+    },
+    "requestedSelector": "codex://local/thread/thread-local-001",
+    "resolvedSelector": "codex://local/thread/thread-local-001",
+    "herdr": null,
+    "fields": {
+      "endpointId": {
+        "value": "ep_0198f0e0-0000-7000-8000-000000000001",
+        "provenance": "observed"
+      },
+      "threadId": { "value": "thread-local-001", "provenance": "observed" }
+    }
+  },
+  "target": {
+    "endpoint": {
+      "id": "ep_0198f0e0-0000-7000-8000-000000000002",
+      "alias": "devbox",
+      "transport": "ssh-proxy",
+      "server": { "version": "0.154.0", "compatibility": "tested" }
+    },
+    "thread": {
+      "id": "thread-recipient-001",
+      "uri": "codex://devbox/thread/thread-recipient-001"
+    },
+    "requestedSelector": "herdr://devbox/agent/buildoor",
+    "resolvedSelector": "codex://devbox/thread/thread-recipient-001",
+    "herdr": {
+      "server": "devbox",
+      "workspace": "default",
+      "agentName": "buildoor",
+      "association": "verified"
+    },
+    "fields": {
+      "endpointId": {
+        "value": "ep_0198f0e0-0000-7000-8000-000000000002",
+        "provenance": "resolved"
+      },
+      "threadId": {
+        "value": "thread-recipient-001",
+        "provenance": "resolved"
+      },
+      "requestedTarget": {
+        "value": "herdr://devbox/agent/buildoor",
+        "provenance": "caller_supplied"
+      }
+    }
+  },
+  "message": {
+    "messageId": "msg_0198f0e0-0000-7000-8000-000000000003",
+    "inReplyTo": null,
+    "kind": "message",
+    "replyRequested": true,
+    "bodyBytes": 18,
+    "bodySha256": "sha256:b165810e4e7bf583d7a6582c9f93a2964ab0bd1fd86690a2e013e8555d4faa28",
+    "clientUserMessageId": "msg_0198f0e0-0000-7000-8000-000000000003",
+    "turnId": "turn-recipient-001",
+    "acceptedAt": "2026-09-15T03:00:00.100000Z",
+    "replyAcceptedAt": "2026-09-15T03:00:02.000000Z",
+    "replyObservedAt": null,
+    "replyStatus": "success",
+    "contentRef": {
+      "endpointId": "ep_0198f0e0-0000-7000-8000-000000000001",
+      "threadId": "thread-local-001",
+      "locator": {
+        "clientUserMessageId": "msg_0198f0e0-0000-7000-8000-000000000007",
+        "itemId": "item-reply-001",
+        "turnId": "turn-local-001"
+      },
+      "bytes": 15,
+      "sha256": "sha256:914b169093c4dd7ec24080529845bb0660de553a835a200852e86c145470967f"
+    }
+  },
+  "evidence": [
+    {
+      "state": "accepted",
+      "observedAt": "2026-09-15T03:00:00.100000Z",
+      "source": "app-server response",
+      "details": { "turnId": "turn-recipient-001" }
+    },
+    {
+      "state": "reply_accepted",
+      "observedAt": "2026-09-15T03:00:02.000000Z",
+      "source": "authoritative custody journal",
+      "details": { "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007" }
+    }
+  ],
+  "warnings": [],
+  "createdAt": "2026-09-15T03:00:00.000000Z",
+  "updatedAt": "2026-09-15T03:00:02.000000Z"
+}

@@ -1,0 +1,19 @@
+{
+  "schema": "mektup/event/v1",
+  "event": "reply.accepted",
+  "eventId": "evt_0198f0e0-0000-7000-8000-00000000000b",
+  "sequence": 2,
+  "operationId": "op_0198f0e0-0000-7000-8000-000000000004",
+  "timestamp": "2026-09-15T03:00:02.000000Z",
+  "terminal": true,
+  "ok": true,
+  "warnings": [],
+  "data": {
+    "receiptId": "rcpt_0198f0e0-0000-7000-8000-000000000005",
+    "messageId": "msg_0198f0e0-0000-7000-8000-000000000003",
+    "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007",
+    "status": "success",
+    "bodyBytes": 15,
+    "bodySha256": "sha256:914b169093c4dd7ec24080529845bb0660de553a835a200852e86c145470967f"
+  }
+}

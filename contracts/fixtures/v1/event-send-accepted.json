@@ -1,0 +1,17 @@
+{
+  "schema": "mektup/event/v1",
+  "event": "send.accepted",
+  "eventId": "evt_0198f0e0-0000-7000-8000-000000000006",
+  "sequence": 1,
+  "operationId": "op_0198f0e0-0000-7000-8000-000000000004",
+  "timestamp": "2026-09-15T03:00:00.100000Z",
+  "terminal": false,
+  "ok": true,
+  "warnings": [],
+  "data": {
+    "receiptId": "rcpt_0198f0e0-0000-7000-8000-000000000005",
+    "messageId": "msg_0198f0e0-0000-7000-8000-000000000003",
+    "turnId": "turn-recipient-001",
+    "state": "accepted"
+  }
+}

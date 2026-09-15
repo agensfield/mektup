@@ -1,0 +1,47 @@
+{
+  "schema": "mektup/conformance/v1/state-transitions",
+  "contract": "wire-contract-v1",
+  "states": [
+    "not_sent",
+    "prepared",
+    "dispatch_started",
+    "reply_dispatch_claimed",
+    "reply_outcome_unknown",
+    "rejected",
+    "accepted",
+    "outcome_unknown",
+    "reply_accepted",
+    "reply_observed",
+    "manually_resolved"
+  ],
+  "transitions": [
+    { "from": "none", "event": "intent.persisted", "to": "prepared", "observable": "operation/message identity and pinned routes are durable before dispatch" },
+    { "from": "prepared", "event": "dispatch.started", "to": "dispatch_started", "observable": "dispatch-start is durable before request write" },
+    { "from": "prepared", "event": "recovery.prepared_orphan", "to": "not_sent", "observable": "request was not written and a classified retry remains safe" },
+    { "from": "dispatch_started", "event": "delivery.accepted", "to": "accepted", "observable": "app-server acceptance or unique positive history evidence is recorded" },
+    { "from": "dispatch_started", "event": "delivery.rejected", "to": "rejected", "observable": "conclusive rejection proves no admission" },
+    { "from": "dispatch_started", "event": "transport.result_lost", "to": "outcome_unknown", "observable": "possible remote effect is preserved and automatic resend is forbidden" },
+    { "from": "not_sent", "event": "retry.intent.persisted", "to": "prepared", "observable": "only a proven-not-sent attempt may be retried" },
+    { "from": "accepted", "event": "reply.claimed", "to": "reply_dispatch_claimed", "observable": "one fenced reply ID owns a bounded dispatch lease" },
+    { "from": "reply_dispatch_claimed", "event": "reply.accepted", "to": "reply_accepted", "observable": "reply body acceptance and authoritative wake metadata commit atomically" },
+    { "from": "reply_dispatch_claimed", "event": "claim.expired", "to": "reply_outcome_unknown", "observable": "waiter wakes unknown and no redispatch is authorized" },
+    { "from": "reply_accepted", "event": "native.item.observed", "to": "reply_observed", "observable": "history item/client ID and digest prove later observation" },
+    { "from": "outcome_unknown", "event": "reconcile.accepted", "to": "accepted", "observable": "new positive evidence upgrades the original uncertainty" },
+    { "from": "reply_outcome_unknown", "event": "reconcile.reply_accepted", "to": "reply_accepted", "observable": "a later positive commit may upgrade but never replays the body" },
+    { "from": "outcome_unknown", "event": "operator.resolve", "to": "manually_resolved", "observable": "assertion records actor, reason, timestamp, reference, and presentation" },
+    { "from": "reply_outcome_unknown", "event": "operator.resolve", "to": "manually_resolved", "observable": "reply uncertainty remains preserved beside caller assertion" }
+  ],
+  "forbiddenTransitions": [
+    { "from": "outcome_unknown", "to": "rejected", "reason": "elapsed time or missing evidence cannot prove rejection" },
+    { "from": "outcome_unknown", "to": "not_sent", "reason": "a request may already have been written" },
+    { "from": "reply_outcome_unknown", "to": "reply_dispatch_claimed", "reason": "expired fencing never authorizes automatic redispatch" },
+    { "from": "reply_accepted", "to": "reply_accepted", "reason": "duplicate reply acceptance is idempotent and does not duplicate body delivery" }
+  ],
+  "invariants": [
+    "journal_commit_precedes_stdout_event",
+    "unknown_never_auto_resends",
+    "reply_body_is_submitted_once_per_reply_id",
+    "reply_accepted_does_not_imply_reply_observed",
+    "manual_resolution_does_not_rewrite_observed_evidence"
+  ]
+}

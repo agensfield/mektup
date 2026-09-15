@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agensfield.dev/mektup/contracts/error-v1.schema.json",
+  "title": "Mektup v1 terminal error",
+  "type": "object",
+  "required": ["error"],
+  "properties": {
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "retryable", "effectState", "details"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "invalid_arguments",
+            "invalid_target",
+            "resolver_unavailable",
+            "target_ambiguous",
+            "route_unavailable",
+            "endpoint_unavailable",
+            "unsupported_server_version",
+            "input_too_large",
+            "message_not_found",
+            "message_identity_conflict",
+            "reply_route_required",
+            "reply_route_unavailable",
+            "reply_not_requested",
+            "invalid_raw_wait",
+            "invalid_raw_reply_request",
+            "reply_outcome_unknown",
+            "message_not_addressed_to_thread",
+            "content_unavailable",
+            "delivery_rejected",
+            "delivery_temporarily_unavailable",
+            "outcome_unknown",
+            "wait_incomplete",
+            "wait_interrupted",
+            "effect_acknowledgment_required",
+            "experimental_method_unavailable",
+            "output_too_large",
+            "storage_busy",
+            "storage_corrupt",
+            "storage_migration_required",
+            "repair_required",
+            "internal_error"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "effectState": {
+          "enum": [
+            "not_sent",
+            "prepared",
+            "dispatch_started",
+            "rejected",
+            "accepted",
+            "unknown",
+            "outcome_unknown",
+            "reply_outcome_unknown"
+          ]
+        },
+        "details": { "type": "object" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

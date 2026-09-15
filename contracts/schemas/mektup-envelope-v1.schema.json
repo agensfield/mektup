@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agensfield.dev/mektup/contracts/mektup-envelope-v1.schema.json",
+  "title": "Mektup/1 target-visible envelope metadata",
+  "description": "JSON representation of the canonical hyphenated header. The body is framed separately and is covered by payload-bytes and payload-sha256.",
+  "type": "object",
+  "required": [
+    "schema",
+    "message-id",
+    "kind",
+    "from-endpoint-id",
+    "from",
+    "from-kind",
+    "from-herdr",
+    "to-endpoint-id",
+    "to",
+    "requested-target",
+    "in-reply-to",
+    "reply-requested",
+    "reply-endpoint-id",
+    "reply-to",
+    "reply-custody-endpoint-id",
+    "reply-custody-store-id",
+    "sent-at",
+    "payload-bytes",
+    "payload-sha256",
+    "provenance"
+  ],
+  "properties": {
+    "schema": { "const": "Mektup/1" },
+    "message-id": { "$ref": "common-v1.schema.json#/$defs/messageId" },
+    "kind": { "enum": ["message", "reply"] },
+    "from-endpoint-id": { "$ref": "common-v1.schema.json#/$defs/endpointId" },
+    "from": { "type": ["string", "null"] },
+    "from-kind": { "enum": ["agent", "human"] },
+    "from-herdr": { "type": ["string", "null"] },
+    "to-endpoint-id": { "$ref": "common-v1.schema.json#/$defs/endpointId" },
+    "to": { "$ref": "common-v1.schema.json#/$defs/uri" },
+    "requested-target": { "type": "string", "minLength": 1 },
+    "in-reply-to": {
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "common-v1.schema.json#/$defs/messageId" }
+      ]
+    },
+    "reply-requested": { "type": "boolean" },
+    "reply-endpoint-id": {
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "common-v1.schema.json#/$defs/endpointId" }
+      ]
+    },
+    "reply-to": {
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "common-v1.schema.json#/$defs/uri" }
+      ]
+    },
+    "reply-custody-endpoint-id": {
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "common-v1.schema.json#/$defs/endpointId" }
+      ]
+    },
+    "reply-custody-store-id": {
+      "anyOf": [
+        { "type": "null" },
+        { "$ref": "common-v1.schema.json#/$defs/storeId" }
+      ]
+    },
+    "sent-at": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+    "payload-bytes": { "type": "integer", "minimum": 0 },
+    "payload-sha256": { "$ref": "common-v1.schema.json#/$defs/sha256" },
+    "provenance": { "const": "observed" },
+    "reply-status": { "enum": ["success", "error"] },
+    "reply-error-code": { "type": "string", "minLength": 1 }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["reply-requested"],
+        "properties": { "reply-requested": { "const": true } }
+      },
+      "then": {
+        "required": [
+          "reply-endpoint-id",
+          "reply-to",
+          "reply-custody-endpoint-id",
+          "reply-custody-store-id"
+        ],
+        "properties": {
+          "reply-endpoint-id": { "type": "string" },
+          "reply-to": { "type": "string" },
+          "reply-custody-endpoint-id": { "type": "string" },
+          "reply-custody-store-id": { "type": "string" }
+        }
+      },
+      "else": {
+        "properties": {
+          "reply-endpoint-id": { "type": ["null", "string"] },
+          "reply-to": { "type": ["null", "string"] },
+          "reply-custody-endpoint-id": { "type": ["null", "string"] },
+          "reply-custody-store-id": { "type": ["null", "string"] }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["kind"],
+        "properties": { "kind": { "const": "reply" } }
+      },
+      "then": {
+        "required": ["in-reply-to", "reply-status"],
+        "properties": {
+          "in-reply-to": { "type": "string" }
+        }
+      },
+      "else": {
+        "required": [],
+        "properties": {
+          "in-reply-to": { "type": "null" },
+          "reply-status": false,
+          "reply-error-code": false
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["reply-status"],
+        "properties": { "reply-status": { "const": "success" } }
+      },
+      "then": { "properties": { "reply-error-code": false } }
+    }
+  ],
+  "additionalProperties": true
+}
