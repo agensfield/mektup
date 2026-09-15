@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"errors"
 	"fmt"
 
 	"github.com/agensfield/mektup/go/internal/service"
@@ -34,11 +33,8 @@ func (a *DeliveryAdapter) Resume(ctx context.Context, target service.ResolvedTar
 	if a == nil || a.Pool == nil {
 		return "", fmt.Errorf("runtime: delivery pool is required")
 	}
-	session, err := a.Pool.session(ctx, target)
+	_, err := a.Pool.subscribe(ctx, target)
 	if err != nil {
-		return "", err
-	}
-	if err := session.Resume(ctx, target.ThreadID); err != nil {
 		return "", err
 	}
 	return target.ThreadID, nil
@@ -48,15 +44,8 @@ func (a *DeliveryAdapter) Detach(ctx context.Context, target service.ResolvedTar
 	if a == nil || a.Pool == nil {
 		return fmt.Errorf("runtime: delivery pool is required")
 	}
-	session, err := a.Pool.session(ctx, target)
-	if err != nil {
-		return err
-	}
-	// Resume of an unloaded target acquires both thread residency and a
-	// subscription. Release the subscription first, then detach this one-shot
-	// connection so the pool cannot hand a closed generation to another call.
-	err = session.Unsubscribe(ctx, target.ThreadID)
-	err = errors.Join(err, session.Detach(ctx))
-	a.Pool.forget(target.EndpointID, session)
-	return err
+	// The endpoint session is pooled and may be serving another delivery or
+	// observer. Release only this thread subscription lease. pool.close owns
+	// the connection lifetime and is the only operation allowed to detach it.
+	return a.Pool.unsubscribe(ctx, target)
 }

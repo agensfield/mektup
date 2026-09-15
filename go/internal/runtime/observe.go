@@ -1,12 +1,14 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/agensfield/mektup/go/appserver"
@@ -24,18 +26,23 @@ func (a *ObservationAdapter) Subscribe(ctx context.Context, target service.Resol
 	if a == nil || a.Pool == nil {
 		return nil, errors.New("runtime: observation pool is required")
 	}
-	session, err := a.Pool.session(ctx, target)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	session, err := a.Pool.openIsolated(streamCtx, target)
 	if err != nil {
+		streamCancel()
 		return nil, err
 	}
-	resumed := false
-	if target.Persistent {
-		if err := session.Resume(ctx, target.ThreadID); err != nil {
-			return nil, err
-		}
-		resumed = true
+	if err := session.Resume(streamCtx, target.ThreadID); err != nil {
+		streamCancel()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = session.Detach(cleanupCtx)
+		cleanupCancel()
+		return nil, err
 	}
-	return &eventStream{pool: a.Pool, session: session, target: target, resumed: resumed}, nil
+	return &eventStream{session: session, target: target, ctx: streamCtx, cancel: streamCancel}, nil
 }
 
 func (a *ObservationAdapter) FullHistory(ctx context.Context, target service.ResolvedTarget) ([]service.ObservedItem, error) {
@@ -84,19 +91,34 @@ func (a *ObservationAdapter) FullHistory(ctx context.Context, target service.Res
 }
 
 type eventStream struct {
-	pool    *ConnectionPool
 	session Session
 	target  service.ResolvedTarget
-	resumed bool
+	ctx     context.Context
+	cancel  context.CancelFunc
+	mu      sync.Mutex
 	closed  bool
 }
 
 func (s *eventStream) Next(ctx context.Context) (service.Event, error) {
-	if s == nil || s.closed {
+	if s == nil || s.isClosed() {
 		return service.Event{}, io.EOF
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	nextCtx, stop := context.WithCancel(ctx)
+	var stopClose func() bool
+	if s.ctx != nil {
+		stopClose = context.AfterFunc(s.ctx, stop)
+	} else {
+		stopClose = func() bool { return false }
+	}
+	defer func() {
+		stopClose()
+		stop()
+	}()
 	for {
-		event, err := s.session.NextEvent(ctx)
+		event, err := s.session.NextEvent(nextCtx)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return service.Event{Gap: true, Reason: "app-server event stream disconnected"}, nil
@@ -137,21 +159,32 @@ func (s *eventStream) Next(ctx context.Context) (service.Event, error) {
 }
 
 func (s *eventStream) Close() error {
-	if s == nil || s.closed {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
 		return nil
 	}
 	s.closed = true
+	s.mu.Unlock()
+	if s.cancel != nil {
+		s.cancel()
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	// Unsubscribe is per-thread and does not tear down the pooled endpoint
-	// connection. A resumed operation may have loaded the runtime, so detach is
-	// attempted only after that explicit unsubscribe.
+	// This stream owns an isolated observer connection, so it can release its
+	// subscription and detach without affecting delivery or other observers.
 	err := s.session.Unsubscribe(ctx, s.target.ThreadID)
-	if s.resumed {
-		err = errors.Join(err, s.session.Detach(ctx))
-		s.pool.forget(s.target.EndpointID, s.session)
-	}
-	return err
+	return errors.Join(err, s.session.Detach(ctx))
+}
+
+func (s *eventStream) isClosed() bool {
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	return closed
 }
 
 func notificationItem(notification appserver.RPCNotification, threadID string) (service.ObservedItem, bool) {
@@ -159,16 +192,16 @@ func notificationItem(notification appserver.RPCNotification, threadID string) (
 	if err := json.Unmarshal(notification.Params, &params); err != nil {
 		return service.ObservedItem{}, false
 	}
-	actualThread := stringField(params, "threadId")
-	if actualThread != "" && actualThread != threadID {
+	actualThread, threadOK := requiredStringField(params, "threadId")
+	turnID, turnOK := requiredStringField(params, "turnId")
+	if !threadOK || !turnOK || actualThread != threadID {
 		return service.ObservedItem{}, false
 	}
-	turnID := stringField(params, "turnId")
 	itemRaw := params["item"]
 	if len(itemRaw) == 0 {
 		return service.ObservedItem{}, false
 	}
-	return visibleItem(itemRaw, firstNonEmpty(actualThread, threadID), turnID, stringField(params, "clientUserMessageId"))
+	return visibleItem(itemRaw, actualThread, turnID, "")
 }
 
 func visibleItem(raw json.RawMessage, threadID, turnID, fallbackClientID string) (service.ObservedItem, bool) {
@@ -180,6 +213,17 @@ func visibleItem(raw json.RawMessage, threadID, turnID, fallbackClientID string)
 	if typ != "userMessage" && typ != "agentMessage" {
 		return service.ObservedItem{}, false
 	}
+	if _, ok := requiredStringField(object, "id"); !ok {
+		return service.ObservedItem{}, false
+	}
+	if typ == "userMessage" && !validUserMessageShape(object) {
+		return service.ObservedItem{}, false
+	}
+	if typ == "agentMessage" {
+		if _, ok := requiredStringField(object, "text"); !ok {
+			return service.ObservedItem{}, false
+		}
+	}
 	text := itemText(object)
 	if text == "" {
 		return service.ObservedItem{}, false
@@ -189,7 +233,42 @@ func visibleItem(raw json.RawMessage, threadID, turnID, fallbackClientID string)
 	// userMessage. The alternate names are accepted only as additive fields from
 	// newer/legacy projections; they are never synthesized from body text.
 	clientID := firstNonEmpty(stringField(object, "clientId"), stringField(object, "clientUserMessageId"), stringField(object, "messageId"), fallbackClientID)
-	return service.ObservedItem{ThreadID: threadID, TurnID: turnID, NativeItemID: nativeID, ClientMessageID: clientID, Text: text}, true
+	return service.ObservedItem{ThreadID: threadID, TurnID: turnID, NativeItemID: nativeID, NativeType: typ, ClientMessageID: clientID, Text: text}, true
+}
+
+func validUserMessageShape(object map[string]json.RawMessage) bool {
+	content, ok := object["content"]
+	if !ok {
+		return false
+	}
+	if bytes.Equal(bytes.TrimSpace(content), []byte("null")) {
+		return false
+	}
+	var parts []json.RawMessage
+	if json.Unmarshal(content, &parts) != nil {
+		return false
+	}
+	if client, present := object["clientId"]; present && string(client) != "null" {
+		var value string
+		if json.Unmarshal(client, &value) != nil {
+			return false
+		}
+	}
+	for _, part := range parts {
+		var value map[string]json.RawMessage
+		if json.Unmarshal(part, &value) != nil {
+			return false
+		}
+		if _, ok := requiredStringField(value, "type"); !ok {
+			return false
+		}
+		if typ := stringField(value, "type"); typ == "text" {
+			if _, ok := requiredStringField(value, "text"); !ok {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func itemText(object map[string]json.RawMessage) string {
@@ -225,6 +304,18 @@ func stringField(object map[string]json.RawMessage, key string) string {
 		return value
 	}
 	return ""
+}
+
+func requiredStringField(object map[string]json.RawMessage, key string) (string, bool) {
+	raw, ok := object[key]
+	if !ok || string(raw) == "null" {
+		return "", false
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil || value == "" {
+		return "", false
+	}
+	return value, true
 }
 
 var _ service.ObservationPort = (*ObservationAdapter)(nil)

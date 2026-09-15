@@ -24,6 +24,7 @@ import (
 var (
 	ErrNoSessionFactory = errors.New("runtime: session factory is required")
 	ErrEndpointMismatch = errors.New("runtime: session endpoint does not match pinned target")
+	ErrPoolClosed       = errors.New("runtime: connection pool is closed")
 )
 
 // Session is the smallest concrete app-server seam needed by the runtime
@@ -70,14 +71,16 @@ type EndpointLookup func(string) (endpoint.Endpoint, error)
 // It never uses an alias as a cache key, so an alias change cannot move a
 // pinned operation to another endpoint.
 type ConnectionPool struct {
-	Factory  SessionFactory
-	Lookup   EndpointLookup
-	mu       sync.Mutex
-	sessions map[string]Session
+	Factory       SessionFactory
+	Lookup        EndpointLookup
+	mu            sync.Mutex
+	sessions      map[string]Session
+	subscriptions map[string]int
+	closed        bool
 }
 
 func NewConnectionPool(factory SessionFactory, lookup EndpointLookup) *ConnectionPool {
-	return &ConnectionPool{Factory: factory, Lookup: lookup, sessions: make(map[string]Session)}
+	return &ConnectionPool{Factory: factory, Lookup: lookup, sessions: make(map[string]Session), subscriptions: make(map[string]int)}
 }
 
 func (p *ConnectionPool) session(ctx context.Context, target service.ResolvedTarget) (Session, error) {
@@ -89,6 +92,9 @@ func (p *ConnectionPool) session(ctx context.Context, target service.ResolvedTar
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		return nil, ErrPoolClosed
+	}
 	if current := p.sessions[target.EndpointID]; current != nil {
 		if current.EndpointID() != target.EndpointID {
 			return nil, ErrEndpointMismatch
@@ -125,16 +131,63 @@ func (p *ConnectionPool) session(ctx context.Context, target service.ResolvedTar
 	return session, nil
 }
 
-func (p *ConnectionPool) close(ctx context.Context) error {
+// openIsolated creates an observer-owned connection. Observer streams consume
+// a connection's single event queue, so sharing the delivery session would
+// let one thread discard another thread's notifications. The returned session
+// is never inserted into the pool and must be detached by its owner.
+func (p *ConnectionPool) openIsolated(ctx context.Context, target service.ResolvedTarget) (Session, error) {
+	if p == nil || p.Factory == nil {
+		return nil, ErrNoSessionFactory
+	}
+	if target.EndpointID == "" || target.ThreadID == "" || target.URI == "" {
+		return nil, fmt.Errorf("runtime: incomplete pinned target")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil, ErrPoolClosed
+	}
+	if p.Lookup == nil {
+		return nil, errors.New("runtime: endpoint lookup is required")
+	}
+	ep, err := p.Lookup(target.EndpointID)
+	if err != nil {
+		return nil, err
+	}
+	if ep.ID != target.EndpointID {
+		return nil, ErrEndpointMismatch
+	}
+	session, err := p.Factory.Open(ctx, ep)
+	if err != nil {
+		return nil, err
+	}
+	if session == nil || session.EndpointID() != target.EndpointID {
+		if session != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = session.Detach(cleanupCtx)
+			cancel()
+		}
+		return nil, ErrEndpointMismatch
+	}
+	return session, nil
+}
+
+func (p *ConnectionPool) Close(ctx context.Context) error {
 	if p == nil {
 		return nil
 	}
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
 	sessions := make([]Session, 0, len(p.sessions))
 	for _, session := range p.sessions {
 		sessions = append(sessions, session)
 	}
 	p.sessions = make(map[string]Session)
+	p.subscriptions = make(map[string]int)
 	p.mu.Unlock()
 	var joined error
 	for _, session := range sessions {
@@ -143,15 +196,62 @@ func (p *ConnectionPool) close(ctx context.Context) error {
 	return joined
 }
 
-func (p *ConnectionPool) forget(endpointID string, session Session) {
-	if p == nil {
-		return
+func (p *ConnectionPool) close(ctx context.Context) error { return p.Close(ctx) }
+
+func subscriptionKey(target service.ResolvedTarget) string {
+	return target.EndpointID + "\x00" + target.ThreadID
+}
+
+// subscribe acquires a reference-counted per-thread subscription on the
+// pooled endpoint session. Codex subscriptions belong to the connection, not
+// to an individual operation, so only the first lease resumes and only the
+// last release unsubscribes.
+func (p *ConnectionPool) subscribe(ctx context.Context, target service.ResolvedTarget) (Session, error) {
+	session, err := p.session(ctx, target)
+	if err != nil {
+		return nil, err
 	}
+	key := subscriptionKey(target)
 	p.mu.Lock()
-	if current := p.sessions[endpointID]; current == session {
-		delete(p.sessions, endpointID)
+	defer p.mu.Unlock()
+	if p.closed {
+		return nil, ErrPoolClosed
 	}
+	if current := p.sessions[target.EndpointID]; current != session {
+		return nil, ErrEndpointMismatch
+	}
+	if p.subscriptions[key] == 0 {
+		if err := session.Resume(ctx, target.ThreadID); err != nil {
+			return nil, err
+		}
+	}
+	p.subscriptions[key]++
+	return session, nil
+}
+
+func (p *ConnectionPool) unsubscribe(ctx context.Context, target service.ResolvedTarget) error {
+	if p == nil {
+		return nil
+	}
+	key := subscriptionKey(target)
+	p.mu.Lock()
+	session := p.sessions[target.EndpointID]
+	count := p.subscriptions[key]
+	if count <= 0 || session == nil {
+		p.mu.Unlock()
+		return nil
+	}
+	if count > 1 {
+		p.subscriptions[key] = count - 1
+		p.mu.Unlock()
+		return nil
+	}
+	delete(p.subscriptions, key)
+	// Hold the pool lock while releasing the last lease so another subscriber
+	// cannot race a new Resume between the count check and unsubscribe.
+	err := session.Unsubscribe(ctx, target.ThreadID)
 	p.mu.Unlock()
+	return err
 }
 
 // ConnectionFactory is the production factory over internal/connection.
@@ -260,12 +360,17 @@ func (s *connectionSession) History(ctx context.Context, threadID string) ([]cod
 func (s *connectionSession) ItemsHistory(ctx context.Context, threadID string) ([]codexapi.ItemEntry, error) {
 	var all []codexapi.ItemEntry
 	cursor := ""
+	totalBytes := 0
 	for pageNo := 0; pageNo < codexapi.MaxReconciliationPages; pageNo++ {
 		page, err := s.api.ThreadItems(ctx, codexapi.ItemsOptions{ThreadID: threadID, Cursor: cursor, Limit: codexapi.MaxItemsPageLimit})
 		if err != nil {
 			return nil, fmt.Errorf("runtime: item history page %d: %w", pageNo+1, err)
 		}
 		if len(all)+len(page.Data) > codexapi.MaxReconciliationItems {
+			return nil, codexapi.ErrPaginationExceeded
+		}
+		totalBytes += len(page.Raw)
+		if totalBytes > codexapi.MaxReconciliationBytes {
 			return nil, codexapi.ErrPaginationExceeded
 		}
 		all = append(all, page.Data...)

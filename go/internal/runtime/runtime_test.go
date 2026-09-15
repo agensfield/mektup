@@ -22,16 +22,18 @@ const (
 )
 
 type fakeSession struct {
-	endpoint   string
-	start      func(context.Context, string, string, string) (TurnResult, error)
-	events     chan appserver.Event
-	history    []codexapi.Turn
-	items      []codexapi.ItemEntry
-	historyErr error
-	mu         sync.Mutex
-	calls      []string
-	unsub      int
-	detach     int
+	endpoint    string
+	start       func(context.Context, string, string, string) (TurnResult, error)
+	events      chan appserver.Event
+	history     []codexapi.Turn
+	items       []codexapi.ItemEntry
+	historyErr  error
+	mu          sync.Mutex
+	calls       []string
+	unsub       int
+	detach      int
+	nextStarted chan struct{}
+	nextOnce    sync.Once
 }
 
 func (s *fakeSession) EndpointID() string { return s.endpoint }
@@ -60,6 +62,11 @@ func (s *fakeSession) ItemsHistory(context.Context, string) ([]codexapi.ItemEntr
 	return s.items, nil
 }
 func (s *fakeSession) NextEvent(ctx context.Context) (appserver.Event, error) {
+	s.nextOnce.Do(func() {
+		if s.nextStarted != nil {
+			close(s.nextStarted)
+		}
+	})
 	select {
 	case event, ok := <-s.events:
 		if !ok {
@@ -79,6 +86,7 @@ func (s *fakeSession) Detach(context.Context) error {
 
 type fakeFactory struct {
 	session *fakeSession
+	open    func() *fakeSession
 	opens   int
 	got     []endpoint.Endpoint
 }
@@ -86,6 +94,9 @@ type fakeFactory struct {
 func (f *fakeFactory) Open(_ context.Context, ep endpoint.Endpoint) (Session, error) {
 	f.opens++
 	f.got = append(f.got, ep)
+	if f.open != nil {
+		return f.open(), nil
+	}
 	return f.session, nil
 }
 
@@ -140,6 +151,27 @@ func TestConnectionPoolDetachesMismatchedOpenedSession(t *testing.T) {
 	}
 }
 
+func TestConnectionPoolCloseIsIdempotentAndFencesReopen(t *testing.T) {
+	session := &fakeSession{endpoint: testTargetEndpoint, events: make(chan appserver.Event)}
+	factory := &fakeFactory{session: session}
+	pool := NewConnectionPool(factory, func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: testTargetEndpoint}, nil })
+	if _, err := pool.session(context.Background(), testTarget()); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.session(context.Background(), testTarget()); !errors.Is(err, ErrPoolClosed) {
+		t.Fatalf("reopen after close = %v", err)
+	}
+	if factory.opens != 1 {
+		t.Fatalf("factory opened %d sessions after close", factory.opens)
+	}
+}
+
 func TestObservationIgnoresServerRequestsAndMapsVisibleCompletedItem(t *testing.T) {
 	events := make(chan appserver.Event, 2)
 	events <- appserver.Event{Kind: appserver.EventServerRequest, Request: &appserver.ServerRequest{Method: "item/permissions/requestApproval"}}
@@ -164,6 +196,47 @@ func TestObservationIgnoresServerRequestsAndMapsVisibleCompletedItem(t *testing.
 	}
 }
 
+func TestIsolatedObserversDoNotStealOtherThreadEvents(t *testing.T) {
+	makeSession := func(thread, text string) *fakeSession {
+		events := make(chan appserver.Event, 1)
+		params, _ := json.Marshal(map[string]any{"threadId": thread, "turnId": "turn-1", "item": map[string]any{"id": "item-" + thread, "type": "userMessage", "clientId": "msg-" + thread, "content": []any{map[string]any{"type": "text", "text": text}}}})
+		events <- appserver.Event{Kind: appserver.EventNotification, Notification: &appserver.RPCNotification{Method: "item/completed", Params: params}}
+		return &fakeSession{endpoint: testTargetEndpoint, events: events}
+	}
+	first, second := makeSession("thread-1", "one"), makeSession("thread-2", "two")
+	opened := 0
+	factory := &fakeFactory{open: func() *fakeSession {
+		opened++
+		if opened == 1 {
+			return first
+		}
+		return second
+	}}
+	pool := NewConnectionPool(factory, func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: testTargetEndpoint}, nil })
+	adapter := &ObservationAdapter{Pool: pool}
+	secondTarget := testTarget()
+	secondTarget.ThreadID = "thread-2"
+	secondTarget.URI = "codex://target/thread/thread-2"
+	one, err := adapter.Subscribe(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, err := adapter.Subscribe(context.Background(), secondTarget)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer one.Close()
+	defer two.Close()
+	oneEvent, err := one.Next(context.Background())
+	if err != nil || oneEvent.Item == nil || oneEvent.Item.Text != "one" {
+		t.Fatalf("first observer event = %#v, %v", oneEvent, err)
+	}
+	twoEvent, err := two.Next(context.Background())
+	if err != nil || twoEvent.Item == nil || twoEvent.Item.Text != "two" {
+		t.Fatalf("second observer event = %#v, %v", twoEvent, err)
+	}
+}
+
 func TestObservationSubscribesLoadedThreadBeforeReturningStream(t *testing.T) {
 	events := make(chan appserver.Event)
 	close(events)
@@ -179,6 +252,117 @@ func TestObservationSubscribesLoadedThreadBeforeReturningStream(t *testing.T) {
 	session.mu.Unlock()
 	if len(calls) != 1 || calls[0] != "resume" {
 		t.Fatalf("subscription established without explicit resume: %v", calls)
+	}
+}
+
+func TestEventStreamConcurrentNextAndCloseIsIdempotent(t *testing.T) {
+	nextStarted := make(chan struct{})
+	session := &fakeSession{endpoint: testTargetEndpoint, events: make(chan appserver.Event), nextStarted: nextStarted}
+	pool := NewConnectionPool(&fakeFactory{session: session}, func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: testTargetEndpoint}, nil })
+	stream, err := (&ObservationAdapter{Pool: pool}).Subscribe(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextCtx, cancel := context.WithCancel(context.Background())
+	nextDone := make(chan error, 1)
+	go func() {
+		_, nextErr := stream.Next(nextCtx)
+		nextDone <- nextErr
+	}()
+	<-nextStarted
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- stream.Close() }()
+	cancel()
+	if err := <-closeDone; err != nil {
+		t.Fatalf("close = %v", err)
+	}
+	if err := <-nextDone; err == nil {
+		t.Fatal("Next returned without cancellation or a terminal event")
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("second close = %v", err)
+	}
+}
+
+func TestObservationCloseDoesNotDetachPooledDeliverySession(t *testing.T) {
+	deliverySession := &fakeSession{endpoint: testTargetEndpoint, events: make(chan appserver.Event)}
+	observerSession := &fakeSession{endpoint: testTargetEndpoint, events: make(chan appserver.Event)}
+	opened := 0
+	factory := &fakeFactory{open: func() *fakeSession {
+		opened++
+		if opened == 1 {
+			return deliverySession
+		}
+		return observerSession
+	}}
+	pool := NewConnectionPool(factory, func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: testTargetEndpoint}, nil })
+	delivery := &DeliveryAdapter{Pool: pool}
+	if _, err := delivery.Send(context.Background(), testTarget(), "body", "msg_01999999-9999-7999-8999-999999999998"); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := (&ObservationAdapter{Pool: pool}).Subscribe(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deliverySession.mu.Lock()
+	detach := deliverySession.detach
+	deliverySession.mu.Unlock()
+	observerSession.mu.Lock()
+	observerDetach := observerSession.detach
+	observerSession.mu.Unlock()
+	if detach != 0 || observerDetach != 1 {
+		t.Fatalf("observer lifetime: pooled delivery detach=%d observer detach=%d", detach, observerDetach)
+	}
+}
+
+func TestPooledSubscriptionReferenceCountingProtectsConcurrentUsers(t *testing.T) {
+	// Delivery leases share one pooled session. Observer streams use an
+	// isolated session and therefore do not participate in this count.
+	deliverySession := &fakeSession{endpoint: testTargetEndpoint, events: make(chan appserver.Event)}
+	observerSession := &fakeSession{endpoint: testTargetEndpoint, events: make(chan appserver.Event)}
+	opened := 0
+	factory := &fakeFactory{open: func() *fakeSession {
+		opened++
+		if opened == 1 {
+			return deliverySession
+		}
+		return observerSession
+	}}
+	pool := NewConnectionPool(factory, func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: testTargetEndpoint}, nil })
+	delivery := &DeliveryAdapter{Pool: pool}
+	if _, err := delivery.Resume(context.Background(), testTarget()); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := (&ObservationAdapter{Pool: pool}).Subscribe(context.Background(), testTarget())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	deliverySession.mu.Lock()
+	resumeCalls := 0
+	for _, call := range deliverySession.calls {
+		if call == "resume" {
+			resumeCalls++
+		}
+	}
+	unsub := deliverySession.unsub
+	deliverySession.mu.Unlock()
+	if resumeCalls != 1 || unsub != 0 {
+		t.Fatalf("delivery lease changed by observer: resumes=%d unsubscribes=%d", resumeCalls, unsub)
+	}
+	if err := delivery.Detach(context.Background(), testTarget()); err != nil {
+		t.Fatal(err)
+	}
+	deliverySession.mu.Lock()
+	unsub = deliverySession.unsub
+	deliverySession.mu.Unlock()
+	if unsub != 1 {
+		t.Fatalf("final subscription release unsubscribes=%d, want one", unsub)
 	}
 }
 
@@ -233,6 +417,48 @@ func TestOriginalResolverExactLookupRejectsForkAncestor(t *testing.T) {
 	observe.items = []service.ObservedItem{{ThreadID: "thread-1", ClientMessageID: ancestor.MessageID, Text: string(ancestorText)}}
 	if _, err := resolver.ResolveOriginal(context.Background(), ancestor.MessageID); err == nil {
 		t.Fatal("fork-inherited ancestor envelope resolved in descendant")
+	}
+}
+
+func TestOriginalResolverConflictsOnChangedReplyRoute(t *testing.T) {
+	original := mektup.Envelope{MessageID: "msg_01999999-9999-7999-8999-999999999999", Kind: mektup.KindMessage,
+		FromEndpointID: testSourceEndpoint, From: "codex://source/thread/source", FromKind: "agent",
+		ToEndpointID: testTargetEndpoint, To: "codex://target/thread/thread-1", RequestedTarget: "target",
+		ReplyRequested: true, ReplyEndpointID: testSourceEndpoint, ReplyTo: "codex://source/thread/source",
+		ReplyCustodyEndpointID: testSourceEndpoint, ReplyCustodyStoreID: "store_01999999-9999-7999-8999-999999999991",
+		Body: "question", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	first, err := mektup.RenderEnvelope(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondEnvelope := original
+	secondEnvelope.ReplyTo = "codex://source/thread/other"
+	second, err := mektup.RenderEnvelope(secondEnvelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := OriginalResolver{Observe: &historyPort{items: []service.ObservedItem{
+		{ThreadID: "thread-1", ClientMessageID: original.MessageID, Text: string(first)},
+		{ThreadID: "thread-1", ClientMessageID: original.MessageID, Text: string(second)},
+	}}, Target: testTarget()}
+	if _, err := resolver.ResolveOriginal(context.Background(), original.MessageID); !errors.Is(err, service.ErrOriginalIdentityConflict) {
+		t.Fatalf("changed reply route did not conflict: %v", err)
+	}
+}
+
+func TestVisibleItemRejectsMalformedPinnedShapes(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"userMessage","content":[]}`,
+		`{"id":"u","type":"userMessage","clientId":42,"content":[]}`,
+		`{"id":"u","type":"userMessage","content":["body"]}`,
+	} {
+		if _, ok := visibleItem(json.RawMessage(raw), "thread-1", "turn-1", ""); ok {
+			t.Fatalf("malformed native item accepted: %s", raw)
+		}
+	}
+	valid, ok := visibleItem(json.RawMessage(`{"id":"u","type":"userMessage","clientId":"msg-1","content":[{"type":"text","text":"body"}]}`), "thread-1", "turn-1", "")
+	if !ok || valid.NativeType != "userMessage" || valid.ClientMessageID != "msg-1" {
+		t.Fatalf("valid native user item rejected: %#v", valid)
 	}
 }
 

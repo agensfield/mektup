@@ -154,6 +154,7 @@ type ObservedItem struct {
 	ThreadID        string
 	TurnID          string
 	NativeItemID    string
+	NativeType      string
 	ClientMessageID string
 	Text            string
 }

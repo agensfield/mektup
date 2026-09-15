@@ -66,7 +66,7 @@ func TestLiveBodyCarryAcceptance(t *testing.T) {
 	})
 	defer func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
-		_ = pool.close(closeCtx)
+		_ = pool.Close(closeCtx)
 		closeCancel()
 	}()
 	store, err := journal.Open(ctx, journal.Options{StateDir: t.TempDir()})
@@ -103,28 +103,24 @@ func TestLiveBodyCarryAcceptance(t *testing.T) {
 
 	var original service.OriginalMessage
 	if err := eventually(ctx, 10*time.Second, func() error {
-		var resolveErr error
-		original, resolveErr = originalResolver.ResolveOriginal(ctx, "msg_")
-		if resolveErr != nil {
-			return resolveErr
-		}
-		return nil
-	}); err != nil {
-		// ResolveOriginal requires an exact ID, so search is not allowed. Read
-		// current history only to discover the exact generated message ID.
 		items, historyErr := observe.FullHistory(ctx, resolver.target)
 		if historyErr != nil {
-			t.Fatalf("history before exact resolution: %v (initial: %v)", historyErr, err)
+			return historyErr
 		}
 		for _, item := range items {
-			if parsed, parseErr := mektup.ParseEnvelopeString(item.Text); parseErr == nil && parsed.Kind == mektup.KindMessage {
-				original, err = originalResolver.ResolveOriginal(ctx, parsed.MessageID)
-				break
+			parsed, parseErr := mektup.ParseEnvelopeString(item.Text)
+			if parseErr != nil || parsed.Kind != mektup.KindMessage || parsed.Body != "a dedicated live body-carry probe" {
+				continue
+			}
+			var resolveErr error
+			original, resolveErr = originalResolver.ResolveOriginal(ctx, parsed.MessageID)
+			if resolveErr == nil {
+				return nil
 			}
 		}
-		if original.Envelope.MessageID == "" {
-			t.Fatalf("dedicated original did not become visible: %v", err)
-		}
+		return errors.New("dedicated original not visible")
+	}); err != nil {
+		t.Fatalf("dedicated original did not become visible: %v", err)
 	}
 	if _, err := receiver.Reply(ctx, originalResolver, service.ReplyRequest{Reference: original.Envelope.MessageID, Body: "one dedicated live reply"}); err != nil {
 		t.Fatalf("reply delivery: %v", err)
@@ -145,7 +141,8 @@ func TestLiveBodyCarryAcceptance(t *testing.T) {
 		t.Fatal("sender wait did not wake before native observation")
 	}
 
-	items, err := eventuallyItems(ctx, 10*time.Second, observe, resolver.target)
+	sourceTarget := service.ResolvedTarget{EndpointID: endpointID, URI: sourceURI, ThreadID: source.Thread.ID, Loaded: true, Persistent: true}
+	items, err := eventuallyItems(ctx, 10*time.Second, observe, sourceTarget)
 	if err != nil {
 		t.Fatal(err)
 	}

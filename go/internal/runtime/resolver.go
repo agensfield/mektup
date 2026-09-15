@@ -63,9 +63,12 @@ func (r ResolverAdapter) ResolveSource(_ context.Context, source string) (servic
 	return service.SourceIdentity{EndpointID: resolved.Endpoint.ID, URI: uri, Human: false, CustodyEndpointID: firstNonEmpty(r.CustodyEndpointID, resolved.Endpoint.ID), CustodyStoreID: r.CustodyStoreID}, nil
 }
 
-func (r ResolverAdapter) ResolvePinned(_ context.Context, endpointID, uri string) (service.ResolvedTarget, error) {
+func (r ResolverAdapter) ResolvePinned(ctx context.Context, endpointID, uri string) (service.ResolvedTarget, error) {
 	if endpointID == "" || uri == "" {
 		return service.ResolvedTarget{}, fmt.Errorf("runtime: pinned endpoint and URI are required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	address, err := mektup.ParseThreadURI(uri)
 	if err != nil {
@@ -84,7 +87,14 @@ func (r ResolverAdapter) ResolvePinned(_ context.Context, endpointID, uri string
 			return service.ResolvedTarget{}, fmt.Errorf("runtime: pinned URI alias %q is not mapped to endpoint %q", address.Endpoint, endpointID)
 		}
 	}
-	return service.ResolvedTarget{Requested: uri, EndpointID: ep.ID, URI: uri, ThreadID: address.ThreadID, Loaded: true, Persistent: true}, nil
+	loaded, persistent := true, true
+	if r.StateProbe != nil {
+		loaded, persistent, err = r.StateProbe(ctx, ep.ID, address.ThreadID)
+		if err != nil {
+			return service.ResolvedTarget{}, fmt.Errorf("runtime: pinned target runtime-state preflight failed: %w", err)
+		}
+	}
+	return service.ResolvedTarget{Requested: uri, EndpointID: ep.ID, URI: uri, ThreadID: address.ThreadID, Loaded: loaded, Persistent: persistent}, nil
 }
 
 func codexURI(alias, threadID string) string {

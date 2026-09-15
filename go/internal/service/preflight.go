@@ -21,6 +21,9 @@ func preflight(rendered []byte, body string) error {
 }
 
 func validateObservedEnvelope(item ObservedItem, original OperationStatus, accepted bool) (mektup.Envelope, error) {
+	if item.NativeType != "" && item.NativeType != "userMessage" {
+		return mektup.Envelope{}, fmt.Errorf("reply was observed in a non-user native item")
+	}
 	e, err := mektup.ParseEnvelopeString(item.Text)
 	if err != nil {
 		return mektup.Envelope{}, err

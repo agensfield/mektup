@@ -34,7 +34,7 @@ func (r OriginalResolver) ResolveOriginal(ctx context.Context, reference string)
 			continue
 		}
 		envelope, parseErr := mektup.ParseEnvelopeString(item.Text)
-		if parseErr != nil || envelope.Kind != mektup.KindMessage {
+		if parseErr != nil || (envelope.Kind != mektup.KindMessage && envelope.Kind != mektup.KindReply) {
 			continue
 		}
 		if !matchesExact(reference, envelope, item.ClientMessageID) {
@@ -50,7 +50,11 @@ func (r OriginalResolver) ResolveOriginal(ctx context.Context, reference string)
 			continue
 		}
 		candidate := service.OriginalMessage{Envelope: envelope, CurrentThread: r.Target.URI}
-		if match != nil && (match.Envelope.MessageID != candidate.Envelope.MessageID || match.Envelope.PayloadSHA256 != candidate.Envelope.PayloadSHA256 || match.Envelope.To != candidate.Envelope.To) {
+		// Envelope is a scalar-only immutable value. Compare the complete
+		// relationship tuple, including sender, reply route, custody route,
+		// status, timestamp, and body, rather than selecting the later history
+		// presentation when a return route was changed.
+		if match != nil && match.Envelope != candidate.Envelope {
 			return service.OriginalMessage{}, service.ErrOriginalIdentityConflict
 		}
 		copy := candidate
