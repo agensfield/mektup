@@ -398,6 +398,15 @@ func TestCleanupFailurePreservesAcceptedResultAndAddsWireWarning(t *testing.T) {
 	}
 }
 
+func TestCleanupFailureAddsDurableReceiptWarningProjection(t *testing.T) {
+	result := cli.ExecutionResult{Receipt: mektup.Receipt{Warnings: []mektup.Warning{}}, Exit: cli.ExitSuccess}
+	got := preserveCleanupResult(result, errors.New("close failed"))
+	receipt, ok := got.Receipt.(mektup.Receipt)
+	if !ok || len(receipt.Warnings) != 1 || receipt.Warnings[0].Code != mektup.WarningCleanupIncomplete {
+		t.Fatalf("receipt cleanup warnings = %#v", got.Receipt)
+	}
+}
+
 func TestProductionCompositionDoesNotRequireDaemonOrSSHProcessForInjectedRoute(t *testing.T) {
 	root := t.TempDir()
 	store := endpoint.NewStore(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"))
