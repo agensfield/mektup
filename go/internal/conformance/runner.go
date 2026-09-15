@@ -684,8 +684,16 @@ func validateControlFixture(data []byte) error {
 				if !ok {
 					return errors.New("claimed result requires lease")
 				}
-				if expires, ok := lease["expiresAt"].(string); !ok || expires == "" {
+				if expires, ok := lease["expiresAt"].(string); !ok || !validControlTimestamp(expires) {
 					return errors.New("claimed result requires lease expiry")
+				}
+				for _, field := range []string{"acquiredAt", "heartbeatAt"} {
+					if raw, present := lease[field]; present {
+						value, ok := raw.(string)
+						if !ok || !validControlTimestamp(value) {
+							return fmt.Errorf("claimed result lease %s must be a UTC timestamp", field)
+						}
+					}
 				}
 			case "existing":
 				if _, ok := result["fencingToken"]; ok {
@@ -867,6 +875,14 @@ func validateEventSequence(root string) error {
 func digest(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+func validControlTimestamp(value string) bool {
+	if len(value) < len("2006-01-02T15:04:05.0Z") || !strings.HasSuffix(value, "Z") || len(value) <= 19 || value[19] != '.' {
+		return false
+	}
+	timestamp, err := time.Parse(time.RFC3339Nano, value)
+	return err == nil && timestamp.Location() == time.UTC
 }
 
 func validDigest(value string) bool {

@@ -354,7 +354,8 @@ func (r ControlRequest) Validate() error {
 			}
 			switch result.Disposition {
 			case "claimed":
-				if result.FencingToken == "" || result.Lease == nil || !result.Lease.valid() {
+				leaseRaw, present := resultObject["lease"]
+				if !present || result.FencingToken == "" || result.Lease == nil || !result.Lease.valid() || validateLeaseObject(leaseRaw) != nil {
 					return fmt.Errorf("%w: claimed result requires fencingToken and lease", ErrControlValidation)
 				}
 			case "existing":
@@ -364,9 +365,13 @@ func (r ControlRequest) Validate() error {
 				if _, present := resultObject["lease"]; present {
 					return fmt.Errorf("%w: existing result forbids fencingToken and lease", ErrControlValidation)
 				}
-				if len(result.Winner) > 0 && string(result.Winner) != "null" {
-					var winner map[string]any
-					if err := json.Unmarshal(result.Winner, &winner); err != nil || winner == nil {
+				if raw, present := resultObject["status"]; present {
+					if text, err := rawString(raw, "result.status"); err != nil || text == "" {
+						return fmt.Errorf("%w: existing result status must be a nonempty string", ErrControlValidation)
+					}
+				}
+				if raw, present := resultObject["winner"]; present {
+					if _, err := rawObject(raw, "result.winner"); err != nil {
 						return fmt.Errorf("%w: existing result winner must be an object", ErrControlValidation)
 					}
 				}

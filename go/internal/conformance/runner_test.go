@@ -17,7 +17,7 @@ func TestRunFromRepositoryAndEmitDeterministicEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(summary.Fixtures) != 21 || len(summary.Scenarios) != 104 {
+	if len(summary.Fixtures) != 25 || len(summary.Scenarios) != 104 {
 		t.Fatalf("unexpected coverage: fixtures=%d scenarios=%d", len(summary.Fixtures), len(summary.Scenarios))
 	}
 	var first, second bytes.Buffer
@@ -94,6 +94,34 @@ func TestTamperedScenarioExpectationFailsSemanticValidation(t *testing.T) {
 	scenarios.Profiles["rejected"] = profile
 	if err := validateScenarioDocuments(scenarios, transitions); err == nil {
 		t.Fatal("tampered terminal exit unexpectedly passed")
+	}
+}
+
+func TestClaimResultMutationsStayRejectedByRunner(t *testing.T) {
+	root, err := Root()
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing, err := os.ReadFile(filepath.Join(root, fixturesDir, "control-claim-existing-result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, err := os.ReadFile(filepath.Join(root, fixturesDir, "control-claim-result.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string][]byte{
+		"existing null status":    bytes.Replace(existing, []byte(`"status": "accepted"`), []byte(`"status": null`), 1),
+		"existing null winner":    bytes.Replace(existing, []byte(`"winner": {`), []byte(`"winner": null, "ignored": {`), 1),
+		"claimed invalid expiry":  bytes.Replace(claimed, []byte(`"expiresAt": "2026-09-15T03:00:31.900000Z"`), []byte(`"expiresAt": "not-a-timestamp"`), 1),
+		"claimed null acquiredAt": bytes.Replace(claimed, []byte(`"acquiredAt": "2026-09-15T03:00:01.900000Z"`), []byte(`"acquiredAt": null`), 1),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := validateControlFixture(data); err == nil {
+				t.Fatal("tampered claim result unexpectedly passed runner validation")
+			}
+		})
 	}
 }
 

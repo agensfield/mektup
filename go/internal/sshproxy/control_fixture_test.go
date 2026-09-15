@@ -70,10 +70,26 @@ func TestControlClaimExistingResultIsTokenless(t *testing.T) {
 	for name, tampered := range map[string][]byte{
 		"null fencingToken": bytes.Replace(result, []byte(`"result":{"disposition"`), []byte(`"result":{"fencingToken":null,"disposition"`), 1),
 		"null lease":        bytes.Replace(result, []byte(`"result":{"disposition"`), []byte(`"result":{"lease":null,"disposition"`), 1),
+		"null status":       bytes.Replace(result, []byte(`"status":"accepted"`), []byte(`"status":null`), 1),
+		"null winner":       bytes.Replace(result, []byte(`"winner":{"replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007"}`), []byte(`"winner":null`), 1),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := ValidateControlRequest(tampered); !errors.Is(err, ErrControlValidation) {
 				t.Fatalf("existing claim result with explicit null accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestControlClaimResultLeaseTimestampsAreStrict(t *testing.T) {
+	claimed := []byte(`{"schema":"mektup/control/v1","kind":"result","operation":"claim","operationId":"op_0198f0e0-0000-7000-8000-00000000000c","replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007","originalMessageId":"msg_0198f0e0-0000-7000-8000-000000000003","custody":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","storeId":"store_0198f0e0-0000-7000-8000-000000000002"},"replyDestination":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","threadId":"thread-local-001"},"result":{"disposition":"claimed","state":"reply_dispatch_claimed","fencingToken":"fence-01","lease":{"acquiredAt":"2026-09-15T03:00:01.900000Z","expiresAt":"2026-09-15T03:00:31.900000Z"}}}`)
+	for name, tampered := range map[string][]byte{
+		"invalid expiry":  bytes.Replace(claimed, []byte(`2026-09-15T03:00:31.900000Z`), []byte(`not-a-timestamp`), 1),
+		"null acquiredAt": bytes.Replace(claimed, []byte(`"acquiredAt":"2026-09-15T03:00:01.900000Z"`), []byte(`"acquiredAt":null`), 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ValidateControlRequest(tampered); !errors.Is(err, ErrControlValidation) {
+				t.Fatalf("invalid claim lease timestamp accepted: %v", err)
 			}
 		})
 	}

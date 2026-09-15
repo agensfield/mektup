@@ -43,6 +43,25 @@ func TestOfflineSurfacesDoNotNeedState(t *testing.T) {
 	}
 }
 
+func TestVersionReportsLockedContractRevision(t *testing.T) {
+	code, stdout, stderr := runTest(t, "version", "--json")
+	if code != int(ExitSuccess) || stderr != "" {
+		t.Fatalf("code=%d stderr=%q", code, stderr)
+	}
+	var version struct {
+		ContractVersion string `json:"contract_version"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &version); err != nil {
+		t.Fatal(err)
+	}
+	if version.ContractVersion != ContractVersion {
+		t.Fatalf("contract version=%q constant=%q", version.ContractVersion, ContractVersion)
+	}
+	if version.ContractVersion != "1.0.2" {
+		t.Fatalf("contract version=%q, want 1.0.2", version.ContractVersion)
+	}
+}
+
 func TestOfflineSurfacesRejectOperationalOverrides(t *testing.T) {
 	for _, args := range [][]string{{"--state-dir", "/tmp/state", "--skill"}, {"--config", "/tmp/config", "docs", "agents"}, {"--endpoint", "remote", "docs", "commands"}, {"--audit", "docs", "receipts"}, {"--debug", "version"}} {
 		code, _, _ := runTest(t, args...)
