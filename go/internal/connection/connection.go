@@ -19,6 +19,8 @@ import (
 	"github.com/agensfield/mektup/go/internal/codexapi"
 	"github.com/agensfield/mektup/go/internal/compat"
 	"github.com/agensfield/mektup/go/internal/endpoint"
+	"github.com/agensfield/mektup/go/internal/sshproxy"
+	"github.com/agensfield/mektup/go/internal/sshtransport"
 )
 
 var (
@@ -52,6 +54,13 @@ type ClientDialFunc func(context.Context, endpoint.Route, appserver.Options) (*a
 
 func (f ClientDialFunc) DialClient(ctx context.Context, route endpoint.Route, options appserver.Options) (*appserver.Client, error) {
 	return f(ctx, route, options)
+}
+
+// NewSSHClientDialer returns the production SSH bridge for Connect's
+// Options.ClientDialer seam. The remote app-server daemon is not started by
+// this constructor; sshproxy only relays its raw HTTP Upgrade/WebSocket bytes.
+func NewSSHClientDialer(config sshproxy.Config, factory sshproxy.ProcessFactory) ClientDialer {
+	return sshtransport.NewClientDialer(config, factory)
 }
 
 type defaultClientDialer struct{}
