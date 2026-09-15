@@ -52,7 +52,7 @@ type ScopedSearcher interface {
 // thread/name/set mutation. It is optional on Codex so older adapters cannot
 // accidentally treat --name as a start/fork field.
 type ThreadNameSetter interface {
-	ThreadSetName(context.Context, string, string) (any, error)
+	ThreadSetName(context.Context, string, string) (codexapi.ThreadNameResponse, error)
 }
 
 // Connection is an already initialized, compatibility-gated endpoint. Check
@@ -187,7 +187,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 	if len(inv.Position) == 0 {
 		return cli.ExecutionResult{}, usage("missing thread subcommand")
 	}
-	if err := validatePageOptions(inv); err != nil {
+	if err := validatePageOptions(inv, codexapi.MaxThreadPageLimit); err != nil {
 		return cli.ExecutionResult{}, err
 	}
 	mutating := inv.Position[0] == "start" || inv.Position[0] == "resume" || inv.Position[0] == "fork"
@@ -251,7 +251,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 				return cli.ExecutionResult{}, callErr
 			}
 		}
-		data, kind = rawOr(r.Raw, r), "thread.start"
+		data, kind = lifecycleMetadata(r), "thread.start"
 	case "resume":
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread resume requires a thread identifier")
@@ -260,7 +260,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
-		data, kind = rawOr(r.Raw, r), "thread.resume"
+		data, kind = lifecycleMetadata(r), "thread.resume"
 	case "fork":
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread fork requires a thread identifier")
@@ -274,7 +274,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 				return cli.ExecutionResult{}, callErr
 			}
 		}
-		data, kind = rawOr(r.Raw, r), "thread.fork"
+		data, kind = lifecycleMetadata(r), "thread.fork"
 	default:
 		return cli.ExecutionResult{}, usage("unsupported thread subcommand: " + sub)
 	}
@@ -285,7 +285,11 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (cli.Executio
 	if len(inv.Position) < 1 || strings.TrimSpace(inv.Position[0]) == "" {
 		return cli.ExecutionResult{}, usage("search requires a query")
 	}
-	if err := validatePageOptions(inv); err != nil {
+	pageMax := codexapi.MaxThreadPageLimit
+	if has(inv, "thread") {
+		pageMax = codexapi.MaxOccurrencesPageLimit
+	}
+	if err := validatePageOptions(inv, pageMax); err != nil {
 		return cli.ExecutionResult{}, err
 	}
 	conn, api, err := e.open(ctx, inv.Resolved.Endpoint)
@@ -564,6 +568,9 @@ func (e *Executor) params(ctx context.Context, inv cli.Invocation) (json.RawMess
 
 func (e *Executor) result(ctx context.Context, kind string, data any, cursor string, warnings []string, mutation bool, endpointID string) (cli.ExecutionResult, error) {
 	payload := map[string]any{"resultKind": kind, "result": data}
+	if strings.HasPrefix(kind, "search") {
+		payload["experimental"] = true
+	}
 	if cursor != "" {
 		payload["nextCursor"] = cursor
 	}
@@ -645,6 +652,29 @@ func rawOr(raw json.RawMessage, value any) any {
 	return value
 }
 
+// lifecycleMetadata is the privacy boundary for thread mutations. Lifecycle
+// responses may contain hydrated turns/items in Raw; mutation receipts and
+// CLI output only carry bounded identity/runtime fields.
+func lifecycleMetadata(response codexapi.LifecycleResponse) map[string]any {
+	data := map[string]any{}
+	if response.Thread.ID != "" {
+		data["threadId"] = response.Thread.ID
+	}
+	if response.Thread.Status != "" {
+		data["status"] = response.Thread.Status
+	}
+	if response.Model != "" {
+		data["model"] = response.Model
+	}
+	if response.ModelProvider != "" {
+		data["modelProvider"] = response.ModelProvider
+	}
+	if response.CWD != "" {
+		data["cwd"] = response.CWD
+	}
+	return data
+}
+
 func pageData(raw json.RawMessage, value any, cursor string) (any, string) {
 	return rawOr(raw, value), cursor
 }
@@ -655,14 +685,14 @@ func optionInt(inv cli.Invocation, name string) int {
 	return n
 }
 
-func validatePageOptions(inv cli.Invocation) error {
+func validatePageOptions(inv cli.Invocation, maxLimit int) error {
 	if cursor := inv.Option("cursor"); len(cursor) > codexapi.MaxCursorBytes {
 		return usage("--cursor exceeds the bounded cursor size")
 	}
 	if value := inv.Option("limit"); value != "" {
 		n, err := strconv.Atoi(value)
-		if err != nil || n < 0 || n > codexapi.MaxThreadPageLimit {
-			return usage("--limit must be between 0 and 100")
+		if err != nil || n < 0 || n > maxLimit {
+			return usage(fmt.Sprintf("--limit must be between 0 and %d", maxLimit))
 		}
 	}
 	return nil
