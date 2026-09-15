@@ -85,12 +85,14 @@ func TestLiveBodyCarryAcceptance(t *testing.T) {
 	}
 	sourceURI := "codex://live/thread/" + source.Thread.ID
 	targetURI := "codex://live/thread/" + target.Thread.ID
-	resolver := liveResolver{source: service.SourceIdentity{EndpointID: endpointID, URI: sourceURI, CustodyEndpointID: endpointID, CustodyStoreID: store.StoreID()}, target: service.ResolvedTarget{EndpointID: endpointID, URI: targetURI, ThreadID: target.Thread.ID, Loaded: true, Persistent: true}}
+	targetResolved := service.ResolvedTarget{EndpointID: endpointID, URI: targetURI, ThreadID: target.Thread.ID, Loaded: true, Persistent: true}
+	senderResolver := liveResolver{source: service.SourceIdentity{EndpointID: endpointID, URI: sourceURI, CustodyEndpointID: endpointID, CustodyStoreID: store.StoreID()}, target: targetResolved}
+	receiverResolver := liveResolver{source: service.SourceIdentity{EndpointID: endpointID, URI: targetURI, CustodyEndpointID: endpointID, CustodyStoreID: store.StoreID()}, target: targetResolved}
 	observe := &ObservationAdapter{Pool: pool}
 	gatedObserve := &custodyFirstObservation{inner: observe, release: make(chan struct{})}
-	sender := &service.Service{Resolver: resolver, Delivery: &DeliveryAdapter{Pool: pool}, Journal: journalAdapter, Observe: gatedObserve}
-	receiver := &service.Service{Resolver: resolver, Delivery: &DeliveryAdapter{Pool: pool}, Journal: journalAdapter, Observe: observe}
-	originalResolver := OriginalResolver{Observe: observe, Target: resolver.target}
+	sender := &service.Service{Resolver: senderResolver, Delivery: &DeliveryAdapter{Pool: pool}, Journal: journalAdapter, Observe: gatedObserve}
+	receiver := &service.Service{Resolver: receiverResolver, Delivery: &DeliveryAdapter{Pool: pool}, Journal: journalAdapter, Observe: observe}
+	originalResolver := OriginalResolver{Observe: observe, Target: targetResolved}
 
 	started := time.Now()
 	sendDone := make(chan liveSendOutcome, 1)
@@ -99,15 +101,22 @@ func TestLiveBodyCarryAcceptance(t *testing.T) {
 		sendDone <- liveSendOutcome{result: result, err: sendErr}
 	}()
 
-	original, err := discoverLiveOriginal(ctx, 10*time.Second, observe, resolver.target, originalResolver, sendDone, "a dedicated live body-carry probe")
+	original, err := discoverLiveOriginal(ctx, 10*time.Second, observe, targetResolved, originalResolver, sendDone, "a dedicated live body-carry probe")
 	if err != nil {
 		t.Fatalf("dedicated original did not become visible: %v", err)
 	}
-	if _, err := receiver.Reply(ctx, originalResolver, service.ReplyRequest{Reference: original.Envelope.MessageID, Body: "one dedicated live reply"}); err != nil {
+	replyResult, err := receiver.Reply(ctx, originalResolver, service.ReplyRequest{Reference: original.Envelope.MessageID, Body: "one dedicated live reply"})
+	if err != nil {
 		t.Fatalf("reply delivery: %v", err)
 	}
+	replyID := replyResult.Receipt.Message.MessageID
+	if replyID == "" {
+		t.Fatal("reply receipt omitted message identity")
+	}
+	var sendOutcome liveSendOutcome
 	select {
 	case outcome := <-sendDone:
+		sendOutcome = outcome
 		logLiveSendOutcome(t, outcome)
 		if outcome.err != nil {
 			t.Fatalf("sender wait did not wake from custody: %v", outcome.err)
@@ -138,6 +147,44 @@ func TestLiveBodyCarryAcceptance(t *testing.T) {
 	if replyCount != 1 {
 		t.Fatalf("native source history contains %d exact reply bodies, want one", replyCount)
 	}
+	if sendOutcome.result.Wait.ReplyID != replyID || replyResult.Receipt.Message.InReplyTo != original.Envelope.MessageID {
+		t.Fatalf("custody reply ID %q differs from delivered reply %q", sendOutcome.result.Wait.ReplyID, replyID)
+	}
+	originalCount := 0
+	for _, item := range mustHistory(t, observe, targetResolved) {
+		if item.NativeType != "userMessage" || item.ClientMessageID != original.Envelope.MessageID {
+			continue
+		}
+		parsed, parseErr := mektup.ParseEnvelopeString(item.Text)
+		if parseErr == nil && parsed.Kind == mektup.KindMessage && parsed.MessageID == original.Envelope.MessageID && parsed.FromEndpointID == endpointID && parsed.ToEndpointID == endpointID && parsed.From == sourceURI && parsed.To == targetURI && parsed.Body == original.Envelope.Body && parsed.PayloadSHA256 == original.Envelope.PayloadSHA256 {
+			originalCount++
+		}
+	}
+	if originalCount != 1 {
+		t.Fatalf("native target history contains %d exact original user messages, want one", originalCount)
+	}
+	exactReplyCount := 0
+	for _, item := range items {
+		if item.NativeType != "userMessage" || item.ClientMessageID != replyID {
+			continue
+		}
+		parsed, parseErr := mektup.ParseEnvelopeString(item.Text)
+		if parseErr == nil && parsed.Kind == mektup.KindReply && parsed.MessageID == replyID && parsed.FromEndpointID == endpointID && parsed.ToEndpointID == endpointID && parsed.From == targetURI && parsed.To == sourceURI && parsed.InReplyTo == original.Envelope.MessageID && parsed.Body == "one dedicated live reply" && parsed.PayloadSHA256 == replyResult.Receipt.Message.PayloadSHA256 && parsed.PayloadBytes == replyResult.Receipt.Message.PayloadBytes {
+			exactReplyCount++
+		}
+	}
+	if exactReplyCount != 1 {
+		t.Fatalf("native source history contains %d exact correlated reply user messages, want one", exactReplyCount)
+	}
+}
+
+func mustHistory(t *testing.T, observe service.ObservationPort, target service.ResolvedTarget) []service.ObservedItem {
+	t.Helper()
+	items, err := observe.FullHistory(context.Background(), target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return items
 }
 
 type liveSendOutcome struct {
@@ -162,9 +209,14 @@ func discoverLiveOriginal(ctx context.Context, timeout time.Duration, observe se
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	scanCtx, scanCancel := context.WithCancel(ctx)
-	defer scanCancel()
+	workerDone := make(chan struct{})
+	defer func() {
+		scanCancel()
+		<-workerDone
+	}()
 	historyCh := make(chan liveHistoryResult, 1)
 	go func() {
+		defer close(workerDone)
 		ticker := time.NewTicker(100 * time.Millisecond)
 		defer ticker.Stop()
 		for {
@@ -189,7 +241,7 @@ func discoverLiveOriginal(ctx context.Context, timeout time.Duration, observe se
 			if outcome.err != nil {
 				return service.OriginalMessage{}, fmt.Errorf("send failed before original discovery operation=%s message=%s state=%s: %w", outcome.result.Receipt.OperationID, outcome.result.Receipt.Message.MessageID, outcome.result.Receipt.State, outcome.err)
 			}
-			continue
+			return service.OriginalMessage{}, fmt.Errorf("send completed before original discovery operation=%s message=%s state=%s", outcome.result.Receipt.OperationID, outcome.result.Receipt.Message.MessageID, outcome.result.Receipt.State)
 		case history := <-historyCh:
 			if history.err == nil {
 				for _, item := range history.items {
@@ -197,7 +249,7 @@ func discoverLiveOriginal(ctx context.Context, timeout time.Duration, observe se
 					if parseErr != nil || parsed.Kind != mektup.KindMessage || parsed.Body != expectedBody {
 						continue
 					}
-					if original, resolveErr := resolver.ResolveOriginal(ctx, parsed.MessageID); resolveErr == nil {
+					if original, resolveErr := resolver.resolveItems(parsed.MessageID, history.items); resolveErr == nil {
 						return original, nil
 					}
 				}

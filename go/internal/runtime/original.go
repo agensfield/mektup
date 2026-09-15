@@ -28,6 +28,10 @@ func (r OriginalResolver) ResolveOriginal(ctx context.Context, reference string)
 	if err != nil {
 		return service.OriginalMessage{}, err
 	}
+	return r.resolveItems(reference, items)
+}
+
+func (r OriginalResolver) resolveItems(reference string, items []service.ObservedItem) (service.OriginalMessage, error) {
 	var match *service.OriginalMessage
 	for _, item := range items {
 		if item.ThreadID != "" && item.ThreadID != r.Target.ThreadID {
