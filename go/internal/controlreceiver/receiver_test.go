@@ -93,10 +93,19 @@ type staticResolver struct{ store Store }
 
 func (r staticResolver) Resolve(context.Context, string, string) (Store, error) { return r.store, nil }
 
+func localDestination() DestinationResolver {
+	return DestinationResolverFunc(func(_ context.Context, endpointID, uri, threadID string) error {
+		if endpointID == receiverEndpoint && uri == "codex://local/thread/source" && threadID == "source" {
+			return nil
+		}
+		return ErrRelationshipMismatch
+	})
+}
+
 func TestReceiverClaimHeartbeatCommitStatusAndDuplicate(t *testing.T) {
 	j, _ := openReceiverJournal(t, time.Minute)
 	prepareOriginal(t, j)
-	receiver := Receiver{Registry: staticResolver{store: Store{Journal: j, StoreID: j.StoreID(), EndpointID: receiverEndpoint, CloseFunc: func() error { return nil }}}, LocalEndpointID: receiverEndpoint}
+	receiver := Receiver{Registry: staticResolver{store: Store{Journal: j, StoreID: j.StoreID(), EndpointID: receiverEndpoint, CloseFunc: func() error { return nil }}}, LocalEndpointID: receiverEndpoint, Destination: localDestination()}
 	claimRequest := request(j)
 	claimResult := receive(t, receiver, claimRequest)
 	var claimPayload struct {
@@ -152,7 +161,7 @@ func TestReceiverClaimHeartbeatCommitStatusAndDuplicate(t *testing.T) {
 func TestReceiverRejectsWrongStoreRouteAndConflict(t *testing.T) {
 	j, state := openReceiverJournal(t, time.Minute)
 	prepareOriginal(t, j)
-	receiver := Receiver{Registry: makeRegistry(t, state, j.StoreID()), LocalEndpointID: receiverEndpoint}
+	receiver := Receiver{Registry: makeRegistry(t, state, j.StoreID()), LocalEndpointID: receiverEndpoint, Destination: localDestination()}
 	wrong := request(j)
 	wrong.Custody.EndpointID = "ep_0198f0e0-0000-7000-8000-000000000002"
 	if _, err := receiver.Receive(context.Background(), mustMarshal(t, wrong)); !errors.Is(err, ErrStoreUnavailable) && !errors.Is(err, ErrRelationshipMismatch) {
@@ -172,7 +181,7 @@ func TestReceiverRejectsWrongStoreRouteAndConflict(t *testing.T) {
 func TestReceiverRejectsWrongThreadForMatchingDestination(t *testing.T) {
 	j, state := openReceiverJournal(t, time.Minute)
 	prepareOriginal(t, j)
-	receiver := Receiver{Registry: makeRegistry(t, state, j.StoreID()), LocalEndpointID: receiverEndpoint}
+	receiver := Receiver{Registry: makeRegistry(t, state, j.StoreID()), LocalEndpointID: receiverEndpoint, Destination: localDestination()}
 	wrong := request(j)
 	wrong.ReplyDestination.ThreadID = "thread-other"
 	if _, err := receiver.Receive(context.Background(), mustMarshal(t, wrong)); !errors.Is(err, ErrRelationshipMismatch) {
@@ -214,6 +223,41 @@ func TestReceiverAllowsDistinctTrustedReplyEndpointTopology(t *testing.T) {
 	}
 }
 
+func TestRegistryDoesNotInitializeZeroByteDatabase(t *testing.T) {
+	state := filepath.Join(t.TempDir(), "state")
+	if err := os.MkdirAll(state, 0700); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(state, "journal.sqlite3")
+	if err := os.WriteFile(dbPath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	registryDir := t.TempDir()
+	if err := os.Chmod(registryDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	regPath := filepath.Join(registryDir, "stores.json")
+	storeID := "store_0198f0e0-0000-7000-8000-000000000099"
+	doc, err := json.Marshal(RegistryDocument{Version: 1, Stores: []RegistryEntry{{StoreID: storeID, EndpointID: receiverEndpoint, StateDir: state}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(regPath, doc, 0600); err != nil {
+		t.Fatal(err)
+	}
+	registry := FileRegistry{Path: regPath}
+	if _, err := registry.Resolve(context.Background(), receiverEndpoint, storeID); err == nil {
+		t.Fatal("zero-byte database accepted")
+	}
+	info, err := os.Stat(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("zero-byte database changed to %d bytes", info.Size())
+	}
+}
+
 func ptrInt64(value int64) *int64 { return &value }
 
 func TestReceiverExpiredTokenAndUnknownStatus(t *testing.T) {
@@ -226,7 +270,7 @@ func TestReceiverExpiredTokenAndUnknownStatus(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = j.Close() })
 	prepareOriginal(t, j)
-	receiver := Receiver{Registry: staticResolver{store: Store{Journal: j, StoreID: j.StoreID(), EndpointID: receiverEndpoint, CloseFunc: func() error { return nil }}}, LocalEndpointID: receiverEndpoint}
+	receiver := Receiver{Registry: staticResolver{store: Store{Journal: j, StoreID: j.StoreID(), EndpointID: receiverEndpoint, CloseFunc: func() error { return nil }}}, LocalEndpointID: receiverEndpoint, Destination: localDestination()}
 	claim := request(j)
 	result := receive(t, receiver, claim)
 	var payload struct {
@@ -255,7 +299,7 @@ func TestReceiverExpiredTokenAndUnknownStatus(t *testing.T) {
 func TestReceiverServeRejectsMultipleDocumentsAndBody(t *testing.T) {
 	j, state := openReceiverJournal(t, time.Minute)
 	prepareOriginal(t, j)
-	receiver := Receiver{Registry: makeRegistry(t, state, j.StoreID()), LocalEndpointID: receiverEndpoint}
+	receiver := Receiver{Registry: makeRegistry(t, state, j.StoreID()), LocalEndpointID: receiverEndpoint, Destination: localDestination()}
 	data := mustMarshal(t, request(j))
 	if err := receiver.Serve(context.Background(), strings.NewReader(string(data)+"\n"+string(data)), io.Discard); !errors.Is(err, sshproxy.ErrControlValidation) {
 		t.Fatalf("multiple docs err = %v", err)

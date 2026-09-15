@@ -152,11 +152,10 @@ func (r Receiver) validateOriginal(ctx context.Context, j *journal.Journal, req 
 	if err := validateDestinationThread(req); err != nil {
 		return err
 	}
-	if r.Destination != nil {
-		if err := r.Destination.ValidateDestination(ctx, req.ReplyDestination.EndpointID, req.ReplyDestination.URI, req.ReplyDestination.ThreadID); err != nil {
-			return ErrRelationshipMismatch
-		}
-	} else if req.ReplyDestination.EndpointID != r.LocalEndpointID {
+	if r.Destination == nil {
+		return ErrRelationshipMismatch
+	}
+	if err := r.Destination.ValidateDestination(ctx, req.ReplyDestination.EndpointID, req.ReplyDestination.URI, req.ReplyDestination.ThreadID); err != nil {
 		return ErrRelationshipMismatch
 	}
 	op, err := j.OperationByMessage(ctx, req.OriginalMessageID)

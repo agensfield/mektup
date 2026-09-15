@@ -111,6 +111,9 @@ func open(ctx context.Context, opts Options, existing bool) (*Journal, error) {
 		if statErr != nil || !dbInfo.Mode().IsRegular() {
 			return nil, fmt.Errorf("journal: existing database unavailable")
 		}
+		if err := preflightExistingDatabase(ctx, dbPath); err != nil {
+			return nil, err
+		}
 	} else if err := secureDir(dir); err != nil {
 		return nil, err
 	}
@@ -145,6 +148,26 @@ func open(ctx context.Context, opts Options, existing bool) (*Journal, error) {
 		return nil, err
 	}
 	return j, nil
+}
+
+func preflightExistingDatabase(ctx context.Context, path string) error {
+	db, err := sql.Open("sqlite", "file:"+escapedSQLitePath(path)+"?mode=rw")
+	if err != nil {
+		return fmt.Errorf("journal: existing database preflight: %w", ErrCorrupt)
+	}
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		return fmt.Errorf("journal: existing database preflight: %w", ErrCorrupt)
+	}
+	var version int
+	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil || version == 0 {
+		return fmt.Errorf("journal: existing database is uninitialized: %w", ErrCorrupt)
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='meta'").Scan(&count); err != nil || count != 1 {
+		return fmt.Errorf("journal: existing database has no recognized schema: %w", ErrCorrupt)
+	}
+	return nil
 }
 
 func escapedSQLitePath(path string) string {
