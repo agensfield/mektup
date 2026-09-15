@@ -15,31 +15,31 @@ import (
 // Unknown and active records are never eligible solely because of age.
 const RetentionAge = 30 * 24 * time.Hour
 
-const retentionOperationStates = `state IN (?,?,?,?) AND terminal_at IS NOT NULL AND terminal_at > 0 AND terminal_at <= ?`
+const retentionOperationStates = `o.state IN (?,?,?,?) AND o.terminal_at IS NOT NULL AND o.terminal_at > 0 AND o.terminal_at <= ?`
 
 // retentionOperationPredicate keeps an accepted request-reply operation
 // alive until custody has a durable winner and every related claim is itself
 // terminal and old. This prevents an accepted outbound send from erasing the
 // relationship a later wait needs to inspect.
 const retentionOperationPredicate = retentionOperationStates + ` AND (
-	reply_route = '' OR (
-		state IN (?,?,?) AND NOT EXISTS (
+	o.reply_route = '' OR (
+		o.state IN (?,?,?) AND NOT EXISTS (
 			SELECT 1 FROM reply_claims related
-			WHERE related.original_id = operations.message_id
+			WHERE related.original_id = o.message_id
 			  AND (related.state NOT IN (?,?) OR related.updated_at > ?)
 		)
 	) OR (
-		state = ? AND
+		o.state = ? AND
 		EXISTS (
 			SELECT 1 FROM reply_winners w
 			JOIN reply_claims winner ON winner.reply_id = w.reply_id
-			WHERE w.original_id = operations.message_id
+			WHERE w.original_id = o.message_id
 			  AND winner.state IN (?,?)
 			  AND winner.updated_at <= ?
 		)
 		AND NOT EXISTS (
 			SELECT 1 FROM reply_claims related
-			WHERE related.original_id = operations.message_id
+			WHERE related.original_id = o.message_id
 			  AND (related.state NOT IN (?,?) OR related.updated_at > ?)
 		)
 	)
@@ -190,11 +190,11 @@ func (j *Journal) StorageStatus(ctx context.Context) (StorageStatus, error) {
 	if j.now != nil {
 		status.RetentionCutoff = j.now().UTC().Add(-RetentionAge)
 	}
-	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations WHERE `+retentionOperationPredicate, retentionOperationArgs(status.RetentionCutoff.UnixNano())...).Scan(&status.RetentionEligible); err != nil {
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations o WHERE `+retentionOperationPredicate, retentionOperationArgs(status.RetentionCutoff.UnixNano())...).Scan(&status.RetentionEligible); err != nil {
 		return status, classifyStorageError(err)
 	}
 	var replies int64
-	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims WHERE state IN (?,?) AND updated_at <= ?`, string(StateReplyAccepted), string(StateReplyObserved), status.RetentionCutoff.UnixNano()).Scan(&replies); err != nil {
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims c WHERE `+retentionReplyPredicate, retentionReplyArgs(status.RetentionCutoff.UnixNano())...).Scan(&replies); err != nil {
 		return status, classifyStorageError(err)
 	}
 	status.RetentionEligible += replies
@@ -230,6 +230,15 @@ func retentionOperationArgs(cutoff int64) []any {
 	}
 }
 
+const retentionReplyPredicate = `c.state IN (?,?) AND c.updated_at <= ? AND EXISTS (
+	SELECT 1 FROM operations o WHERE o.message_id = c.original_id AND ` + retentionOperationPredicate + `
+)`
+
+func retentionReplyArgs(cutoff int64) []any {
+	args := []any{string(StateReplyAccepted), string(StateReplyObserved), cutoff}
+	return append(args, retentionOperationArgs(cutoff)...)
+}
+
 // StorageCheck performs only SELECTs and read-only SQLite pragmas. It never
 // creates a directory, repairs schema, changes pragmas, or rebuilds files.
 func (j *Journal) StorageCheck(ctx context.Context) (StorageCheck, error) {
@@ -243,6 +252,9 @@ func checkDB(ctx context.Context, db *sql.DB) (StorageCheck, error) {
 	}
 	if result.Integrity != "ok" {
 		return result, fmt.Errorf("%w: integrity_check: %s", ErrStorageCorrupt, result.Integrity)
+	}
+	if err := validateReadOnlySchema(ctx, db); err != nil {
+		return result, err
 	}
 	rows, err := db.QueryContext(ctx, "PRAGMA foreign_key_check")
 	if err != nil {
@@ -286,6 +298,26 @@ func checkDB(ctx context.Context, db *sql.DB) (StorageCheck, error) {
 	return result, nil
 }
 
+func validateReadOnlySchema(ctx context.Context, db *sql.DB) error {
+	var version int
+	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		return classifyStorageError(err)
+	}
+	if version != 4 {
+		return fmt.Errorf("%w: unsupported schema version %d", ErrStorageCorrupt, version)
+	}
+	for _, name := range []string{"meta", "store_id_aliases", "operations", "attempts", "reply_claims", "reply_winners", "observations", "events", "manual_resolutions", "operation_acceptances", "reply_acceptances"} {
+		var count int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", name).Scan(&count); err != nil {
+			return classifyStorageError(err)
+		}
+		if count != 1 {
+			return fmt.Errorf("%w: required v4 table %s is missing", ErrStorageCorrupt, name)
+		}
+	}
+	return nil
+}
+
 // CheckPath opens an existing database read-only. Unlike Open, it does not
 // create directories, run migrations, set pragmas, or create a store ID.
 func CheckPath(ctx context.Context, path string) (StorageCheck, error) {
@@ -317,16 +349,16 @@ func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) 
 		cutoff = opts.Before.UTC()
 	}
 	receipt := MaintenanceReceipt{DryRun: opts.DryRun, RetentionCutoff: cutoff, Actions: []MaintenanceAction{
-		{Kind: "expiry", Attempted: !opts.DryRun},
-		{Kind: "prune", Attempted: !opts.DryRun},
-		{Kind: "wal_checkpoint", Attempted: !opts.DryRun},
-		{Kind: "optimize", Attempted: !opts.DryRun},
+		{Kind: "expiry"},
+		{Kind: "prune"},
+		{Kind: "wal_checkpoint"},
+		{Kind: "optimize"},
 	}}
 	var eligibleOps, eligibleReplies, activeExpired int64
-	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations WHERE `+retentionOperationPredicate, retentionOperationArgs(cutoff.UnixNano())...).Scan(&eligibleOps); err != nil {
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations o WHERE `+retentionOperationPredicate, retentionOperationArgs(cutoff.UnixNano())...).Scan(&eligibleOps); err != nil {
 		return receipt, classifyStorageError(err)
 	}
-	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims WHERE state IN (?,?) AND updated_at <= ?`, string(StateReplyAccepted), string(StateReplyObserved), cutoff.UnixNano()).Scan(&eligibleReplies); err != nil {
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims c WHERE `+retentionReplyPredicate, retentionReplyArgs(cutoff.UnixNano())...).Scan(&eligibleReplies); err != nil {
 		return receipt, classifyStorageError(err)
 	}
 	receipt.Actions[1].Eligible = eligibleOps + eligibleReplies
@@ -337,37 +369,59 @@ func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) 
 	if opts.DryRun {
 		return receipt, nil
 	}
-	if err := j.ExpireClaims(ctx); err != nil {
+	receipt.Actions[0].Attempted = true
+	changed, err := j.expireClaimsAt(ctx, now.UnixNano())
+	if err != nil {
 		receipt.Actions[0].Error = err.Error()
 		receipt.Actions[0].Busy = isBusy(err)
 		return receipt, classifyStorageError(err)
 	}
-	receipt.Actions[0].Changed = activeExpired
+	receipt.Actions[0].Changed = changed
+	receipt.Actions[0].Applied = true
+	receipt.Actions[1].Attempted = true
 	var pruned int64
-	err := j.withTx(ctx, func(tx *sql.Tx) error {
+	err = j.withTx(ctx, func(tx *sql.Tx) error {
 		args := retentionOperationArgs(cutoff.UnixNano())
-		if _, err := tx.Exec(`DELETE FROM events WHERE operation_id IN (SELECT operation_id FROM operations WHERE `+retentionOperationPredicate+`)`, args...); err != nil {
+		if _, err := tx.Exec(`CREATE TEMP TABLE mektup_prune_operations(operation_id TEXT PRIMARY KEY)`); err != nil {
 			return err
 		}
-		res, err := tx.Exec(`DELETE FROM operations WHERE `+retentionOperationPredicate, args...)
+		if _, err := tx.Exec(`INSERT INTO mektup_prune_operations SELECT o.operation_id FROM operations o WHERE `+retentionOperationPredicate, args...); err != nil {
+			return err
+		}
+		replyArgs := retentionReplyArgs(cutoff.UnixNano())
+		if _, err := tx.Exec(`CREATE TEMP TABLE mektup_prune_replies(reply_id TEXT PRIMARY KEY)`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO mektup_prune_replies SELECT c.reply_id FROM reply_claims c WHERE `+retentionReplyPredicate, replyArgs...); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM events WHERE operation_id IN (SELECT operation_id FROM mektup_prune_operations)`); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`DELETE FROM operations WHERE operation_id IN (SELECT operation_id FROM mektup_prune_operations)`)
 		if err != nil {
 			return err
 		}
 		n, _ := res.RowsAffected()
 		pruned += n
-		if _, err := tx.Exec(`DELETE FROM events WHERE reply_id IN (SELECT reply_id FROM reply_claims WHERE state IN (?,?) AND updated_at <= ?)`, string(StateReplyAccepted), string(StateReplyObserved), cutoff.UnixNano()); err != nil {
+		if _, err := tx.Exec(`DELETE FROM events WHERE reply_id IN (SELECT reply_id FROM mektup_prune_replies)`); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`DELETE FROM reply_winners WHERE reply_id IN (SELECT reply_id FROM reply_claims WHERE state IN (?,?) AND updated_at <= ?)`, string(StateReplyAccepted), string(StateReplyObserved), cutoff.UnixNano()); err != nil {
+		if _, err := tx.Exec(`DELETE FROM reply_winners WHERE reply_id IN (SELECT reply_id FROM mektup_prune_replies)`); err != nil {
 			return err
 		}
-		res, err = tx.Exec(`DELETE FROM reply_claims WHERE state IN (?,?) AND updated_at <= ?`, string(StateReplyAccepted), string(StateReplyObserved), cutoff.UnixNano())
+		res, err = tx.Exec(`DELETE FROM reply_claims WHERE reply_id IN (SELECT reply_id FROM mektup_prune_replies)`)
 		if err != nil {
 			return err
 		}
 		n, _ = res.RowsAffected()
 		pruned += n
-		return nil
+		_, err = tx.Exec(`DROP TABLE mektup_prune_replies`)
+		if err != nil {
+			return err
+		}
+		_, err = tx.Exec(`DROP TABLE mektup_prune_operations`)
+		return err
 	})
 	if err != nil {
 		receipt.Actions[1].Error = err.Error()
@@ -375,6 +429,8 @@ func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) 
 		return receipt, classifyStorageError(err)
 	}
 	receipt.Actions[1].Changed = pruned
+	receipt.Actions[1].Applied = true
+	receipt.Actions[2].Attempted = true
 	var busy, logPages, checkpointed int64
 	if err := j.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)").Scan(&busy, &logPages, &checkpointed); err != nil {
 		receipt.Actions[2].Error = err.Error()
@@ -385,17 +441,14 @@ func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) 
 	if busy != 0 {
 		receipt.Actions[2].Busy = true
 	}
+	receipt.Actions[2].Applied = true
+	receipt.Actions[3].Attempted = true
 	if _, err := j.db.ExecContext(ctx, "PRAGMA optimize"); err != nil {
 		receipt.Actions[3].Error = err.Error()
 		receipt.Actions[3].Busy = isBusy(err)
 		return receipt, classifyStorageError(err)
 	}
 	receipt.Actions[3].Applied = true
-	for i := range receipt.Actions {
-		if receipt.Actions[i].Attempted && receipt.Actions[i].Error == "" {
-			receipt.Actions[i].Applied = true
-		}
-	}
 	return receipt, nil
 }
 

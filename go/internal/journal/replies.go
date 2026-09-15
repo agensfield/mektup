@@ -252,8 +252,17 @@ func expireClaimTx(tx *sql.Tx, replyID string, now int64) error {
 // ExpireClaims is safe for a waiter/status process to call and is the wake
 // path when the delivery process has disappeared.
 func (j *Journal) ExpireClaims(ctx context.Context) error {
-	return j.withTx(ctx, func(tx *sql.Tx) error {
-		now := j.nowUnix()
+	_, err := j.expireClaimsAt(ctx, j.nowUnix())
+	return err
+}
+
+// expireClaimsAt expires claims against one caller-selected custody clock and
+// returns the number of rows whose transition committed. Maintenance uses this
+// to avoid reporting a pre-read prediction as an applied change.
+func (j *Journal) expireClaimsAt(ctx context.Context, now int64) (int64, error) {
+	var changed int64
+	err := j.withTx(ctx, func(tx *sql.Tx) error {
+		var transactionChanged int64
 		rows, err := tx.Query("SELECT reply_id FROM reply_claims WHERE state=? AND lease_until<=?", string(StateReplyClaimed), now)
 		if err != nil {
 			return err
@@ -266,10 +275,20 @@ func (j *Journal) ExpireClaims(ctx context.Context) error {
 			}
 			if err := expireClaimTx(tx, id, now); err != nil && err != ErrClaimExpired {
 				return err
+			} else if err == nil {
+				transactionChanged++
 			}
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		changed = transactionChanged
+		return nil
 	})
+	if err != nil {
+		return 0, err
+	}
+	return changed, err
 }
 
 // AbandonReply is an explicit operator/delivery failure transition. It is

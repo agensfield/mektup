@@ -185,10 +185,7 @@ func probeDir(_ context.Context, id, category, path string) ([]Finding, error) {
 	info, err := os.Lstat(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return []Finding{{ID: id, Category: category, Severity: SeverityWarning, Message: "directory is missing", Path: path, Fixable: true, SafeFix: true, Fix: func(context.Context) (string, error) {
-			if err := os.MkdirAll(path, 0700); err != nil {
-				return "", err
-			}
-			if err := os.Chmod(path, 0700); err != nil {
+			if err := safeEnsureDir(path, 0700); err != nil {
 				return "", err
 			}
 			return "created owner-private directory", nil
@@ -201,7 +198,7 @@ func probeDir(_ context.Context, id, category, path string) ([]Finding, error) {
 		return []Finding{{ID: id, Category: category, Severity: SeverityError, Message: "path is not a directory", Path: path}}, nil
 	}
 	if info.Mode()&0077 != 0 {
-		return []Finding{{ID: id, Category: category, Severity: SeverityWarning, Message: fmt.Sprintf("directory mode %04o is not owner-private", info.Mode().Perm()), Path: path, Fixable: true, SafeFix: true, Fix: chmodFix(path, 0700)}}, nil
+		return []Finding{{ID: id, Category: category, Severity: SeverityWarning, Message: fmt.Sprintf("directory mode %04o is not owner-private", info.Mode().Perm()), Path: path, Fixable: true, SafeFix: true, Fix: chmodFix(path, 0700, info)}}, nil
 	}
 	return []Finding{{ID: id, Category: category, Severity: SeverityOK, Message: "owner-private directory", Path: path}}, nil
 }
@@ -221,7 +218,7 @@ func probeFile(_ context.Context, id, category, path string) ([]Finding, error) 
 		return []Finding{{ID: id, Category: category, Severity: SeverityError, Message: "path is not a regular file", Path: path}}, nil
 	}
 	if info.Mode()&0077 != 0 {
-		return []Finding{{ID: id, Category: category, Severity: SeverityWarning, Message: fmt.Sprintf("file mode %04o is not owner-private", info.Mode().Perm()), Path: path, Fixable: true, SafeFix: true, Fix: chmodFix(path, 0600)}}, nil
+		return []Finding{{ID: id, Category: category, Severity: SeverityWarning, Message: fmt.Sprintf("file mode %04o is not owner-private", info.Mode().Perm()), Path: path, Fixable: true, SafeFix: true, Fix: chmodFix(path, 0600, info)}}, nil
 	}
 	return []Finding{{ID: id, Category: category, Severity: SeverityOK, Message: "owner-private file", Path: path}}, nil
 }
@@ -241,14 +238,14 @@ func probeSocket(_ context.Context, path string) ([]Finding, error) {
 		return []Finding{{ID: "socket.path", Category: "socket", Severity: SeverityError, Message: "path is not a Unix socket", Path: path}}, nil
 	}
 	if info.Mode().Perm()&0077 != 0 {
-		return []Finding{{ID: "socket.path", Category: "socket", Severity: SeverityWarning, Message: fmt.Sprintf("socket mode %04o is not owner-private", info.Mode().Perm()), Path: path, Fixable: true, SafeFix: true, Fix: chmodFix(path, 0600)}}, nil
+		return []Finding{{ID: "socket.path", Category: "socket", Severity: SeverityWarning, Message: fmt.Sprintf("socket mode %04o is not owner-private", info.Mode().Perm()), Path: path, Fixable: true, SafeFix: true, Fix: chmodFix(path, 0600, info)}}, nil
 	}
 	// Dialing is deliberately not part of the default probe. A connection can
 	// be observable by a daemon, so callers needing liveness inject a probe.
 	return []Finding{{ID: "socket.path", Category: "socket", Severity: SeverityOK, Message: "Unix socket is present", Path: path}}, nil
 }
 
-func chmodFix(path string, mode os.FileMode) FixFunc {
+func chmodFix(path string, mode os.FileMode, expected ...os.FileInfo) FixFunc {
 	return func(context.Context) (string, error) {
 		info, err := os.Lstat(path)
 		if err != nil {
@@ -260,7 +257,15 @@ func chmodFix(path string, mode os.FileMode) FixFunc {
 		if info.Mode()&os.ModeSocket != 0 {
 			return "", fmt.Errorf("refusing socket permission repair without descriptor support: %s", path)
 		}
-		if err := safeChmod(path, mode); err != nil {
+		if len(expected) > 0 && expected[0] != nil {
+			if !os.SameFile(expected[0], info) || expected[0].Mode()&os.ModeType != info.Mode()&os.ModeType {
+				return "", fmt.Errorf("permission target changed since diagnosis: %s", path)
+			}
+		}
+		if !info.Mode().IsRegular() && !info.IsDir() {
+			return "", fmt.Errorf("refusing special permission target: %s", path)
+		}
+		if err := safeChmod(path, mode, info); err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("mode set to %04o", mode.Perm()), nil
