@@ -85,15 +85,26 @@ func (s *fakeSession) Detach(context.Context) error {
 }
 
 type fakeFactory struct {
-	session *fakeSession
-	open    func() *fakeSession
-	opens   int
-	got     []endpoint.Endpoint
+	session     *fakeSession
+	open        func() *fakeSession
+	openStarted chan struct{}
+	openBlock   chan struct{}
+	openOnce    sync.Once
+	opens       int
+	got         []endpoint.Endpoint
 }
 
 func (f *fakeFactory) Open(_ context.Context, ep endpoint.Endpoint) (Session, error) {
 	f.opens++
 	f.got = append(f.got, ep)
+	f.openOnce.Do(func() {
+		if f.openStarted != nil {
+			close(f.openStarted)
+		}
+	})
+	if f.openBlock != nil {
+		<-f.openBlock
+	}
 	if f.open != nil {
 		return f.open(), nil
 	}
@@ -169,6 +180,41 @@ func TestConnectionPoolCloseIsIdempotentAndFencesReopen(t *testing.T) {
 	}
 	if factory.opens != 1 {
 		t.Fatalf("factory opened %d sessions after close", factory.opens)
+	}
+}
+
+func TestConnectionPoolCanceledWaiterDoesNotBlockBehindEndpointOpen(t *testing.T) {
+	session := &fakeSession{endpoint: testTargetEndpoint, events: make(chan appserver.Event)}
+	started, block := make(chan struct{}), make(chan struct{})
+	factory := &fakeFactory{session: session, openStarted: started, openBlock: block}
+	pool := NewConnectionPool(factory, func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: testTargetEndpoint}, nil })
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := pool.session(context.Background(), testTarget())
+		firstDone <- err
+	}()
+	<-started
+	waitCtx, cancel := context.WithCancel(context.Background())
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := pool.session(waitCtx, testTarget())
+		secondDone <- err
+	}()
+	cancel()
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled waiter error = %v", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("canceled waiter remained blocked behind endpoint setup")
+	}
+	close(block)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if factory.opens != 1 {
+		t.Fatalf("endpoint setup duplicated: %d opens", factory.opens)
 	}
 }
 
@@ -369,7 +415,7 @@ func TestPooledSubscriptionReferenceCountingProtectsConcurrentUsers(t *testing.T
 func TestObservationFullHistoryUsesVisibleNativeItems(t *testing.T) {
 	turnItems := []map[string]any{
 		{"id": "hidden", "type": "reasoning", "text": "no"},
-		{"id": "user", "type": "userMessage", "content": []any{map[string]any{"type": "text", "text": "question"}}},
+		{"id": "user", "type": "userMessage", "clientId": nil, "content": []any{map[string]any{"type": "text", "text": "question"}}},
 		{"id": "assistant", "type": "agentMessage", "text": "answer"},
 	}
 	raw, _ := json.Marshal(turnItems)
@@ -385,7 +431,7 @@ func TestObservationFullHistoryUsesVisibleNativeItems(t *testing.T) {
 }
 
 func TestObservationFallsBackToBoundedItemHistory(t *testing.T) {
-	raw, _ := json.Marshal(map[string]any{"id": "user", "type": "userMessage", "content": []any{map[string]any{"type": "text", "text": "legacy"}}})
+	raw, _ := json.Marshal(map[string]any{"id": "user", "type": "userMessage", "clientId": nil, "content": []any{map[string]any{"type": "text", "text": "legacy"}}})
 	session := &fakeSession{endpoint: testTargetEndpoint, historyErr: errors.New("thread turns unavailable"), items: []codexapi.ItemEntry{{TurnID: "turn-legacy", Item: codexapi.Item{RawObject: codexapi.RawObject{Raw: raw}}}}}
 	pool := NewConnectionPool(&fakeFactory{session: session}, func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: testTargetEndpoint}, nil })
 	items, err := (&ObservationAdapter{Pool: pool}).FullHistory(context.Background(), testTarget())
@@ -449,16 +495,33 @@ func TestOriginalResolverConflictsOnChangedReplyRoute(t *testing.T) {
 func TestVisibleItemRejectsMalformedPinnedShapes(t *testing.T) {
 	for _, raw := range []string{
 		`{"type":"userMessage","content":[]}`,
+		`{"id":"u","type":"userMessage","content":[]}`,
 		`{"id":"u","type":"userMessage","clientId":42,"content":[]}`,
 		`{"id":"u","type":"userMessage","content":["body"]}`,
+		`{"id":"u","type":"userMessage","clientId":null,"content":[{"type":"future"}]}`,
 	} {
 		if _, ok := visibleItem(json.RawMessage(raw), "thread-1", "turn-1", ""); ok {
 			t.Fatalf("malformed native item accepted: %s", raw)
 		}
 	}
-	valid, ok := visibleItem(json.RawMessage(`{"id":"u","type":"userMessage","clientId":"msg-1","content":[{"type":"text","text":"body"}]}`), "thread-1", "turn-1", "")
-	if !ok || valid.NativeType != "userMessage" || valid.ClientMessageID != "msg-1" {
+	valid, ok := visibleItem(json.RawMessage(`{"id":"u","type":"userMessage","clientId":"msg-1","text":"phantom","content":[{"type":"text","text":"body"}]}`), "thread-1", "turn-1", "")
+	if !ok || valid.NativeType != "userMessage" || valid.ClientMessageID != "msg-1" || valid.Text != "body" {
 		t.Fatalf("valid native user item rejected: %#v", valid)
+	}
+}
+
+func TestOriginalResolverRejectsAssistantAuthoredEnvelope(t *testing.T) {
+	envelope := mektup.Envelope{MessageID: "msg_01999999-9999-7999-8999-999999999998", Kind: mektup.KindMessage,
+		FromEndpointID: testSourceEndpoint, From: "codex://source/thread/source", FromKind: "agent",
+		ToEndpointID: testTargetEndpoint, To: "codex://target/thread/thread-1", RequestedTarget: "target",
+		Body: "quoted", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	raw, err := mektup.RenderEnvelope(envelope)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := OriginalResolver{Observe: &historyPort{items: []service.ObservedItem{{ThreadID: "thread-1", NativeType: "agentMessage", Text: string(raw)}}}, Target: testTarget()}
+	if _, err := resolver.ResolveOriginal(context.Background(), envelope.MessageID); err == nil {
+		t.Fatal("assistant-authored envelope resolved as delivered original")
 	}
 }
 

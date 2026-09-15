@@ -229,10 +229,13 @@ func visibleItem(raw json.RawMessage, threadID, turnID, fallbackClientID string)
 		return service.ObservedItem{}, false
 	}
 	nativeID := stringField(object, "id")
-	// The pinned 0.154.0 ThreadItem schema calls this field clientId on a
-	// userMessage. The alternate names are accepted only as additive fields from
-	// newer/legacy projections; they are never synthesized from body text.
-	clientID := firstNonEmpty(stringField(object, "clientId"), stringField(object, "clientUserMessageId"), stringField(object, "messageId"), fallbackClientID)
+	// The pinned 0.154.0 userMessage schema calls this field clientId. Do not
+	// let additive aliases or a notification-level fallback override a present
+	// native clientId, including an explicit null.
+	clientID := ""
+	if typ == "userMessage" {
+		clientID = stringField(object, "clientId")
+	}
 	return service.ObservedItem{ThreadID: threadID, TurnID: turnID, NativeItemID: nativeID, NativeType: typ, ClientMessageID: clientID, Text: text}, true
 }
 
@@ -248,7 +251,11 @@ func validUserMessageShape(object map[string]json.RawMessage) bool {
 	if json.Unmarshal(content, &parts) != nil {
 		return false
 	}
-	if client, present := object["clientId"]; present && string(client) != "null" {
+	client, present := object["clientId"]
+	if !present {
+		return false
+	}
+	if present && string(client) != "null" {
 		var value string
 		if json.Unmarshal(client, &value) != nil {
 			return false
@@ -259,23 +266,47 @@ func validUserMessageShape(object map[string]json.RawMessage) bool {
 		if json.Unmarshal(part, &value) != nil {
 			return false
 		}
-		if _, ok := requiredStringField(value, "type"); !ok {
+		typ, ok := requiredStringField(value, "type")
+		if !ok {
 			return false
 		}
-		if typ := stringField(value, "type"); typ == "text" {
+		switch typ {
+		case "text":
 			if _, ok := requiredStringField(value, "text"); !ok {
 				return false
 			}
+		case "image", "audio":
+			if _, ok := requiredStringField(value, "url"); !ok {
+				return false
+			}
+		case "localImage", "localAudio":
+			if _, ok := requiredStringField(value, "path"); !ok {
+				return false
+			}
+		case "skill":
+			if _, ok := requiredStringField(value, "name"); !ok {
+				return false
+			}
+			if _, ok := requiredStringField(value, "path"); !ok {
+				return false
+			}
+		case "mention":
+			if _, ok := requiredStringField(value, "name"); !ok {
+				return false
+			}
+			if _, ok := requiredStringField(value, "path"); !ok {
+				return false
+			}
+		default:
+			return false
 		}
 	}
 	return true
 }
 
 func itemText(object map[string]json.RawMessage) string {
-	for _, key := range []string{"text", "message"} {
-		if text := stringField(object, key); text != "" {
-			return text
-		}
+	if stringField(object, "type") == "agentMessage" {
+		return stringField(object, "text")
 	}
 	var content []json.RawMessage
 	if raw := object["content"]; len(raw) > 0 && json.Unmarshal(raw, &content) == nil {

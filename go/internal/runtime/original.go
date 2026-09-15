@@ -33,6 +33,9 @@ func (r OriginalResolver) ResolveOriginal(ctx context.Context, reference string)
 		if item.ThreadID != "" && item.ThreadID != r.Target.ThreadID {
 			continue
 		}
+		if item.NativeType != "" && item.NativeType != "userMessage" {
+			continue
+		}
 		envelope, parseErr := mektup.ParseEnvelopeString(item.Text)
 		if parseErr != nil || (envelope.Kind != mektup.KindMessage && envelope.Kind != mektup.KindReply) {
 			continue

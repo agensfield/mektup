@@ -76,11 +76,20 @@ type ConnectionPool struct {
 	mu            sync.Mutex
 	sessions      map[string]Session
 	subscriptions map[string]int
+	openings      map[string]*sessionOpening
+	gates         map[string]chan struct{}
 	closed        bool
 }
 
+type sessionOpening struct {
+	done    chan struct{}
+	cancel  context.CancelFunc
+	session Session
+	err     error
+}
+
 func NewConnectionPool(factory SessionFactory, lookup EndpointLookup) *ConnectionPool {
-	return &ConnectionPool{Factory: factory, Lookup: lookup, sessions: make(map[string]Session), subscriptions: make(map[string]int)}
+	return &ConnectionPool{Factory: factory, Lookup: lookup, sessions: make(map[string]Session), subscriptions: make(map[string]int), openings: make(map[string]*sessionOpening), gates: make(map[string]chan struct{})}
 }
 
 func (p *ConnectionPool) session(ctx context.Context, target service.ResolvedTarget) (Session, error) {
@@ -90,63 +99,61 @@ func (p *ConnectionPool) session(ctx context.Context, target service.ResolvedTar
 	if target.EndpointID == "" || target.ThreadID == "" || target.URI == "" {
 		return nil, fmt.Errorf("runtime: incomplete pinned target")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	if p.closed {
+		p.mu.Unlock()
 		return nil, ErrPoolClosed
 	}
 	if current := p.sessions[target.EndpointID]; current != nil {
+		p.mu.Unlock()
 		if current.EndpointID() != target.EndpointID {
 			return nil, ErrEndpointMismatch
 		}
 		return current, nil
 	}
-	// Opening happens under the pool lock. This intentionally serializes the
-	// first operation for an endpoint and prevents two same-endpoint daemons
-	// from being created by racing callers.
-	if p.Lookup == nil {
-		return nil, errors.New("runtime: endpoint lookup is required")
+	if opening := p.openings[target.EndpointID]; opening != nil {
+		done := opening.done
+		p.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-done:
+			if opening.err != nil {
+				return nil, opening.err
+			}
+			return opening.session, nil
+		}
 	}
-	ep, err := p.Lookup(target.EndpointID)
-	if err != nil {
-		return nil, err
+	setupCtx, setupCancel := context.WithCancel(ctx)
+	opening := &sessionOpening{done: make(chan struct{}), cancel: setupCancel}
+	p.openings[target.EndpointID] = opening
+	p.mu.Unlock()
+
+	session, err := p.openEndpoint(setupCtx, target)
+	setupCancel()
+	p.mu.Lock()
+	delete(p.openings, target.EndpointID)
+	if p.closed && err == nil {
+		err = ErrPoolClosed
 	}
-	if ep.ID != target.EndpointID {
-		return nil, ErrEndpointMismatch
+	if err == nil {
+		p.sessions[target.EndpointID] = session
 	}
-	session, err := p.Factory.Open(ctx, ep)
-	if err != nil {
-		return nil, err
-	}
-	if session == nil {
-		return nil, ErrEndpointMismatch
-	}
-	if session.EndpointID() != target.EndpointID {
+	opening.session, opening.err = session, err
+	close(opening.done)
+	p.mu.Unlock()
+	if err != nil && session != nil {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = session.Detach(cleanupCtx)
 		cancel()
-		return nil, ErrEndpointMismatch
 	}
-	p.sessions[target.EndpointID] = session
-	return session, nil
+	return session, err
 }
 
-// openIsolated creates an observer-owned connection. Observer streams consume
-// a connection's single event queue, so sharing the delivery session would
-// let one thread discard another thread's notifications. The returned session
-// is never inserted into the pool and must be detached by its owner.
-func (p *ConnectionPool) openIsolated(ctx context.Context, target service.ResolvedTarget) (Session, error) {
-	if p == nil || p.Factory == nil {
-		return nil, ErrNoSessionFactory
-	}
-	if target.EndpointID == "" || target.ThreadID == "" || target.URI == "" {
-		return nil, fmt.Errorf("runtime: incomplete pinned target")
-	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.closed {
-		return nil, ErrPoolClosed
-	}
+func (p *ConnectionPool) openEndpoint(ctx context.Context, target service.ResolvedTarget) (Session, error) {
 	if p.Lookup == nil {
 		return nil, errors.New("runtime: endpoint lookup is required")
 	}
@@ -162,12 +169,60 @@ func (p *ConnectionPool) openIsolated(ctx context.Context, target service.Resolv
 		return nil, err
 	}
 	if session == nil || session.EndpointID() != target.EndpointID {
+		return session, ErrEndpointMismatch
+	}
+	return session, nil
+}
+
+func (p *ConnectionPool) gate(key string) chan struct{} {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.gates[key] == nil {
+		p.gates[key] = make(chan struct{}, 1)
+		p.gates[key] <- struct{}{}
+	}
+	return p.gates[key]
+}
+
+// openIsolated creates an observer-owned connection. Observer streams consume
+// a connection's single event queue, so sharing the delivery session would
+// let one thread discard another thread's notifications. The returned session
+// is never inserted into the pool and must be detached by its owner.
+func (p *ConnectionPool) openIsolated(ctx context.Context, target service.ResolvedTarget) (Session, error) {
+	if p == nil || p.Factory == nil {
+		return nil, ErrNoSessionFactory
+	}
+	if target.EndpointID == "" || target.ThreadID == "" || target.URI == "" {
+		return nil, fmt.Errorf("runtime: incomplete pinned target")
+	}
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, ErrPoolClosed
+	}
+	p.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	session, err := p.openEndpoint(ctx, target)
+	p.mu.Lock()
+	closed := p.closed
+	p.mu.Unlock()
+	if closed {
 		if session != nil {
 			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = session.Detach(cleanupCtx)
 			cancel()
 		}
-		return nil, ErrEndpointMismatch
+		return nil, ErrPoolClosed
+	}
+	if err != nil {
+		if session != nil {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			_ = session.Detach(cleanupCtx)
+			cancel()
+		}
+		return nil, err
 	}
 	return session, nil
 }
@@ -183,12 +238,21 @@ func (p *ConnectionPool) Close(ctx context.Context) error {
 	}
 	p.closed = true
 	sessions := make([]Session, 0, len(p.sessions))
+	cancels := make([]context.CancelFunc, 0, len(p.openings))
+	for _, opening := range p.openings {
+		if opening.cancel != nil {
+			cancels = append(cancels, opening.cancel)
+		}
+	}
 	for _, session := range p.sessions {
 		sessions = append(sessions, session)
 	}
 	p.sessions = make(map[string]Session)
 	p.subscriptions = make(map[string]int)
 	p.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 	var joined error
 	for _, session := range sessions {
 		joined = errors.Join(joined, session.Detach(ctx))
@@ -207,25 +271,48 @@ func subscriptionKey(target service.ResolvedTarget) string {
 // to an individual operation, so only the first lease resumes and only the
 // last release unsubscribes.
 func (p *ConnectionPool) subscribe(ctx context.Context, target service.ResolvedTarget) (Session, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	gate := p.gate(subscriptionKey(target))
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-gate:
+	}
+	defer func() { gate <- struct{}{} }()
 	session, err := p.session(ctx, target)
 	if err != nil {
 		return nil, err
 	}
 	key := subscriptionKey(target)
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, ErrPoolClosed
+	}
+	if current := p.sessions[target.EndpointID]; current != session {
+		p.mu.Unlock()
+		return nil, ErrEndpointMismatch
+	}
+	if p.subscriptions[key] > 0 {
+		p.subscriptions[key]++
+		p.mu.Unlock()
+		return session, nil
+	}
+	p.mu.Unlock()
+	if err := session.Resume(ctx, target.ThreadID); err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.closed {
 		return nil, ErrPoolClosed
 	}
-	if current := p.sessions[target.EndpointID]; current != session {
+	if p.sessions[target.EndpointID] != session {
 		return nil, ErrEndpointMismatch
 	}
-	if p.subscriptions[key] == 0 {
-		if err := session.Resume(ctx, target.ThreadID); err != nil {
-			return nil, err
-		}
-	}
-	p.subscriptions[key]++
+	p.subscriptions[key] = 1
 	return session, nil
 }
 
@@ -233,7 +320,17 @@ func (p *ConnectionPool) unsubscribe(ctx context.Context, target service.Resolve
 	if p == nil {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	key := subscriptionKey(target)
+	gate := p.gate(key)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+	}
+	defer func() { gate <- struct{}{} }()
 	p.mu.Lock()
 	session := p.sessions[target.EndpointID]
 	count := p.subscriptions[key]
@@ -249,9 +346,8 @@ func (p *ConnectionPool) unsubscribe(ctx context.Context, target service.Resolve
 	delete(p.subscriptions, key)
 	// Hold the pool lock while releasing the last lease so another subscriber
 	// cannot race a new Resume between the count check and unsubscribe.
-	err := session.Unsubscribe(ctx, target.ThreadID)
 	p.mu.Unlock()
-	return err
+	return session.Unsubscribe(ctx, target.ThreadID)
 }
 
 // ConnectionFactory is the production factory over internal/connection.
