@@ -57,6 +57,24 @@ func TestStartOrSteerTurnUsesOnlyPinnedMinimalParams(t *testing.T) {
 	}
 }
 
+func TestThreadSetNameUsesSeparatePinnedMutation(t *testing.T) {
+	r := &recordingCaller{result: json.RawMessage(`{"ok":true,"thread":{"turns":[{"items":[{"text":"ignored"}]}]}}`)}
+	if _, err := New(r, Options{}).ThreadSetName(context.Background(), "thread-1", "session"); err != nil {
+		t.Fatal(err)
+	}
+	if r.method != "thread/name/set" {
+		t.Fatalf("method = %q", r.method)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(r.params, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"threadId": "thread-1", "name": "session"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("params = %#v, want %#v", got, want)
+	}
+}
+
 func TestSearchRequiresExperimentalBeforeCalling(t *testing.T) {
 	r := &recordingCaller{result: json.RawMessage(`{"data":[],"nextCursor":null,"backwardsCursor":null}`)}
 	_, err := New(r, Options{}).Search(context.Background(), SearchOptions{SearchTerm: "needle"})

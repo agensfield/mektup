@@ -175,6 +175,10 @@ type LifecycleResponse struct {
 	Raw           json.RawMessage
 }
 
+// ThreadNameResponse is the bounded result of thread/name/set. The pinned
+// method does not need to hydrate or return the thread transcript.
+type ThreadNameResponse struct{ Raw json.RawMessage }
+
 type ThreadListResponse struct {
 	Data []Thread
 	// LoadedIDs is populated only for loaded enumeration. Loaded thread IDs
@@ -604,6 +608,20 @@ func (c *Client) ThreadFork(ctx context.Context, options ForkOptions) (ThreadFor
 	putBool(p, "excludeTurns", options.ExcludeTurns)
 	var out ThreadForkResponse
 	err := c.callExperimentalMaybe(ctx, "thread/fork", p, options.BeforeTurnID != "", func(raw json.RawMessage) error { var e error; out, e = decodeLifecycle(raw); return e })
+	return out, err
+}
+
+// ThreadSetName updates a thread's display name as a separate mutation. Name
+// is intentionally not part of thread/start or thread/fork options.
+func (c *Client) ThreadSetName(ctx context.Context, threadID, name string) (ThreadNameResponse, error) {
+	if strings.TrimSpace(threadID) == "" || strings.TrimSpace(name) == "" {
+		return ThreadNameResponse{}, errors.New("codexapi: threadId and name are required")
+	}
+	var out ThreadNameResponse
+	err := c.callDecode(ctx, "thread/name/set", map[string]any{"threadId": threadID, "name": name}, func(raw json.RawMessage) error {
+		out.Raw = append(json.RawMessage(nil), raw...)
+		return nil
+	})
 	return out, err
 }
 
