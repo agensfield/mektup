@@ -91,7 +91,7 @@ func Open(ctx context.Context, opts Options) (*Journal, error) {
 	// URI pragmas apply to every connection in database/sql's pool. WAL is
 	// required for concurrent swarm processes; FK and busy handling are not
 	// optional safety settings.
-	dsn := "file:" + escapedSQLitePath(dbPath) + "?_pragma=busy_timeout(" + fmt.Sprint(timeout.Milliseconds()) + ")&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)"
+	dsn := "file:" + escapedSQLitePath(dbPath) + "?_pragma=busy_timeout(" + fmt.Sprint(timeout.Milliseconds()) + ")&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
@@ -169,11 +169,9 @@ func (j *Journal) init(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("journal migration: %w", err)
 	}
-	defer func() {
-		if err != nil {
-			_ = tx.Rollback()
-		}
-	}()
+	// Rollback is harmless after Commit and guarantees every validation or
+	// migration error closes the transaction, including future-schema exits.
+	defer func() { _ = tx.Rollback() }()
 	var version int
 	if err = tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("%w: %v", ErrCorrupt, err)
@@ -189,7 +187,7 @@ func (j *Journal) init(ctx context.Context) error {
 			return fmt.Errorf("journal migration: %w", err)
 		}
 	} else if version == 1 {
-		if err = migrateV1ToV3(ctx, tx); err != nil {
+		if err = migrateV1ToV3(ctx, tx, j.leaseDuration); err != nil {
 			return err
 		}
 	} else if version == 2 {
@@ -239,6 +237,7 @@ func (j *Journal) secureFiles() error {
 
 const schemaV1 = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS operations (
  operation_id TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE,
  source_route TEXT NOT NULL, target_route TEXT NOT NULL, semantics TEXT NOT NULL,
@@ -283,9 +282,17 @@ CREATE TABLE IF NOT EXISTS manual_resolutions (
  assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL,
  evidence_ref TEXT NOT NULL, resolved_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS operation_acceptances (
+ operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
+ evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS reply_acceptances (
+ reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE,
+ evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL
+);
 `
 
-func migrateV1ToV3(ctx context.Context, tx *sql.Tx) error {
+func migrateV1ToV3(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration) error {
 	stmts := []string{
 		`ALTER TABLE attempts ADD COLUMN owner TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE attempts ADD COLUMN token TEXT NOT NULL DEFAULT ''`,
@@ -295,12 +302,38 @@ func migrateV1ToV3(ctx context.Context, tx *sql.Tx) error {
 		`ALTER TABLE operations ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE reply_claims ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS manual_resolutions (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, evidence_ref TEXT NOT NULL, resolved_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS operation_acceptances (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS reply_acceptances (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`PRAGMA user_version=3`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
 		}
+	}
+	rows, err := tx.QueryContext(ctx, "SELECT operation_id,updated_at FROM attempts WHERE lease_until=0")
+	if err != nil {
+		return fmt.Errorf("journal migration: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var operationID string
+		var updatedAt int64
+		if err := rows.Scan(&operationID, &updatedAt); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+		token, err := randomToken()
+		if err != nil {
+			return err
+		}
+		owner := "legacy-" + token[:12]
+		if _, err := tx.ExecContext(ctx, "UPDATE attempts SET owner=?,token=?,lease_until=? WHERE operation_id=? AND lease_until=0", owner, token, updatedAt+leaseDuration.Nanoseconds(), operationID); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("journal migration: %w", err)
 	}
 	return nil
 }
@@ -312,6 +345,9 @@ func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
 		`ALTER TABLE operations ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE reply_claims ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
 		`CREATE TABLE IF NOT EXISTS manual_resolutions (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, evidence_ref TEXT NOT NULL, resolved_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS operation_acceptances (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS reply_acceptances (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`PRAGMA user_version=3`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -333,14 +369,26 @@ func (j *Journal) loadOrCreateStoreID(ctx context.Context) error {
 		if genErr != nil {
 			return genErr
 		}
-		res, updateErr := j.db.ExecContext(ctx, "UPDATE meta SET value=? WHERE key='store_id' AND value=?", newID, id)
+		tx, txErr := j.db.BeginTx(ctx, nil)
+		if txErr != nil {
+			return fmt.Errorf("journal store identity: %w", txErr)
+		}
+		res, updateErr := tx.ExecContext(ctx, "UPDATE meta SET value=? WHERE key='store_id' AND value=?", newID, id)
 		if updateErr != nil {
+			_ = tx.Rollback()
 			return fmt.Errorf("journal store identity: %w", updateErr)
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
-			if scanErr := j.db.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='store_id'").Scan(&newID); scanErr != nil {
+			if scanErr := tx.QueryRowContext(ctx, "SELECT value FROM meta WHERE key='store_id'").Scan(&newID); scanErr != nil {
+				_ = tx.Rollback()
 				return scanErr
 			}
+		} else if _, aliasErr := tx.ExecContext(ctx, "INSERT OR IGNORE INTO store_id_aliases(alias,store_id,created_at) VALUES(?,?,?)", id, newID, j.nowUnix()); aliasErr != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("journal store identity alias: %w", aliasErr)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("journal store identity: %w", err)
 		}
 		j.storeID = newID
 		return nil
@@ -388,6 +436,25 @@ func (j *Journal) Close() error     { return j.db.Close() }
 func (j *Journal) StateDir() string { return j.stateDir }
 func (j *Journal) StoreID() string  { j.mu.RLock(); defer j.mu.RUnlock(); return j.storeID }
 func (j *Journal) nowUnix() int64   { return j.now().UTC().UnixNano() }
+
+// ResolveStoreID preserves custody references issued by the pre-UUIDv7
+// journal while making the new canonical identity explicit.
+func (j *Journal) ResolveStoreID(ctx context.Context, id string) (string, error) {
+	if id == "" {
+		return "", ErrNotFound
+	}
+	if id == j.StoreID() {
+		return id, nil
+	}
+	var canonical string
+	if err := j.db.QueryRowContext(ctx, "SELECT store_id FROM store_id_aliases WHERE alias=?", id).Scan(&canonical); err != nil {
+		if err == sql.ErrNoRows {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	return canonical, nil
+}
 
 func (j *Journal) withTx(ctx context.Context, fn func(*sql.Tx) error) error {
 	deadline := time.Now().Add(j.busyTimeout)

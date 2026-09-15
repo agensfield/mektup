@@ -49,12 +49,14 @@ func (j *Journal) Prepare(ctx context.Context, op Operation) (OperationRecord, e
 	if (op.ReplyRoute == "") != (op.CustodyRoute == "") || (op.ReplyRoute != "" && op.CustodyStoreID == "") {
 		return OperationRecord{}, fmt.Errorf("journal: incomplete reply custody relationship")
 	}
-	now := j.nowUnix()
+	creator := false
 	err := j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
 		var existing OperationRecord
 		err := scanOperation(tx.QueryRow("SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE o.message_id=?", op.MessageID), &existing)
 		if err == nil {
 			if existing.OperationID == op.OperationID && existing.Digest == op.Digest && existing.BodySize == op.BodySize && existing.SourceRoute == op.SourceRoute && existing.TargetRoute == op.TargetRoute && existing.Semantics == op.Semantics && existing.ReplyRoute == op.ReplyRoute && existing.CustodyRoute == op.CustodyRoute && existing.CustodyStoreID == op.CustodyStoreID {
+				creator = op.AttemptOwner != "" && op.AttemptOwner == existing.AttemptOwner
 				return nil
 			}
 			return ErrIdentityConflict
@@ -78,12 +80,13 @@ func (j *Journal) Prepare(ctx context.Context, op Operation) (OperationRecord, e
 		if _, err = tx.Exec("INSERT INTO attempts(operation_id,state,created_at,updated_at,owner,token,lease_until) VALUES(?,?,?,?,?,?,?)", op.OperationID, string(StatePrepared), now, now, attemptOwner, attemptToken, lease); err != nil {
 			return err
 		}
+		creator = true
 		return emit(tx, "operation.prepared", op.OperationID, "", StatePrepared, now)
 	})
 	if err != nil {
 		return OperationRecord{}, err
 	}
-	return j.Operation(ctx, op.OperationID)
+	return j.operation(ctx, op.OperationID, creator)
 }
 
 func scanOperation(row interface{ Scan(...any) error }, out *OperationRecord) error {
@@ -91,10 +94,17 @@ func scanOperation(row interface{ Scan(...any) error }, out *OperationRecord) er
 }
 
 func (j *Journal) Operation(ctx context.Context, operationID string) (OperationRecord, error) {
+	return j.operation(ctx, operationID, false)
+}
+
+func (j *Journal) operation(ctx context.Context, operationID string, includeToken bool) (OperationRecord, error) {
 	var out OperationRecord
 	err := scanOperation(j.db.QueryRowContext(ctx, "SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE o.operation_id=?", operationID), &out)
 	if err == sql.ErrNoRows {
 		return out, ErrNotFound
+	}
+	if !includeToken {
+		out.AttemptToken = ""
 	}
 	return out, err
 }
@@ -102,7 +112,7 @@ func (j *Journal) Operation(ctx context.Context, operationID string) (OperationR
 // MarkDispatchStarted commits the dispatch fence before handing bytes to a
 // transport. An orphaned dispatch-started operation is always unknown.
 func (j *Journal) MarkDispatchStarted(ctx context.Context, operationID string) error {
-	rec, err := j.Operation(ctx, operationID)
+	rec, err := j.operation(ctx, operationID, true)
 	if err != nil {
 		return err
 	}
@@ -165,7 +175,7 @@ func (j *Journal) RecordResult(ctx context.Context, operationID string, state Ev
 			}
 			return err
 		}
-		valid := current == StateDispatchStarted || (current == StateOutcomeUnknown && state == StateAccepted) || (current == StatePrepared && state == StateNotSent)
+		valid := (current == StateDispatchStarted && (state == StateAccepted || state == StateRejected || state == StateOutcomeUnknown)) || (current == StateOutcomeUnknown && state == StateAccepted) || (current == StatePrepared && state == StateNotSent)
 		if !valid {
 			return ErrInvalidTransition
 		}
@@ -191,13 +201,35 @@ func (j *Journal) RecordAccepted(ctx context.Context, operationID, evidenceRef s
 	if evidenceRef == "" {
 		return fmt.Errorf("journal: acceptance evidence reference required")
 	}
-	return j.RecordResult(ctx, operationID, StateAccepted, evidenceRef)
+	return j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
+		var current EvidenceState
+		if err := tx.QueryRow("SELECT state FROM operations WHERE operation_id=?", operationID).Scan(&current); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrNotFound
+			}
+			return err
+		}
+		if current != StateDispatchStarted && current != StateOutcomeUnknown {
+			return ErrInvalidTransition
+		}
+		if _, err := tx.Exec("UPDATE operations SET state=?,updated_at=?,terminal_at=? WHERE operation_id=? AND state=?", string(StateAccepted), now, now, operationID, string(current)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("INSERT OR REPLACE INTO operation_acceptances(operation_id,evidence_ref,recorded_at) VALUES(?,?,?)", operationID, evidenceRef, now); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("UPDATE attempts SET state=?,updated_at=? WHERE operation_id=?", string(StateAccepted), now, operationID); err != nil {
+			return err
+		}
+		return emit(tx, "operation.accepted", operationID, "", StateAccepted, now)
+	})
 }
 
 // RecordManualResolution is the only non-observational way to close an
 // unknown operation. The original unknown event remains in the event log.
 func (j *Journal) RecordManualResolution(ctx context.Context, operationID string, resolution ManualResolution) error {
-	if resolution.Assertion == "" || resolution.Actor == "" || resolution.Reason == "" || resolution.EvidenceRef == "" {
+	if (resolution.Assertion != "accepted" && resolution.Assertion != "not_delivered") || resolution.Actor == "" || resolution.Reason == "" || resolution.EvidenceRef == "" {
 		return fmt.Errorf("journal: incomplete manual resolution")
 	}
 	return j.withTx(ctx, func(tx *sql.Tx) error {

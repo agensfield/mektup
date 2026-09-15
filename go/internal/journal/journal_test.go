@@ -135,7 +135,7 @@ func TestRecoveryDoesNotTouchLiveAttempt(t *testing.T) {
 	var now atomic.Int64
 	now.Store(time.Now().UnixNano())
 	j := testJournal(t, dir, &now)
-	prepared(t, j)
+	created := prepared(t, j)
 	if err := j.RecoverOrphans(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestRecoveryDoesNotTouchLiveAttempt(t *testing.T) {
 	if r.State != StatePrepared {
 		t.Fatalf("live attempt recovered: %s", r.State)
 	}
-	if _, err := j.HeartbeatAttempt(context.Background(), "op-1", r.AttemptOwner, r.AttemptToken); err != nil {
+	if _, err := j.HeartbeatAttempt(context.Background(), "op-1", created.AttemptOwner, created.AttemptToken); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -169,6 +169,19 @@ func TestUnknownCannotBeRejectedButMayBeManuallyResolved(t *testing.T) {
 	if err := j.RecordAccepted(context.Background(), "op-1", "native-acceptance-1"); err != nil {
 		t.Fatal(err)
 	}
+	var errorCode, evidenceRef string
+	if err := j.db.QueryRow("SELECT error_code FROM operations WHERE operation_id='op-1'").Scan(&errorCode); err != nil {
+		t.Fatal(err)
+	}
+	if errorCode != "transport_lost" {
+		t.Fatalf("acceptance rewrote error authority: %q", errorCode)
+	}
+	if err := j.db.QueryRow("SELECT evidence_ref FROM operation_acceptances WHERE operation_id='op-1'").Scan(&evidenceRef); err != nil {
+		t.Fatal(err)
+	}
+	if evidenceRef != "native-acceptance-1" {
+		t.Fatalf("acceptance evidence %q", evidenceRef)
+	}
 	if err := j.RecordManualResolution(context.Background(), "op-1", ManualResolution{Assertion: "not_delivered", Actor: "operator", Reason: "verified external logs", EvidenceRef: "incident-1"}); !errors.Is(err, ErrInvalidTransition) {
 		t.Fatalf("resolved accepted operation: %v", err)
 	}
@@ -190,6 +203,112 @@ func TestUnknownCannotBeRejectedButMayBeManuallyResolved(t *testing.T) {
 	}
 	if r.State != StateManuallyResolved {
 		t.Fatalf("resolution state %s", r.State)
+	}
+}
+
+func TestOperationTransitionMatrixRejectsImpossibleTargets(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	if _, err := j.Prepare(context.Background(), Operation{OperationID: "matrix-1", MessageID: "matrix-msg-1", SourceRoute: "s", TargetRoute: "d", Semantics: "x", Digest: "m1", BodySize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordResult(context.Background(), "matrix-1", StateAccepted, "bad"); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("prepared accepted: %v", err)
+	}
+	if err := j.RecordResult(context.Background(), "matrix-1", StateOutcomeUnknown, "bad"); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("prepared unknown: %v", err)
+	}
+	if err := j.RecordResult(context.Background(), "matrix-1", StateNotSent, "proven"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordResult(context.Background(), "matrix-1", StateAccepted, "late"); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("not-sent accepted: %v", err)
+	}
+	if _, err := j.Prepare(context.Background(), Operation{OperationID: "matrix-2", MessageID: "matrix-msg-2", SourceRoute: "s", TargetRoute: "d", Semantics: "x", Digest: "m2", BodySize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.MarkDispatchStarted(context.Background(), "matrix-2"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordResult(context.Background(), "matrix-2", StateNotSent, "impossible"); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("dispatch not-sent: %v", err)
+	}
+	if err := j.RecordResult(context.Background(), "matrix-2", StateOutcomeUnknown, "lost"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordResult(context.Background(), "matrix-2", StateRejected, "late"); !errors.Is(err, ErrInvalidTransition) {
+		t.Fatalf("unknown rejected: %v", err)
+	}
+}
+
+func TestPrepareJoinRedactsAttemptToken(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	op := Operation{OperationID: "join-op", MessageID: "join-msg", SourceRoute: "s", TargetRoute: "d", Semantics: "x", Digest: "join", BodySize: 1, AttemptOwner: "owner-a"}
+	first, err := j.Prepare(context.Background(), op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.AttemptToken == "" {
+		t.Fatal("creator did not receive attempt token")
+	}
+	joined, err := j.Prepare(context.Background(), op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if joined.AttemptToken != first.AttemptToken {
+		t.Fatal("same owner lost token")
+	}
+	op.AttemptOwner = "owner-b"
+	other, err := j.Prepare(context.Background(), op)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other.AttemptToken != "" {
+		t.Fatal("joined owner received attempt token")
+	}
+	status, err := j.Operation(context.Background(), op.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.AttemptToken != "" {
+		t.Fatal("status exposed attempt token")
+	}
+}
+
+func TestExpiredReplyCanOnlyBeReconciledWithoutTokenRevival(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	claim, err := j.ClaimReply(context.Background(), claimInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	now.Add(2 * int64(time.Second))
+	if _, err := j.ClaimReply(context.Background(), claimInput()); !errors.Is(err, ErrClaimExpired) {
+		t.Fatal(err)
+	}
+	if err := j.ReconcileReplyObservation(context.Background(), claim.ReplyID, "native-late", claim.Digest); err != nil {
+		t.Fatal(err)
+	}
+	r, err := j.Reply(context.Background(), claim.ReplyID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.State != StateReplyObserved || r.Token != "" {
+		t.Fatalf("reconciled claim: %+v", r)
+	}
+	if _, err := j.ClaimReply(context.Background(), claimInput()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.CommitReply(context.Background(), claim.ReplyID, claim.Owner, claim.Token); !errors.Is(err, ErrClaimExpired) {
+		t.Fatalf("reconciled token revived: %v", err)
 	}
 }
 
@@ -219,6 +338,36 @@ func TestQuestionMarkStatePathIsEscaped(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(filepath.Dir(dir), "state")); !os.IsNotExist(err) {
 		t.Fatalf("unescaped query path created sibling: %v", err)
+	}
+}
+
+func TestLegacyStoreIDKeepsAliasProvenance(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	canonical := j.StoreID()
+	legacy := "store_0123456789abcdef0123456789abcdef"
+	if _, err := j.db.Exec("UPDATE meta SET value=? WHERE key='store_id'", legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	j2, err := Open(context.Background(), Options{StateDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j2.Close()
+	if j2.StoreID() == legacy || !validStoreID(j2.StoreID()) {
+		t.Fatalf("legacy canonical id %q", j2.StoreID())
+	}
+	resolved, err := j2.ResolveStoreID(context.Background(), legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved != j2.StoreID() || resolved == canonical {
+		t.Fatalf("alias resolution %q canonical %q", resolved, j2.StoreID())
 	}
 }
 
@@ -490,7 +639,30 @@ PRAGMA user_version=1;`
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	j := testJournal(t, dir, new(atomic.Int64))
+	seed, err := sql.Open("sqlite", "file:"+escapedSQLitePath(dbPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixNano()
+	if _, err := seed.Exec("INSERT INTO operations(operation_id,message_id,source_route,target_route,semantics,digest,body_size,state,created_at,updated_at) VALUES('legacy-op','legacy-msg','s','d','x','digest',1,'prepared',?,?)", now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Exec("INSERT INTO attempts(operation_id,state,created_at,updated_at) VALUES('legacy-op','prepared',?,?)", now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Close(); err != nil {
+		t.Fatal(err)
+	}
+	clock := &atomic.Int64{}
+	clock.Store(now)
+	j := testJournal(t, dir, clock)
+	legacy, err := j.Operation(context.Background(), "legacy-op")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.AttemptOwner == "" || legacy.AttemptLeaseUntil == 0 {
+		t.Fatalf("legacy attempt was stranded: %+v", legacy)
+	}
 	r, err := j.Operation(context.Background(), "missing")
 	if !errors.Is(err, ErrNotFound) || r.OperationID != "" {
 		t.Fatalf("migration operation lookup: %v", err)

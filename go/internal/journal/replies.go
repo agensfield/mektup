@@ -366,3 +366,68 @@ func (j *Journal) ObserveReply(ctx context.Context, replyID, nativeItemID, diges
 		return nil
 	})
 }
+
+// ReconcileReplyObservation records native history found after a claim expired.
+// It strengthens unknown evidence without reopening the claim or restoring its
+// fencing token. The earlier reply_outcome_unknown event remains immutable.
+func (j *Journal) ReconcileReplyObservation(ctx context.Context, replyID, nativeItemID, digest string) error {
+	if nativeItemID == "" || digest == "" {
+		return fmt.Errorf("journal: invalid reconciliation")
+	}
+	return j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
+		var expected string
+		var state EvidenceState
+		if err := tx.QueryRow("SELECT digest,state FROM reply_claims WHERE reply_id=?", replyID).Scan(&expected, &state); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrNotFound
+			}
+			return err
+		}
+		if expected != digest {
+			return ErrIdentityConflict
+		}
+		if state != StateReplyOutcomeUnknown && state != StateReplyAccepted && state != StateReplyObserved {
+			return ErrInvalidTransition
+		}
+		if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest) VALUES(?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET native_item_id=excluded.native_item_id,observed_at=excluded.observed_at,digest=excluded.digest", replyID, nativeItemID, now, digest); err != nil {
+			return err
+		}
+		if state == StateReplyObserved {
+			return nil
+		}
+		if _, err := tx.Exec("UPDATE reply_claims SET state=?,updated_at=? WHERE reply_id=? AND state=?", string(StateReplyObserved), now, replyID, string(state)); err != nil {
+			return err
+		}
+		return emit(tx, "reply.reconciled", "", replyID, StateReplyObserved, now)
+	})
+}
+
+// ReconcileReplyAccepted is the acceptance-side counterpart when a durable
+// destination receipt is recovered after claim expiry. It never reopens the
+// expired dispatch token.
+func (j *Journal) ReconcileReplyAccepted(ctx context.Context, replyID, evidenceRef string) error {
+	if evidenceRef == "" {
+		return fmt.Errorf("journal: acceptance evidence reference required")
+	}
+	return j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
+		var state EvidenceState
+		if err := tx.QueryRow("SELECT state FROM reply_claims WHERE reply_id=?", replyID).Scan(&state); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrNotFound
+			}
+			return err
+		}
+		if state != StateReplyOutcomeUnknown {
+			return ErrInvalidTransition
+		}
+		if _, err := tx.Exec("UPDATE reply_claims SET state=?,updated_at=? WHERE reply_id=? AND state=?", string(StateReplyAccepted), now, replyID, string(StateReplyOutcomeUnknown)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("INSERT OR REPLACE INTO reply_acceptances(reply_id,evidence_ref,recorded_at) VALUES(?,?,?)", replyID, evidenceRef, now); err != nil {
+			return err
+		}
+		return emit(tx, "reply.reconciled", "", replyID, StateReplyAccepted, now)
+	})
+}
