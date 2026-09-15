@@ -65,7 +65,7 @@ type ManualResolution struct {
 	Reason       string `json:"reason"`
 	Timestamp    string `json:"timestamp"`
 	EvidenceRef  string `json:"evidenceRef"`
-	Presentation string `json:"presentation"`
+	Presentation string `json:"presentationMode"`
 }
 
 func (m ManualResolution) Validate() error {

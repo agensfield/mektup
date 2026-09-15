@@ -43,6 +43,17 @@ const (
 
 type EvidenceState string
 
+func (s EvidenceState) Valid() bool {
+	switch s {
+	case StateNotSent, StatePrepared, StateDispatchStarted, StateReplyClaimed,
+		StateReplyOutcomeUnknown, StateRejected, StateAccepted, StateOutcomeUnknown,
+		StateReplyAccepted, StateReplyObserved, StateManuallyResolved:
+		return true
+	default:
+		return false
+	}
+}
+
 var (
 	ErrNotFound          = errors.New("journal: record not found")
 	ErrIdentityConflict  = errors.New("journal: message identity conflict")
@@ -200,6 +211,9 @@ func (j *Journal) init(ctx context.Context) error {
 			return err
 		}
 	} else if version == 4 {
+		if err = ensureSupplementalTables(ctx, tx); err != nil {
+			return err
+		}
 		if err = validateV4Schema(ctx, tx); err != nil {
 			return err
 		}
@@ -289,7 +303,7 @@ CREATE INDEX IF NOT EXISTS events_operation ON events(operation_id, seq);
 CREATE TABLE IF NOT EXISTS manual_resolutions (
  operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
  assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL,
- evidence_ref TEXT NOT NULL, resolved_at INTEGER NOT NULL
+ evidence_ref TEXT NOT NULL, presentation TEXT NOT NULL DEFAULT '', resolved_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS operation_acceptances (
  operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
@@ -299,6 +313,32 @@ CREATE TABLE IF NOT EXISTS reply_acceptances (
  reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE,
  evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS receipts (
+ receipt_id TEXT PRIMARY KEY,
+ operation_id TEXT NOT NULL,
+ message_id TEXT NOT NULL,
+ state TEXT NOT NULL,
+ created_at INTEGER NOT NULL,
+ updated_at INTEGER NOT NULL,
+ document TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS receipts_operation ON receipts(operation_id);
+CREATE INDEX IF NOT EXISTS receipts_message ON receipts(message_id);
+CREATE TABLE IF NOT EXISTS blockers (
+ method TEXT NOT NULL,
+ correlation_id TEXT NOT NULL,
+ first_seen INTEGER NOT NULL,
+ last_seen INTEGER NOT NULL,
+ resolved_at INTEGER,
+ endpoint_id TEXT NOT NULL DEFAULT '',
+ thread_id TEXT NOT NULL DEFAULT '',
+ turn_id TEXT NOT NULL DEFAULT '',
+ item_id TEXT NOT NULL DEFAULT '',
+ operation_id TEXT NOT NULL DEFAULT '',
+ message_id TEXT NOT NULL DEFAULT '',
+ PRIMARY KEY(method, correlation_id)
+);
+CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen);
 `
 
 func migrateV1ToV4(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration) error {
@@ -310,10 +350,15 @@ func migrateV1ToV4(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration)
 		`ALTER TABLE operations ADD COLUMN custody_route TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE operations ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE reply_claims ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
-		`CREATE TABLE IF NOT EXISTS manual_resolutions (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, evidence_ref TEXT NOT NULL, resolved_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS manual_resolutions (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, evidence_ref TEXT NOT NULL, presentation TEXT NOT NULL DEFAULT '', resolved_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS operation_acceptances (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS reply_acceptances (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS receipts (receipt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, message_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, document TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS receipts_operation ON receipts(operation_id)`,
+		`CREATE INDEX IF NOT EXISTS receipts_message ON receipts(message_id)`,
+		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(method, correlation_id))`,
+		`CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen)`,
 		`PRAGMA user_version=4`,
 	}
 	for _, stmt := range stmts {
@@ -353,10 +398,15 @@ func migrateV2ToV4(ctx context.Context, tx *sql.Tx) error {
 		`ALTER TABLE operations ADD COLUMN custody_route TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE operations ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE reply_claims ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
-		`CREATE TABLE IF NOT EXISTS manual_resolutions (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, evidence_ref TEXT NOT NULL, resolved_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS manual_resolutions (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, evidence_ref TEXT NOT NULL, presentation TEXT NOT NULL DEFAULT '', resolved_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS operation_acceptances (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS reply_acceptances (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS receipts (receipt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, message_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, document TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS receipts_operation ON receipts(operation_id)`,
+		`CREATE INDEX IF NOT EXISTS receipts_message ON receipts(message_id)`,
+		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(method, correlation_id))`,
+		`CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen)`,
 		`PRAGMA user_version=4`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -371,9 +421,88 @@ func ensureV4Tables(ctx context.Context, tx *sql.Tx) error {
 		`CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS operation_acceptances (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS reply_acceptances (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS receipts (receipt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, message_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, document TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS receipts_operation ON receipts(operation_id)`,
+		`CREATE INDEX IF NOT EXISTS receipts_message ON receipts(message_id)`,
+		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(method, correlation_id))`,
+		`CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen)`,
 		`PRAGMA user_version=4`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(manual_resolutions)")
+	if err != nil {
+		return fmt.Errorf("journal migration: %w", err)
+	}
+	hasPresentation := false
+	for rows.Next() {
+		var cid int
+		var name, kind string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("journal migration: %w", err)
+		}
+		if name == "presentation" {
+			hasPresentation = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("journal migration: %w", err)
+	}
+	rows.Close()
+	if !hasPresentation {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE manual_resolutions ADD COLUMN presentation TEXT NOT NULL DEFAULT ''"); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+	}
+	return nil
+}
+
+// ensureSupplementalTables adds only tables introduced by the receipt domain.
+// Existing v4 evidence tables must still be validated strictly; recreating a
+// missing acceptance table would turn corruption into a successful open.
+func ensureSupplementalTables(ctx context.Context, tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS receipts (receipt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, message_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, document TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS receipts_operation ON receipts(operation_id)`,
+		`CREATE INDEX IF NOT EXISTS receipts_message ON receipts(message_id)`,
+		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(method, correlation_id))`,
+		`CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen)`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+	}
+	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(manual_resolutions)")
+	if err != nil {
+		return fmt.Errorf("journal migration: %w", err)
+	}
+	hasPresentation := false
+	for rows.Next() {
+		var cid int
+		var name, kind string
+		var notNull, pk int
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return fmt.Errorf("journal migration: %w", err)
+		}
+		if name == "presentation" {
+			hasPresentation = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("journal migration: %w", err)
+	}
+	rows.Close()
+	if !hasPresentation {
+		if _, err := tx.ExecContext(ctx, "ALTER TABLE manual_resolutions ADD COLUMN presentation TEXT NOT NULL DEFAULT ''"); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
 		}
 	}

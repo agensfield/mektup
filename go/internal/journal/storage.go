@@ -147,7 +147,7 @@ func (j *Journal) StorageStatus(ctx context.Context) (StorageStatus, error) {
 	if err := j.db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&status.JournalMode); err != nil {
 		return status, classifyStorageError(err)
 	}
-	for _, table := range []string{"operations", "reply_claims", "events", "observations", "manual_resolutions", "blockers"} {
+	for _, table := range []string{"operations", "reply_claims", "events", "observations", "manual_resolutions", "receipts", "blockers"} {
 		var count int64
 		err := j.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&count)
 		if err != nil {
@@ -198,6 +198,14 @@ func (j *Journal) StorageStatus(ctx context.Context) (StorageStatus, error) {
 		return status, classifyStorageError(err)
 	}
 	status.RetentionEligible += replies
+	var receipts, blockers int64
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM receipts WHERE `+retentionReceiptPredicate, retentionReceiptArgs(status.RetentionCutoff.UnixNano())...).Scan(&receipts); err != nil {
+		return status, classifyStorageError(err)
+	}
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM blockers WHERE resolved_at IS NOT NULL AND resolved_at <= ?`, status.RetentionCutoff.UnixNano()).Scan(&blockers); err != nil {
+		return status, classifyStorageError(err)
+	}
+	status.RetentionEligible += receipts + blockers
 	return status, nil
 }
 
@@ -233,6 +241,12 @@ func retentionOperationArgs(cutoff int64) []any {
 const retentionReplyPredicate = `c.state IN (?,?) AND c.updated_at <= ? AND EXISTS (
 	SELECT 1 FROM operations o WHERE o.message_id = c.original_id AND ` + retentionOperationPredicate + `
 )`
+
+const retentionReceiptPredicate = `state IN (?,?,?,?,?,?) AND updated_at <= ?`
+
+func retentionReceiptArgs(cutoff int64) []any {
+	return []any{string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), string(StateReplyAccepted), string(StateReplyObserved), cutoff}
+}
 
 func retentionReplyArgs(cutoff int64) []any {
 	args := []any{string(StateReplyAccepted), string(StateReplyObserved), cutoff}
@@ -354,14 +368,20 @@ func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) 
 		{Kind: "wal_checkpoint"},
 		{Kind: "optimize"},
 	}}
-	var eligibleOps, eligibleReplies, activeExpired int64
+	var eligibleOps, eligibleReplies, eligibleReceipts, eligibleBlockers, activeExpired int64
 	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations o WHERE `+retentionOperationPredicate, retentionOperationArgs(cutoff.UnixNano())...).Scan(&eligibleOps); err != nil {
 		return receipt, classifyStorageError(err)
 	}
 	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims c WHERE `+retentionReplyPredicate, retentionReplyArgs(cutoff.UnixNano())...).Scan(&eligibleReplies); err != nil {
 		return receipt, classifyStorageError(err)
 	}
-	receipt.Actions[1].Eligible = eligibleOps + eligibleReplies
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM receipts WHERE `+retentionReceiptPredicate, retentionReceiptArgs(cutoff.UnixNano())...).Scan(&eligibleReceipts); err != nil {
+		return receipt, classifyStorageError(err)
+	}
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM blockers WHERE resolved_at IS NOT NULL AND resolved_at <= ?`, cutoff.UnixNano()).Scan(&eligibleBlockers); err != nil {
+		return receipt, classifyStorageError(err)
+	}
+	receipt.Actions[1].Eligible = eligibleOps + eligibleReplies + eligibleReceipts + eligibleBlockers
 	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims WHERE state=? AND lease_until <= ?`, string(StateReplyClaimed), now.UnixNano()).Scan(&activeExpired); err != nil {
 		return receipt, classifyStorageError(err)
 	}
@@ -411,6 +431,18 @@ func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) 
 			return err
 		}
 		res, err = tx.Exec(`DELETE FROM reply_claims WHERE reply_id IN (SELECT reply_id FROM mektup_prune_replies)`)
+		if err != nil {
+			return err
+		}
+		n, _ = res.RowsAffected()
+		pruned += n
+		res, err = tx.Exec(`DELETE FROM receipts WHERE `+retentionReceiptPredicate, retentionReceiptArgs(cutoff.UnixNano())...)
+		if err != nil {
+			return err
+		}
+		n, _ = res.RowsAffected()
+		pruned += n
+		res, err = tx.Exec(`DELETE FROM blockers WHERE resolved_at IS NOT NULL AND resolved_at <= ?`, cutoff.UnixNano())
 		if err != nil {
 			return err
 		}

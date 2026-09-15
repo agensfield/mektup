@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"time"
 )
 
 // Operation describes metadata persisted before a request can be dispatched.
@@ -31,13 +32,33 @@ type OperationRecord struct {
 	ErrorCode         string
 	AttemptToken      string
 	AttemptLeaseUntil int64
+	ManualResolution  *ManualResolutionRecord
 }
 
 type ManualResolution struct {
-	Assertion   string
-	Actor       string
-	Reason      string
-	EvidenceRef string
+	Assertion    string
+	Actor        string
+	Reason       string
+	EvidenceRef  string
+	Presentation string
+	Timestamp    time.Time
+}
+
+type ManualResolutionRecord struct {
+	Assertion    string
+	Actor        string
+	Reason       string
+	EvidenceRef  string
+	Presentation string
+	ResolvedAt   time.Time
+}
+
+const MaxOperationQueryLimit = 100
+
+type OperationQuery struct {
+	State EvidenceState
+	Since time.Time
+	Limit int
 }
 
 // Prepare durably establishes the original relationship. It must be called
@@ -93,6 +114,21 @@ func scanOperation(row interface{ Scan(...any) error }, out *OperationRecord) er
 	return row.Scan(&out.OperationID, &out.MessageID, &out.SourceRoute, &out.TargetRoute, &out.Semantics, &out.ReplyRoute, &out.CustodyRoute, &out.CustodyStoreID, &out.Digest, &out.BodySize, &out.State, &out.CreatedAt, &out.UpdatedAt, &out.DispatchStartedAt, &out.TerminalAt, &out.ErrorCode, &out.AttemptOwner, &out.AttemptToken, &out.AttemptLeaseUntil)
 }
 
+func (j *Journal) loadManualResolution(ctx context.Context, operationID string, out *OperationRecord) error {
+	var record ManualResolutionRecord
+	var resolved int64
+	err := j.db.QueryRowContext(ctx, `SELECT assertion,actor,reason,evidence_ref,presentation,resolved_at FROM manual_resolutions WHERE operation_id=?`, operationID).Scan(&record.Assertion, &record.Actor, &record.Reason, &record.EvidenceRef, &record.Presentation, &resolved)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	record.ResolvedAt = time.Unix(0, resolved).UTC()
+	out.ManualResolution = &record
+	return nil
+}
+
 func (j *Journal) Operation(ctx context.Context, operationID string) (OperationRecord, error) {
 	return j.operation(ctx, operationID, false)
 }
@@ -108,6 +144,9 @@ func (j *Journal) OperationByMessage(ctx context.Context, messageID string) (Ope
 	// Message lookup is read-only and must never grant the live dispatch
 	// fencing token. Owned-token recovery remains confined to Prepare.
 	out.AttemptToken = ""
+	if err == nil {
+		err = j.loadManualResolution(ctx, out.OperationID, &out)
+	}
 	return out, err
 }
 
@@ -120,7 +159,52 @@ func (j *Journal) operation(ctx context.Context, operationID string, includeToke
 	if !includeToken {
 		out.AttemptToken = ""
 	}
+	if err == nil {
+		err = j.loadManualResolution(ctx, out.OperationID, &out)
+	}
 	return out, err
+}
+
+func (j *Journal) ListOperations(ctx context.Context, query OperationQuery) ([]OperationRecord, error) {
+	limit := query.Limit
+	if limit < 0 || limit > MaxOperationQueryLimit {
+		return nil, fmt.Errorf("journal: operation limit must be between 0 and %d", MaxOperationQueryLimit)
+	}
+	if limit == 0 {
+		limit = 50
+	}
+	where := "1=1"
+	args := make([]any, 0, 3)
+	if query.State != "" {
+		if !query.State.Valid() {
+			return nil, fmt.Errorf("journal: invalid operation state %q", query.State)
+		}
+		where += " AND o.state=?"
+		args = append(args, string(query.State))
+	}
+	if !query.Since.IsZero() {
+		where += " AND o.created_at>=?"
+		args = append(args, query.Since.UTC().UnixNano())
+	}
+	args = append(args, limit)
+	rows, err := j.db.QueryContext(ctx, `SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE `+where+` ORDER BY o.created_at DESC,o.operation_id DESC LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OperationRecord
+	for rows.Next() {
+		var record OperationRecord
+		if err := scanOperation(rows, &record); err != nil {
+			return nil, err
+		}
+		record.AttemptToken = ""
+		if err := j.loadManualResolution(ctx, record.OperationID, &record); err != nil {
+			return nil, err
+		}
+		out = append(out, record)
+	}
+	return out, rows.Err()
 }
 
 // MarkDispatchStarted commits the dispatch fence before handing bytes to a
@@ -248,6 +332,10 @@ func (j *Journal) RecordManualResolution(ctx context.Context, operationID string
 	}
 	return j.withTx(ctx, func(tx *sql.Tx) error {
 		now := j.nowUnix()
+		resolvedAt := now
+		if !resolution.Timestamp.IsZero() {
+			resolvedAt = resolution.Timestamp.UTC().UnixNano()
+		}
 		var state EvidenceState
 		if err := tx.QueryRow("SELECT state FROM operations WHERE operation_id=?", operationID).Scan(&state); err != nil {
 			if err == sql.ErrNoRows {
@@ -261,7 +349,7 @@ func (j *Journal) RecordManualResolution(ctx context.Context, operationID string
 		if _, err := tx.Exec("UPDATE operations SET state=?,updated_at=?,terminal_at=?,error_code=? WHERE operation_id=? AND state=?", string(StateManuallyResolved), now, now, resolution.Assertion, operationID, string(StateOutcomeUnknown)); err != nil {
 			return err
 		}
-		if _, err := tx.Exec("INSERT OR REPLACE INTO manual_resolutions(operation_id,assertion,actor,reason,evidence_ref,resolved_at) VALUES(?,?,?,?,?,?)", operationID, resolution.Assertion, resolution.Actor, resolution.Reason, resolution.EvidenceRef, now); err != nil {
+		if _, err := tx.Exec("INSERT OR REPLACE INTO manual_resolutions(operation_id,assertion,actor,reason,evidence_ref,presentation,resolved_at) VALUES(?,?,?,?,?,?,?)", operationID, resolution.Assertion, resolution.Actor, resolution.Reason, resolution.EvidenceRef, resolution.Presentation, resolvedAt); err != nil {
 			return err
 		}
 		if _, err := tx.Exec("UPDATE attempts SET state=?,updated_at=? WHERE operation_id=?", string(StateManuallyResolved), now, operationID); err != nil {
