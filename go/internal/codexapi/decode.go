@@ -46,6 +46,20 @@ func stringField(m map[string]json.RawMessage, k string, required bool) (string,
 	}
 	return s, nil
 }
+func nullableStringField(m map[string]json.RawMessage, k string) (string, error) {
+	v, ok := m[k]
+	if !ok {
+		return "", fmt.Errorf("missing required field %q", k)
+	}
+	if bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
+		return "", nil
+	}
+	var s string
+	if err := json.Unmarshal(v, &s); err != nil {
+		return "", fmt.Errorf("field %q must be string or null", k)
+	}
+	return s, nil
+}
 func boolField(m map[string]json.RawMessage, k string, required bool) (bool, error) {
 	v, ok := m[k]
 	if !ok || bytes.Equal(bytes.TrimSpace(v), []byte("null")) {
@@ -96,6 +110,9 @@ func thread(raw json.RawMessage) (Thread, error) {
 	// projectId is required by the wire schema but nullable for unassigned
 	// threads.  Presence, rather than non-nullness, is the contract here.
 	if _, err := present(m, "projectId"); err != nil {
+		return Thread{}, err
+	}
+	if _, err := nullableStringField(m, "projectId"); err != nil {
 		return Thread{}, err
 	}
 	if _, err := stringField(m, "cliVersion", true); err != nil {
@@ -193,6 +210,9 @@ func turn(raw json.RawMessage) (Turn, error) {
 	if err != nil {
 		return Turn{}, err
 	}
+	if status != "completed" && status != "interrupted" && status != "failed" && status != "inProgress" {
+		return Turn{}, fmt.Errorf("unknown TurnStatus %q", status)
+	}
 	if _, err := jsonArray(m["items"]); err != nil {
 		return Turn{}, fmt.Errorf("field %q must be array", "items")
 	}
@@ -204,9 +224,7 @@ func turn(raw json.RawMessage) (Turn, error) {
 			return Turn{}, err
 		}
 	}
-	if view == "" {
-		view = "full"
-	} else if view != "notLoaded" && view != "summary" && view != "full" {
+	if view != "notLoaded" && view != "summary" && view != "full" {
 		return Turn{}, fmt.Errorf("unknown itemsView %q", view)
 	}
 	return Turn{RawObject: ro, ID: id, Status: status, ItemsView: view}, nil
@@ -310,12 +328,118 @@ func decodeLifecycle(raw json.RawMessage) (LifecycleResponse, error) {
 	if err != nil {
 		return LifecycleResponse{}, err
 	}
-	for _, k := range []string{"approvalPolicy", "approvalsReviewer", "sandbox"} {
-		if _, err := req(m, k); err != nil {
-			return LifecycleResponse{}, err
-		}
+	if _, err := req(m, "approvalPolicy"); err != nil {
+		return LifecycleResponse{}, err
+	}
+	if err := validateApprovalPolicy(m["approvalPolicy"]); err != nil {
+		return LifecycleResponse{}, err
+	}
+	if _, err := req(m, "approvalsReviewer"); err != nil {
+		return LifecycleResponse{}, err
+	}
+	if err := validateApprovalsReviewer(m["approvalsReviewer"]); err != nil {
+		return LifecycleResponse{}, err
+	}
+	if _, err := req(m, "sandbox"); err != nil {
+		return LifecycleResponse{}, err
+	}
+	if err := validateSandboxPolicy(m["sandbox"]); err != nil {
+		return LifecycleResponse{}, err
 	}
 	return LifecycleResponse{Thread: t, Model: model, ModelProvider: provider, CWD: cwd, Raw: append(json.RawMessage(nil), raw...)}, nil
+}
+
+func validateApprovalsReviewer(raw json.RawMessage) error {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return fmt.Errorf("approvalsReviewer must be string")
+	}
+	switch value {
+	case "user", "auto_review", "guardian_subagent":
+		return nil
+	default:
+		return fmt.Errorf("unknown approvalsReviewer %q", value)
+	}
+}
+
+func validateApprovalPolicy(raw json.RawMessage) error {
+	var value string
+	if json.Unmarshal(raw, &value) == nil {
+		switch value {
+		case "untrusted", "on-request", "never":
+			return nil
+		default:
+			return fmt.Errorf("unknown approvalPolicy %q", value)
+		}
+	}
+	m, err := object(raw)
+	if err != nil {
+		return fmt.Errorf("approvalPolicy must be enum string or granular object")
+	}
+	granularRaw, err := req(m, "granular")
+	if err != nil {
+		return err
+	}
+	granular, err := object(granularRaw)
+	if err != nil {
+		return fmt.Errorf("approvalPolicy.granular must be object")
+	}
+	for _, key := range []string{"mcp_elicitations", "rules", "sandbox_approval"} {
+		if _, err := boolField(granular, key, true); err != nil {
+			return err
+		}
+	}
+	for _, key := range []string{"skill_approval", "request_permissions"} {
+		if _, present := granular[key]; present {
+			if _, err := boolField(granular, key, true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func validateSandboxPolicy(raw json.RawMessage) error {
+	m, err := object(raw)
+	if err != nil {
+		return fmt.Errorf("sandbox must be policy object")
+	}
+	typeValue, err := stringField(m, "type", true)
+	if err != nil {
+		return err
+	}
+	switch typeValue {
+	case "dangerFullAccess":
+		return nil
+	case "readOnly", "workspaceWrite":
+		if _, present := m["networkAccess"]; present {
+			if _, err := boolField(m, "networkAccess", true); err != nil {
+				return err
+			}
+		}
+	case "externalSandbox":
+		if rawNetwork, present := m["networkAccess"]; present {
+			var network string
+			if err := json.Unmarshal(rawNetwork, &network); err != nil || (network != "restricted" && network != "enabled") {
+				return fmt.Errorf("sandbox.networkAccess must be restricted or enabled")
+			}
+		}
+	default:
+		return fmt.Errorf("unknown sandbox type %q", typeValue)
+	}
+	if rawRoots, present := m["writableRoots"]; present {
+		if _, err := jsonArray(rawRoots); err != nil {
+			return fmt.Errorf("sandbox.writableRoots must be array")
+		}
+	}
+	for _, key := range []string{"excludeSlashTmp", "excludeTmpdirEnvVar"} {
+		if _, present := m[key]; present {
+			if _, err := boolField(m, key, true); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 func decodeThreadList(raw json.RawMessage, limit int) (ThreadListResponse, error) {
 	_, a, next, back, err := page(raw, limit, MaxThreadPageLimit)

@@ -182,7 +182,7 @@ func TestClassifyNotSubmittedOnlyPinnedReviewCompactShapes(t *testing.T) {
 }
 
 func TestThroughTurnUsesExactReadAndRejectsInProgress(t *testing.T) {
-	r := &recordingCaller{result: json.RawMessage(`{"thread":{"id":"t","cliVersion":"x","createdAt":1,"cwd":"/tmp","ephemeral":false,"modelProvider":"openai","preview":"p","projectId":null,"sessionId":"s","source":"cli","status":{"type":"idle"},"turns":[],"updatedAt":1},"model":"m","modelProvider":"openai","cwd":"/tmp","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"workspace-write"}`)}
+	r := &recordingCaller{result: lifecycleFixture()}
 	reader := exactReader{turn: Turn{ID: "turn", Status: "inProgress"}}
 	_, err := New(r, Options{ExactRead: reader}).ThreadFork(context.Background(), ForkOptions{ThreadID: "t", ThroughTurnID: "turn"})
 	if err != ErrInProgressCutoff {
@@ -258,6 +258,30 @@ func TestKnownMalformedFieldsRejectAndOmittedItemsViewDefaultsFull(t *testing.T)
 	}
 }
 
+func TestKnownShapeValidationRejectsInvalidEnumsAndNullableTypes(t *testing.T) {
+	if _, err := decodeTurns(json.RawMessage(`{"data":[{"id":"t","status":"completed","items":[],"itemsView":""}]}`), 1, "full"); err == nil {
+		t.Fatal("explicit empty itemsView accepted")
+	}
+	if _, err := thread(json.RawMessage(strings.Replace(threadFixture(), `"projectId":null`, `"projectId":42`, 1))); err == nil {
+		t.Fatal("numeric projectId accepted")
+	}
+	if _, err := turn(json.RawMessage(`{"id":"t","status":"","items":[]}`)); err == nil {
+		t.Fatal("empty TurnStatus accepted")
+	}
+	invalidReviewer := strings.Replace(string(lifecycleFixture()), `"approvalsReviewer":"user"`, `"approvalsReviewer":42`, 1)
+	if _, err := decodeLifecycle(json.RawMessage(invalidReviewer)); err == nil {
+		t.Fatal("numeric approvalsReviewer accepted")
+	}
+	invalidPolicy := `{"thread":` + threadFixture() + `,"model":"m","modelProvider":"openai","cwd":"/tmp","approvalPolicy":42,"approvalsReviewer":"user","sandbox":{"type":"workspaceWrite"}}`
+	if _, err := decodeLifecycle(json.RawMessage(invalidPolicy)); err == nil {
+		t.Fatal("invalid approval policy accepted")
+	}
+	invalidSandbox := `{"thread":` + threadFixture() + `,"model":"m","modelProvider":"openai","cwd":"/tmp","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"workspace-write"}`
+	if _, err := decodeLifecycle(json.RawMessage(invalidSandbox)); err == nil {
+		t.Fatal("string sandbox policy accepted")
+	}
+}
+
 func TestInvalidCWDAndOutboundCursorRejectBeforeDispatch(t *testing.T) {
 	r := &recordingCaller{result: json.RawMessage(`{"data":[]}`)}
 	if _, err := New(r, Options{}).ThreadList(context.Background(), ThreadListOptions{CWD: 42}); !errors.Is(err, ErrInvalidCWD) || r.method != "" {
@@ -284,7 +308,7 @@ func TestReconcileHistoryCountsNestedItems(t *testing.T) {
 }
 
 func lifecycleFixture() json.RawMessage {
-	return json.RawMessage(`{"thread":{"id":"t","cliVersion":"x","createdAt":1,"cwd":"/tmp","ephemeral":false,"modelProvider":"openai","preview":"p","projectId":null,"sessionId":"s","source":"cli","status":{"type":"idle"},"turns":[],"updatedAt":1},"model":"m","modelProvider":"openai","cwd":"/tmp","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"workspace-write"}`)
+	return json.RawMessage(`{"thread":{"id":"t","cliVersion":"x","createdAt":1,"cwd":"/tmp","ephemeral":false,"modelProvider":"openai","preview":"p","projectId":null,"sessionId":"s","source":"cli","status":{"type":"idle"},"turns":[],"updatedAt":1},"model":"m","modelProvider":"openai","cwd":"/tmp","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite","writableRoots":[],"networkAccess":false,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}`)
 }
 
 func threadFixture() string {
@@ -292,7 +316,7 @@ func threadFixture() string {
 }
 
 func TestLifecycleDefaultsDoNotSerializeNullOverrides(t *testing.T) {
-	result := json.RawMessage(`{"thread":{"id":"t","cliVersion":"x","createdAt":1,"cwd":"/tmp","ephemeral":false,"modelProvider":"openai","preview":"p","projectId":null,"sessionId":"s","source":"cli","status":{"type":"idle"},"turns":[],"updatedAt":1},"model":"m","modelProvider":"openai","cwd":"/tmp","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"workspace-write"}`)
+	result := lifecycleFixture()
 	for _, call := range []func(*Client) error{
 		func(c *Client) error { _, err := c.ThreadStart(context.Background(), StartOptions{}); return err },
 		func(c *Client) error {
