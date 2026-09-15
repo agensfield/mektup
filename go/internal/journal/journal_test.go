@@ -867,6 +867,57 @@ func TestV3PositiveReconciliationRepairPreservesWinner(t *testing.T) {
 	}
 }
 
+func TestV3MixedEvidenceDomainsFailClosed(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	a := claimInput()
+	a.ReplyID = "event-reply"
+	ca, err := j.ClaimReply(context.Background(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.AbandonReply(context.Background(), ca.ReplyID, ca.Owner, ca.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.ReconcileReplyObservation(context.Background(), ca.ReplyID, "native-event", ca.Digest); err != nil {
+		t.Fatal(err)
+	}
+	b := claimInput()
+	b.ReplyID = "timestamp-reply"
+	cb, err := j.ClaimReply(context.Background(), b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("UPDATE reply_claims SET state=?,accepted_at=NULL,commit_seq=NULL WHERE reply_id=?", string(StateReplyObserved), cb.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest) VALUES(?,?,?,?)", cb.ReplyID, "native-timestamp", now.Load(), cb.Digest); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("DELETE FROM reply_winners"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("UPDATE reply_claims SET accepted_at=NULL,commit_seq=NULL"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("PRAGMA user_version=3"); err != nil {
+		t.Fatal(err)
+	}
+	dir = j.StateDir()
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if k, err := Open(context.Background(), Options{StateDir: dir}); err == nil {
+		k.Close()
+		t.Fatal("mixed evidence domains were accepted")
+	} else if !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("mixed-domain error: %v", err)
+	}
+}
+
 func TestMetadataNeverStoresBodies(t *testing.T) {
 	dir := t.TempDir()
 	var now atomic.Int64

@@ -405,61 +405,64 @@ type legacyPositiveReply struct {
 	replyID, originalID                            string
 	state                                          EvidenceState
 	seq, acceptedAt, eventSeq, observedAt, eventAt int64
+	domain                                         byte
 }
 
 // repairV3PositiveReplies reconstructs the custody order lost by the earlier
 // reconciliation implementation. It refuses to guess when no durable event
 // or observation evidence exists.
 func repairV3PositiveReplies(ctx context.Context, tx *sql.Tx) error {
-	rows, err := tx.QueryContext(ctx, `SELECT c.reply_id,c.original_id,c.state,COALESCE(c.commit_seq,0),COALESCE(c.accepted_at,0),
-COALESCE((SELECT MAX(seq) FROM events e WHERE e.reply_id=c.reply_id AND e.kind IN ('reply.accepted','reply.reconciled')),0),
-COALESCE((SELECT MAX(observed_at) FROM observations o WHERE o.reply_id=c.reply_id),0),
-COALESCE((SELECT MAX(at) FROM events e WHERE e.reply_id=c.reply_id AND e.kind IN ('reply.accepted','reply.reconciled')),0)
-FROM reply_claims c WHERE c.state IN (?,?)`, string(StateReplyAccepted), string(StateReplyObserved))
+	rows, err := tx.QueryContext(ctx, `SELECT c.reply_id,c.original_id,c.state,COALESCE(c.commit_seq,0),COALESCE(c.accepted_at,0),COALESCE((SELECT MIN(observed_at) FROM observations o WHERE o.reply_id=c.reply_id),0) FROM reply_claims c WHERE c.state IN (?,?)`, string(StateReplyAccepted), string(StateReplyObserved))
 	if err != nil {
 		return fmt.Errorf("%w: inspect legacy positive replies: %v", ErrCorrupt, err)
 	}
 	defer rows.Close()
 	var positives []legacyPositiveReply
-	var maxSeq int64
 	for rows.Next() {
 		var p legacyPositiveReply
-		if err := rows.Scan(&p.replyID, &p.originalID, &p.state, &p.seq, &p.acceptedAt, &p.eventSeq, &p.observedAt, &p.eventAt); err != nil {
+		if err := rows.Scan(&p.replyID, &p.originalID, &p.state, &p.seq, &p.acceptedAt, &p.observedAt); err != nil {
 			return fmt.Errorf("%w: inspect legacy positive replies: %v", ErrCorrupt, err)
 		}
-		if p.seq > maxSeq {
-			maxSeq = p.seq
-		}
-		if p.seq == 0 && p.acceptedAt == 0 && p.eventSeq == 0 && p.observedAt == 0 && p.eventAt == 0 {
+		var eventAt int64
+		if err := tx.QueryRowContext(ctx, "SELECT seq,at FROM events WHERE reply_id=? AND kind IN ('reply.accepted','reply.reconciled') ORDER BY seq LIMIT 1", p.replyID).Scan(&p.eventSeq, &eventAt); err == nil {
+			p.domain, p.eventAt = 'e', eventAt
+		} else if err != sql.ErrNoRows {
+			return fmt.Errorf("%w: inspect positive reply %s: %v", ErrCorrupt, p.replyID, err)
+		} else if p.acceptedAt != 0 || p.observedAt != 0 {
+			p.domain = 't'
+			if p.acceptedAt != 0 {
+				p.eventAt = p.acceptedAt
+			} else {
+				p.eventAt = p.observedAt
+			}
+		} else {
 			return fmt.Errorf("%w: positive reply %s has no acceptance evidence", ErrCorrupt, p.replyID)
+		}
+		if p.domain == 'e' && p.eventAt == 0 {
+			return fmt.Errorf("%w: positive reply %s has invalid event timestamp", ErrCorrupt, p.replyID)
 		}
 		positives = append(positives, p)
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("%w: inspect legacy positive replies: %v", ErrCorrupt, err)
 	}
-	sort.Slice(positives, func(i, j int) bool { return evidenceKey(positives[i]) < evidenceKey(positives[j]) })
 	for i := 1; i < len(positives); i++ {
-		if positives[i].seq == 0 && positives[i-1].seq == 0 && evidenceKey(positives[i]) == evidenceKey(positives[i-1]) {
+		if positives[i].domain != positives[0].domain {
+			return fmt.Errorf("%w: mixed acceptance evidence domains", ErrCorrupt)
+		}
+	}
+	sort.SliceStable(positives, func(i, j int) bool { return evidenceKey(positives[i]) < evidenceKey(positives[j]) })
+	for i := 1; i < len(positives); i++ {
+		if evidenceKey(positives[i]) == evidenceKey(positives[i-1]) {
 			return fmt.Errorf("%w: tied acceptance evidence for replies %s and %s", ErrCorrupt, positives[i-1].replyID, positives[i].replyID)
 		}
 	}
-	for _, p := range positives {
-		seq := p.seq
-		if seq == 0 {
-			maxSeq++
-			seq = maxSeq
-		}
-		at := p.acceptedAt
-		if at == 0 {
-			at = p.observedAt
-			if at == 0 {
-				at = p.eventAt
-			}
-		}
-		if at == 0 {
-			return fmt.Errorf("%w: positive reply %s has no acceptance timestamp", ErrCorrupt, p.replyID)
-		}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM reply_winners"); err != nil {
+		return fmt.Errorf("%w: clear legacy winners: %v", ErrCorrupt, err)
+	}
+	for i, p := range positives {
+		seq := int64(i + 1)
+		at := p.eventAt
 		if _, err := tx.ExecContext(ctx, "UPDATE reply_claims SET accepted_at=?,commit_seq=? WHERE reply_id=?", at, seq, p.replyID); err != nil {
 			return fmt.Errorf("%w: repair positive reply %s: %v", ErrCorrupt, p.replyID, err)
 		}
@@ -471,14 +474,8 @@ FROM reply_claims c WHERE c.state IN (?,?)`, string(StateReplyAccepted), string(
 }
 
 func evidenceKey(p legacyPositiveReply) int64 {
-	if p.eventSeq != 0 {
+	if p.domain == 'e' {
 		return p.eventSeq
-	}
-	if p.acceptedAt != 0 {
-		return p.acceptedAt
-	}
-	if p.observedAt != 0 {
-		return p.observedAt
 	}
 	return p.eventAt
 }
