@@ -619,6 +619,10 @@ func (c *Client) ThreadSetName(ctx context.Context, threadID, name string) (Thre
 	}
 	var out ThreadNameResponse
 	err := c.callDecode(ctx, "thread/name/set", map[string]any{"threadId": threadID, "name": name}, func(raw json.RawMessage) error {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+			return errors.New("codexapi: thread/name/set response must be a JSON object")
+		}
 		out.Raw = append(json.RawMessage(nil), raw...)
 		return nil
 	})
