@@ -297,6 +297,7 @@ const (
 
 type command struct {
 	kind       commandKind
+	ctx        context.Context
 	req        RPCRequest
 	notify     RPCNotification
 	key        string
@@ -438,8 +439,11 @@ func (c *Client) stopAdmission() {
 	c.admitMu.Unlock()
 }
 
-func (c *Client) beginWrite(key string, request bool) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(context.Background())
+func (c *Client) beginWrite(parent context.Context, key string, request bool) (context.Context, context.CancelFunc) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
 	c.activeMu.Lock()
 	c.activeKey = key
 	c.activeRequest = request
@@ -459,17 +463,18 @@ func (c *Client) endWrite(key string, cancel context.CancelFunc) {
 	cancel()
 }
 
-func (c *Client) cancelActiveWrite(key string) {
+func (c *Client) cancelActiveWrite() bool {
 	c.activeMu.Lock()
-	active := c.activeRequest && c.activeKey == key && c.activeCancel != nil
+	anyActive := c.activeCancel != nil
 	cancel := c.activeCancel
 	c.activeMu.Unlock()
-	if active {
+	if anyActive {
 		cancel()
 		// A conforming transport must honor the context, but closing here also
 		// bounds transports that only unblock their writer from Close.
 		_ = c.transport.Close()
 	}
+	return anyActive
 }
 
 func (c *Client) cancelAnyActiveWrite() {
@@ -504,6 +509,27 @@ func (c *Client) forgetCompleted(key string) {
 func (c *Client) retire(key string) {
 	c.mu.Lock()
 	c.retired[key] = struct{}{}
+	c.mu.Unlock()
+}
+
+func (c *Client) completeReservation(key string, evidence WriteEvidence) {
+	c.mu.Lock()
+	c.completed[key] = evidence
+	c.retired[key] = struct{}{}
+	delete(c.reserved, key)
+	delete(c.withdrawn, key)
+	delete(c.queued, key)
+	c.mu.Unlock()
+}
+
+func (c *Client) releaseUnknownReservation(key string, retire bool) {
+	c.mu.Lock()
+	if retire {
+		c.retired[key] = struct{}{}
+	}
+	delete(c.reserved, key)
+	delete(c.withdrawn, key)
+	delete(c.queued, key)
 	c.mu.Unlock()
 }
 
@@ -573,7 +599,7 @@ func (c *Client) Initialize(ctx context.Context) (*ServerInfo, error) {
 	}
 	info := &ServerInfo{UserAgent: userAgent, ServerVersion: parseServerVersion(userAgent), CodexHome: raw.CodexHome, PlatformFamily: raw.PlatformFamily, PlatformOS: raw.PlatformOS, Generation: c.generation}
 	c.info.Store(info)
-	if err := c.Notify(ctx, RPCNotification{Method: "initialized"}); err != nil {
+	if err := c.Notify(initCtx, RPCNotification{Method: "initialized"}); err != nil {
 		_ = c.Close(context.Background())
 		return nil, fmt.Errorf("send initialized notification: %w", err)
 	}
@@ -592,6 +618,9 @@ func parseServerVersion(userAgent string) string {
 
 // Call sends one raw request and preserves the raw result or server error.
 func (c *Client) Call(ctx context.Context, request RPCRequest) (*RPCResult, error) {
+	if request.Method != "initialize" && c.info.Load() == nil {
+		return nil, &CallError{Err: errors.New("app-server client is not initialized"), Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
+	}
 	return c.call(ctx, request)
 }
 
@@ -615,7 +644,7 @@ func (c *Client) call(ctx context.Context, request RPCRequest) (*RPCResult, erro
 	}
 	c.reserved[key] = struct{}{}
 	c.mu.Unlock()
-	cmd := command{kind: commandRequest, req: request, key: key, result: resultCh}
+	cmd := command{kind: commandRequest, ctx: ctx, req: request, key: key, result: resultCh}
 	if err := c.enqueue(ctx, cmd); err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			cancel := c.withdraw(ctx, key)
@@ -688,13 +717,14 @@ func (c *Client) Notify(ctx context.Context, notification RPCNotification) error
 		ctx = context.Background()
 	}
 	done := make(chan error, 1)
-	if err := c.enqueue(ctx, command{kind: commandNotify, notify: notification, notifyDone: done}); err != nil {
+	if err := c.enqueue(ctx, command{kind: commandNotify, ctx: ctx, notify: notification, notifyDone: done}); err != nil {
 		return err
 	}
 	select {
 	case err := <-done:
 		return err
 	case <-ctx.Done():
+		c.cancelAnyActiveWrite()
 		return ctx.Err()
 	case <-c.closed:
 		return errClientClosed
@@ -705,7 +735,13 @@ func (c *Client) withdraw(ctx context.Context, key string) cancelOutcome {
 	c.mu.Lock()
 	c.withdrawn[key] = struct{}{}
 	c.mu.Unlock()
-	c.cancelActiveWrite(key)
+	if c.cancelActiveWrite() {
+		// The active writer may belong to another command. There is no way for
+		// this queued cancellation to receive an ordered writer acknowledgement
+		// while that write owns the sole pump, so terminate the generation and
+		// report conservative may-have-written evidence.
+		return cancelOutcome{phase: WriteMayHaveWritten}
+	}
 	ack := make(chan cancelOutcome, 1)
 	select {
 	case c.commands <- command{kind: commandCancel, key: key, ack: ack}:
@@ -841,11 +877,8 @@ func (c *Client) pump() {
 				phase = WriteMayHaveWritten
 			}
 			call.result <- callOutcome{err: &CallError{Err: err, Evidence: WriteEvidence{Phase: phase, Generation: c.generation}, Generation: c.generation}}
-			if phase == WriteMayHaveWritten || phase == WriteComplete {
-				c.retire(key)
-			}
+			c.releaseUnknownReservation(key, phase == WriteMayHaveWritten || phase == WriteComplete)
 			delete(pending, key)
-			c.release(key)
 		}
 		// Resolve requests that were queued but never handed to the transport.
 		// This keeps a close race from turning a proven-before-write request into
@@ -913,7 +946,7 @@ func (c *Client) pump() {
 					// Once ownership enters the transport, a concurrent disconnect
 					// cannot prove that no bytes crossed the boundary.
 					call.phase = WriteMayHaveWritten
-					writeCtx, writeCancel := c.beginWrite(cmd.key, true)
+					writeCtx, writeCancel := c.beginWrite(cmd.ctx, cmd.key, true)
 					err = c.transport.Write(writeCtx, payload)
 					c.endWrite(cmd.key, writeCancel)
 				}
@@ -937,7 +970,7 @@ func (c *Client) pump() {
 			case commandNotify:
 				payload, err := marshalNotification(cmd.notify)
 				if err == nil {
-					writeCtx, writeCancel := c.beginWrite("", false)
+					writeCtx, writeCancel := c.beginWrite(cmd.ctx, "", false)
 					err = c.transport.Write(writeCtx, payload)
 					c.endWrite("", writeCancel)
 				}
@@ -978,6 +1011,14 @@ func (c *Client) pump() {
 				finish(incoming.err)
 				return
 			}
+			if incoming.frame.Type == FrameBinary {
+				finish(errors.New("unexpected binary WebSocket frame"))
+				return
+			}
+			if incoming.frame.Type == FrameClose {
+				finish(errors.New("peer closed WebSocket during JSON-RPC session"))
+				return
+			}
 			if incoming.frame.Type != FrameText {
 				continue
 			}
@@ -997,10 +1038,8 @@ func (c *Client) pump() {
 					continue
 				}
 				delete(pending, key)
-				c.release(key)
 				evidence := WriteEvidence{Phase: call.phase, Generation: c.generation}
-				c.recordCompleted(key, evidence)
-				c.retire(key)
+				c.completeReservation(key, evidence)
 				if msg.serverErr != nil {
 					msg.serverErr.Generation = c.generation
 					call.result <- callOutcome{err: &CallError{Server: msg.serverErr, Evidence: WriteEvidence{Phase: call.phase, Generation: c.generation}, Generation: c.generation}}
@@ -1079,6 +1118,9 @@ func decodeMessage(payload []byte) (decodedMessage, error) {
 		if _, hasError := obj["error"]; hasError {
 			return decodedMessage{}, errors.New("JSON-RPC request/notification cannot contain error")
 		}
+		if len(methodRaw) == 0 || methodRaw[0] != '"' {
+			return decodedMessage{}, errors.New("JSON-RPC method must be a string")
+		}
 		var method string
 		if err := json.Unmarshal(methodRaw, &method); err != nil {
 			return decodedMessage{}, fmt.Errorf("method: %w", err)
@@ -1109,23 +1151,32 @@ func decodeMessage(payload []byte) (decodedMessage, error) {
 		return decodedMessage{}, err
 	}
 	if raw, ok := obj["error"]; ok {
+		if len(raw) == 0 || raw[0] != '{' {
+			return decodedMessage{}, errors.New("JSON-RPC error must be an object")
+		}
 		var e struct {
-			Code    int64           `json:"code"`
-			Message string          `json:"message"`
+			Code    *int64          `json:"code"`
+			Message *string         `json:"message"`
 			Data    json.RawMessage `json:"data"`
 		}
 		if err := json.Unmarshal(raw, &e); err != nil {
 			return decodedMessage{}, fmt.Errorf("error: %w", err)
 		}
-		return decodedMessage{kind: messageResponse, id: id, serverErr: &ServerError{ID: id, Code: e.Code, Message: e.Message, Data: e.Data}}, nil
+		if e.Code == nil || e.Message == nil {
+			return decodedMessage{}, errors.New("JSON-RPC error requires code and message")
+		}
+		return decodedMessage{kind: messageResponse, id: id, serverErr: &ServerError{ID: id, Code: *e.Code, Message: *e.Message, Data: e.Data}}, nil
 	}
 	result := append(json.RawMessage(nil), obj["result"]...)
 	return decodedMessage{kind: messageResponse, id: id, result: result}, nil
 }
 
 func decodeID(raw json.RawMessage) (RequestID, error) {
+	if len(raw) == 0 {
+		return nil, errors.New("JSON-RPC request ID is required")
+	}
 	var s string
-	if json.Unmarshal(raw, &s) == nil {
+	if raw[0] == '"' && json.Unmarshal(raw, &s) == nil {
 		return s, nil
 	}
 	if len(raw) > 0 && raw[0] != '-' && (raw[0] < '0' || raw[0] > '9') {

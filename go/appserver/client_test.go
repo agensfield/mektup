@@ -132,7 +132,7 @@ func TestRawResultServerErrorAndIDs(t *testing.T) {
 			t.Errorf("request id = %v", msg["id"])
 		}
 	}()
-	result, err := c.Call(context.Background(), RPCRequest{ID: int64(1), Method: "thread/read"})
+	result, err := c.call(context.Background(), RPCRequest{ID: int64(1), Method: "thread/read"})
 	if err != nil || string(result.Value) != `{"ok":true}` {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
@@ -140,7 +140,7 @@ func TestRawResultServerErrorAndIDs(t *testing.T) {
 		_ = waitWrite(t, f)
 		pushJSON(f, `{"id":"err","error":{"code":-32603,"message":"nope","data":{"x":1}}}`)
 	}()
-	_, err = c.Call(context.Background(), RPCRequest{ID: "err", Method: "bad"})
+	_, err = c.call(context.Background(), RPCRequest{ID: "err", Method: "bad"})
 	var callErr *CallError
 	if !errors.As(err, &callErr) || callErr.Server == nil || callErr.Server.Code != -32603 || string(callErr.Server.Data) != `{"x":1}` {
 		t.Fatalf("server error = %T %+v", err, err)
@@ -175,7 +175,7 @@ func TestPostWriteDisconnectReportsMayHaveWritten(t *testing.T) {
 		_ = waitWrite(t, f)
 		f.Close()
 	}()
-	_, err := c.Call(context.Background(), RPCRequest{ID: "post", Method: "thread/start"})
+	_, err := c.call(context.Background(), RPCRequest{ID: "post", Method: "thread/start"})
 	var callErr *CallError
 	if !errors.As(err, &callErr) || callErr.Evidence.Phase != WriteMayHaveWritten || callErr.Evidence.Generation != c.Generation() {
 		t.Fatalf("error evidence = %T %+v phase=%v gen=%d", err, err, callErr.Evidence.Phase, callErr.Evidence.Generation)
@@ -197,14 +197,14 @@ func TestCancellationWithdrawsQueuedWriteBeforeClaimingNotSent(t *testing.T) {
 	c := New(f, Options{WriterCapacity: 8})
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := c.Call(context.Background(), RPCRequest{ID: "first", Method: "slow"})
+		_, err := c.call(context.Background(), RPCRequest{ID: "first", Method: "slow"})
 		firstDone <- err
 	}()
 	_ = waitWrite(t, f)
 	ctx, cancel := context.WithCancel(context.Background())
 	secondDone := make(chan error, 1)
 	go func() {
-		_, err := c.Call(ctx, RPCRequest{ID: "second", Method: "never"})
+		_, err := c.call(ctx, RPCRequest{ID: "second", Method: "never"})
 		secondDone <- err
 	}()
 	cancel()
@@ -271,7 +271,7 @@ func TestStalledWriteIsCanceledAndConnectionCloses(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		_, err := c.Call(ctx, RPCRequest{ID: "stall", Method: "slow"})
+		_, err := c.call(ctx, RPCRequest{ID: "stall", Method: "slow"})
 		done <- err
 	}()
 	_ = waitWrite(t, f)
@@ -307,7 +307,7 @@ func TestCanceledBeforeEnqueueReleasesIDForReuse(t *testing.T) {
 	}
 	firstDone := make(chan error, 1)
 	go func() {
-		_, err := c.Call(context.Background(), RPCRequest{ID: "occupy", Method: "slow"})
+		_, err := c.call(context.Background(), RPCRequest{ID: "occupy", Method: "slow"})
 		firstDone <- err
 	}()
 	_ = waitWrite(t, f)
@@ -315,7 +315,7 @@ func TestCanceledBeforeEnqueueReleasesIDForReuse(t *testing.T) {
 	cancel()
 	secondDone := make(chan error, 1)
 	go func() {
-		_, err := c.Call(ctx, RPCRequest{ID: "reuse", Method: "never"})
+		_, err := c.call(ctx, RPCRequest{ID: "reuse", Method: "never"})
 		secondDone <- err
 	}()
 	// The first writer owns the pump. Closing the transport lets it finish so
@@ -343,7 +343,7 @@ func TestCanceledBeforeEnqueueReleasesIDForReuse(t *testing.T) {
 		_ = waitWrite(t, f2)
 		pushJSON(f2, response(`"reuse"`, `true`))
 	}()
-	if _, err := c2.Call(context.Background(), RPCRequest{ID: "reuse", Method: "ok"}); err != nil {
+	if _, err := c2.call(context.Background(), RPCRequest{ID: "reuse", Method: "ok"}); err != nil {
 		t.Fatal(err)
 	}
 	_ = c2.Close(context.Background())
@@ -356,13 +356,13 @@ func TestIDsAreCanonicalStrictAndCompletedIDsAreRetired(t *testing.T) {
 		_ = waitWrite(t, f)
 		pushJSON(f, response(`"ab"`, `true`))
 	}()
-	if _, err := c.Call(context.Background(), RPCRequest{ID: json.RawMessage(`"a\u0062"`), Method: "canonical"}); err != nil {
+	if _, err := c.call(context.Background(), RPCRequest{ID: json.RawMessage(`"a\u0062"`), Method: "canonical"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Call(context.Background(), RPCRequest{ID: "ab", Method: "stale"}); err == nil {
+	if _, err := c.call(context.Background(), RPCRequest{ID: "ab", Method: "stale"}); err == nil {
 		t.Fatal("completed request ID was reusable")
 	}
-	if _, err := c.Call(context.Background(), RPCRequest{ID: uint64(^uint64(0)), Method: "bad"}); err == nil {
+	if _, err := c.call(context.Background(), RPCRequest{ID: uint64(^uint64(0)), Method: "bad"}); err == nil {
 		t.Fatal("unsigned overflow ID was accepted")
 	}
 	_ = c.Close(context.Background())
@@ -373,7 +373,7 @@ func TestIDsAreCanonicalStrictAndCompletedIDsAreRetired(t *testing.T) {
 		_ = waitWrite(t, f2)
 		pushJSON(f2, `{"id":"shape"}`)
 	}()
-	if _, err := c2.Call(context.Background(), RPCRequest{ID: "shape", Method: "shape"}); err == nil {
+	if _, err := c2.call(context.Background(), RPCRequest{ID: "shape", Method: "shape"}); err == nil {
 		t.Fatal("response without result/error was accepted")
 	}
 	_ = c2.Close(context.Background())
@@ -387,4 +387,101 @@ func TestGenerationIncreasesAcrossConnections(t *testing.T) {
 	}
 	_ = c1.Close(context.Background())
 	_ = c2.Close(context.Background())
+}
+
+func TestQueuedCancellationTerminatesUnrelatedStalledWriter(t *testing.T) {
+	f := newFakeTransport()
+	f.onWrite = func([]byte) error {
+		<-f.done
+		return errors.New("closed")
+	}
+	c := New(f, Options{})
+	defer c.Close(context.Background())
+	first := make(chan error, 1)
+	go func() {
+		_, err := c.call(context.Background(), RPCRequest{ID: "first", Method: "blocked"})
+		first <- err
+	}()
+	_ = waitWrite(t, f)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	second := make(chan error, 1)
+	go func() {
+		_, err := c.call(ctx, RPCRequest{ID: "second", Method: "queued"})
+		second <- err
+	}()
+	select {
+	case err := <-second:
+		var callErr *CallError
+		if !errors.As(err, &callErr) || callErr.Evidence.Phase != WriteMayHaveWritten {
+			t.Fatalf("queued cancellation evidence = %T %+v", err, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued cancellation stuck behind unrelated active write")
+	}
+	<-first
+}
+
+func TestHandshakeTimeoutCoversInitializedWrite(t *testing.T) {
+	f := newFakeTransport()
+	f.onWrite = func(payload []byte) error {
+		if string(payload) == `{"method":"initialized"}` {
+			<-f.done
+			return errors.New("closed")
+		}
+		pushJSON(f, `{"id":"initialize","result":{"userAgent":"codex/0.154.0"}}`)
+		return nil
+	}
+	c := New(f, Options{HandshakeTimeout: 10 * time.Millisecond})
+	defer c.Close(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Initialize(context.Background())
+		done <- err
+	}()
+	select {
+	case <-done:
+	case <-time.After(100 * time.Millisecond):
+		f.Close()
+		<-done
+		t.Fatal("handshake timeout did not cover initialized notification")
+	}
+}
+
+func TestMalformedRPCShapesAndBinaryFrameDisconnect(t *testing.T) {
+	for _, payload := range []string{
+		`{"id":"r","error":null}`,
+		`{"id":"r","error":{}}`,
+		`{"method":null}`,
+		`{"id":null,"result":{}}`,
+	} {
+		if _, err := decodeMessage([]byte(payload)); err == nil {
+			t.Errorf("accepted malformed message: %s", payload)
+		}
+	}
+	f := newFakeTransport()
+	c := New(f, Options{})
+	f.reads <- Frame{Type: FrameBinary, Payload: []byte("not JSON-RPC")}
+	select {
+	case event := <-c.Events():
+		if event.Kind != EventDisconnected {
+			t.Fatalf("binary frame event = %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("binary frame did not disconnect client")
+	}
+}
+
+func TestPublicCallRequiresInitialize(t *testing.T) {
+	f := newFakeTransport()
+	c := New(f, Options{})
+	defer c.Close(context.Background())
+	if _, err := c.Call(context.Background(), RPCRequest{ID: "before", Method: "thread/read"}); err == nil {
+		t.Fatal("operational call before initialize unexpectedly dispatched")
+	}
+	select {
+	case write := <-f.writes:
+		t.Fatalf("pre-init call wrote %s", write)
+	default:
+	}
 }
