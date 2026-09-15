@@ -1,6 +1,6 @@
 .PHONY: test test-race vet fmt-check contracts conformance notices govulncheck build
 
-GOVULNCHECK_VERSION ?= v1.8.0
+GOVULNCHECK_VERSION ?= v1.7.0
 
 test:
 	cd go && go test ./...

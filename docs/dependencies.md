@@ -80,8 +80,8 @@ the dependency notices.
 ## Vulnerability scanning
 
 Vulnerability scanning is intentionally separate from archive generation. CI
-and the local Make target use the exact tool version `golang.org/x/vuln`
-`v1.8.0`:
+and the local Make target use `golang.org/x/vuln` `v1.7.0`, the latest pinned
+scanner release whose own module retains Mektup's Go 1.25 toolchain floor:
 
 ```sh
 make govulncheck

@@ -84,7 +84,7 @@ jobs:
           cache-dependency-path: go/go.sum
       - name: Run pinned govulncheck
         working-directory: go
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 ./...
 
   build:
     name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
