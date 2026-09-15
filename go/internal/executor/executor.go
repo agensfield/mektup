@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	mektup "github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/internal/artifact"
 	"github.com/agensfield/mektup/go/internal/cli"
 	"github.com/agensfield/mektup/go/internal/codexapi"
@@ -227,15 +228,10 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 	if err != nil {
 		return cli.ExecutionResult{}, err
 	}
-	if has(inv, "name") {
-		if _, ok := api.(ThreadNameSetter); !ok {
-			return cli.ExecutionResult{}, missing("thread/name/set adapter")
-		}
-	}
 	defer func() {
 		if closeErr := conn.Close(); closeErr != nil {
 			if execErr == nil {
-				result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+				appendCleanupWarning(&result, closeErr)
 			} else if existing, ok := execErr.(*cli.Error); ok {
 				if existing.Details == nil {
 					existing.Details = map[string]any{}
@@ -244,6 +240,11 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 			}
 		}
 	}()
+	if has(inv, "name") {
+		if _, ok := api.(ThreadNameSetter); !ok {
+			return cli.ExecutionResult{}, missing("thread/name/set adapter")
+		}
+	}
 	sub := inv.Position[0]
 	var data any
 	var kind string
@@ -359,7 +360,7 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (result cli.E
 	defer func() {
 		if closeErr := conn.Close(); closeErr != nil {
 			if execErr == nil {
-				result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+				appendCleanupWarning(&result, closeErr)
 			} else if existing, ok := execErr.(*cli.Error); ok {
 				if existing.Details == nil {
 					existing.Details = map[string]any{}
@@ -586,6 +587,9 @@ func (e *Executor) rpc(ctx context.Context, inv cli.Invocation) (result cli.Exec
 	if e.ports.Receipts == nil {
 		return cli.ExecutionResult{}, missing("receipt journal")
 	}
+	if has(inv, "force") && !has(inv, "output") {
+		return cli.ExecutionResult{}, usage("--force requires --output")
+	}
 	params, source, err := e.params(ctx, inv)
 	if err != nil {
 		return cli.ExecutionResult{}, err
@@ -597,7 +601,7 @@ func (e *Executor) rpc(ctx context.Context, inv cli.Invocation) (result cli.Exec
 	defer func() {
 		if closeErr := conn.Close(); closeErr != nil {
 			if execErr == nil {
-				result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+				appendCleanupWarning(&result, closeErr)
 			} else if existing, ok := execErr.(*cli.Error); ok {
 				if existing.Details == nil {
 					existing.Details = map[string]any{}
@@ -743,7 +747,11 @@ func (e *Executor) resultEnvelope(ctx context.Context, eventKind, resultKind, fi
 		}
 	}
 	eventMachine := map[string]any{"event": eventKind + ".completed", "terminal": true, "ok": true, "data": payload}
-	if operationID := receiptOperationID(receipt); operationID != "" {
+	if receipt != nil {
+		operationID, err := receiptOperationID(receipt)
+		if err != nil {
+			return cli.ExecutionResult{}, err
+		}
 		eventMachine["operationId"] = operationID
 	}
 	if len(warnings) != 0 {
@@ -785,20 +793,23 @@ func responseThreadArray(raw json.RawMessage) any {
 	return []any{}
 }
 
-func receiptOperationID(receipt any) string {
+func receiptOperationID(receipt any) (string, error) {
 	if receipt == nil {
-		return ""
+		return "", &cli.Error{Code: "internal_error", Message: "receipt is missing operationId", Effect: "unknown", Exit: cli.ExitInternal}
 	}
 	encoded, err := json.Marshal(receipt)
 	if err != nil {
-		return ""
+		return "", &cli.Error{Code: "internal_error", Message: "receipt operationId is not serializable", Effect: "unknown", Exit: cli.ExitInternal}
 	}
 	var object map[string]any
 	if json.Unmarshal(encoded, &object) != nil {
-		return ""
+		return "", &cli.Error{Code: "internal_error", Message: "receipt operationId is malformed", Effect: "unknown", Exit: cli.ExitInternal}
 	}
 	value, _ := object["operationId"].(string)
-	return value
+	if err := mektup.ValidateID(value, mektup.OperationIDPrefix); err != nil {
+		return "", &cli.Error{Code: "internal_error", Message: "receipt operationId is invalid: " + err.Error(), Effect: "unknown", Exit: cli.ExitInternal}
+	}
+	return value, nil
 }
 
 func warningObjects(warnings []string) []map[string]any {
@@ -974,8 +985,17 @@ func mapError(err error, effect string) error {
 	return &cli.Error{Code: "internal_error", Message: err.Error(), Effect: effect, Details: map[string]any{"cause": err.Error()}, Exit: cli.ExitInternal}
 }
 
-func cleanupError(err error) error {
-	return &cli.Error{Code: "cleanup_incomplete", Message: "connection cleanup failed: " + err.Error(), Effect: "accepted", Details: map[string]any{"error": err.Error()}, Exit: cli.ExitInternal}
+func appendCleanupWarning(result *cli.ExecutionResult, err error) {
+	result.Exit = cli.ExitInternal
+	warning := map[string]any{"code": "cleanup_incomplete", "message": "connection cleanup failed", "details": map[string]any{"error": err.Error()}}
+	for index := range result.Events {
+		machine, ok := result.Events[index].Machine.(map[string]any)
+		if !ok {
+			continue
+		}
+		warnings, _ := machine["warnings"].([]map[string]any)
+		machine["warnings"] = append(warnings, warning)
+	}
 }
 
 func nonempty(a, b string) string {

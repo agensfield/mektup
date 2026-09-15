@@ -61,6 +61,33 @@ func (f fakeCodex) SearchOccurrences(context.Context, codexapi.SearchOccurrences
 	return codexapi.SearchOccurrencesResponse{Raw: json.RawMessage(`{"data":[],"nextCursor":"scoped"}`), NextCursor: "scoped"}, nil
 }
 
+type noNameCodex struct{}
+
+func (noNameCodex) ThreadList(c context.Context, o codexapi.ThreadListOptions) (codexapi.ThreadListResponse, error) {
+	return fakeCodex{}.ThreadList(c, o)
+}
+func (noNameCodex) ThreadRead(c context.Context, o codexapi.ThreadReadOptions) (codexapi.ThreadReadResponse, error) {
+	return fakeCodex{}.ThreadRead(c, o)
+}
+func (noNameCodex) ThreadTurns(c context.Context, o codexapi.TurnsOptions) (codexapi.ThreadTurnsResponse, error) {
+	return fakeCodex{}.ThreadTurns(c, o)
+}
+func (noNameCodex) ThreadItems(c context.Context, o codexapi.ItemsOptions) (codexapi.ThreadItemsResponse, error) {
+	return fakeCodex{}.ThreadItems(c, o)
+}
+func (noNameCodex) ThreadStart(c context.Context, o codexapi.StartOptions) (codexapi.ThreadStartResponse, error) {
+	return fakeCodex{}.ThreadStart(c, o)
+}
+func (noNameCodex) ThreadResume(c context.Context, o codexapi.ResumeOptions) (codexapi.ThreadResumeResponse, error) {
+	return fakeCodex{}.ThreadResume(c, o)
+}
+func (noNameCodex) ThreadFork(c context.Context, o codexapi.ForkOptions) (codexapi.ThreadForkResponse, error) {
+	return fakeCodex{}.ThreadFork(c, o)
+}
+func (noNameCodex) Search(c context.Context, o codexapi.SearchOptions) (codexapi.SearchResponse, error) {
+	return fakeCodex{}.Search(c, o)
+}
+
 type fakeConnection struct{ api Codex }
 
 func (f *fakeConnection) Codex() Codex       { return f.api }
@@ -141,7 +168,7 @@ func (f *fakeReceipts) Mutation(_ context.Context, _ string, _ string, payload a
 	// The fake intentionally retains the input so privacy tests can inspect
 	// exactly what would have crossed the journal boundary.
 	f.payloads = append(f.payloads, payload)
-	returnValue := map[string]any{"schema": "mektup/receipt/v1", "receiptId": "rcpt_test", "state": "accepted"}
+	returnValue := map[string]any{"schema": "mektup/receipt/v1", "receiptId": "rcpt_test", "operationId": "op_00000000-0000-7000-8000-000000000000", "state": "accepted"}
 	return returnValue, nil
 }
 
@@ -283,6 +310,57 @@ func TestThreadNameFailureCarriesPartialEffectEvidence(t *testing.T) {
 	var ce *cli.Error
 	if !errors.As(err, &ce) || ce.Effect != "accepted" || ce.Details["partialEffect"] != true || ce.Details["creationState"] != "accepted" || ce.Details["nameEffect"] != "unknown" || receipts.count != 1 {
 		t.Fatalf("err=%v receipts=%d", err, receipts.count)
+	}
+}
+
+type trackingConnection struct {
+	api    Codex
+	closed int
+}
+
+func (c *trackingConnection) Codex() Codex       { return c.api }
+func (c *trackingConnection) RPC() rawrpc.Caller { return nil }
+func (c *trackingConnection) Warnings() []string { return nil }
+func (c *trackingConnection) Close() error       { c.closed++; return nil }
+
+type trackingFactory struct{ conn *trackingConnection }
+
+func (f trackingFactory) Open(context.Context, string) (Connection, error) { return f.conn, nil }
+func (f trackingFactory) Check(context.Context, string) (any, error)       { return nil, nil }
+
+func TestNameAdapterPreflightClosesConnection(t *testing.T) {
+	conn := &trackingConnection{api: noNameCodex{}}
+	e := New(Ports{Connections: trackingFactory{conn: conn}, Receipts: &fakeReceipts{}})
+	start := invocation("thread", "start")
+	start.Options["name"] = []string{"session"}
+	if _, err := e.Execute(context.Background(), start); err == nil {
+		t.Fatal("missing name adapter was accepted")
+	}
+	if conn.closed != 1 {
+		t.Fatalf("connection cleanup count=%d", conn.closed)
+	}
+}
+
+type noOperationReceipt struct{}
+
+func (noOperationReceipt) Mutation(context.Context, string, string, any) (any, error) {
+	return map[string]any{"schema": "mektup/receipt/v1", "receiptId": "rcpt_test", "state": "accepted"}, nil
+}
+
+func TestReceiptWithoutOperationIdentityFailsClosed(t *testing.T) {
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}, Receipts: noOperationReceipt{}})
+	if _, err := e.Execute(context.Background(), invocation("thread", "start")); err == nil {
+		t.Fatal("receipt without operation identity was accepted")
+	}
+}
+
+func TestForceWithoutOutputIsUsageError(t *testing.T) {
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}, RPC: &fakeRPC{}, Receipts: &fakeReceipts{}})
+	i := invocation("rpc", "thread/read")
+	i.Options["force"] = []string{"true"}
+	var ce *cli.Error
+	if _, err := e.Execute(context.Background(), i); !errors.As(err, &ce) || ce.Exit != cli.ExitUsage {
+		t.Fatalf("err=%v", err)
 	}
 }
 
