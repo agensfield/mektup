@@ -119,58 +119,163 @@ func ValidateControlRequest(data []byte) (ControlRequest, error) {
 }
 
 func validateKnownFields(raw map[string]json.RawMessage) error {
-	for _, field := range []string{"bodySha256", "replyStatus", "replyErrorCode", "fencingToken", "attemptOwner", "requestedAt"} {
-		value, present := raw[field]
-		if !present {
-			continue
-		}
-		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			return fmt.Errorf("%w: known field %s cannot be null", ErrControlValidation, field)
-		}
-		var textValue string
-		if err := json.Unmarshal(value, &textValue); err != nil || textValue == "" {
-			return fmt.Errorf("%w: known field %s must be a nonempty string", ErrControlValidation, field)
-		}
-		switch field {
-		case "bodySha256":
-			if !validSHA256(textValue) {
-				return fmt.Errorf("%w: bodySha256 must be sha256:<64 lowercase hex>", ErrControlValidation)
+	stringChecks := []struct {
+		field string
+		check func(string) bool
+	}{
+		{"schema", func(v string) bool { return v == "mektup/control/v1" }},
+		{"kind", func(v string) bool { return v == "request" || v == "result" }},
+		{"operation", func(v string) bool {
+			switch v {
+			case "claim", "heartbeat", "commit", "abandon", "status", "reconcile":
+				return true
 			}
-		case "replyStatus":
-			if textValue != "success" && textValue != "error" {
-				return fmt.Errorf("%w: invalid reply status", ErrControlValidation)
-			}
-		case "requestedAt":
-			if !validTimestamp(textValue) {
-				return fmt.Errorf("%w: invalid requestedAt timestamp", ErrControlValidation)
+			return false
+		}},
+		{"operationId", func(v string) bool { return validID(v, "op_") }},
+		{"receiptId", func(v string) bool { return validID(v, "rcpt_") }},
+		{"replyMessageId", func(v string) bool { return validID(v, "msg_") }},
+		{"originalMessageId", func(v string) bool { return validID(v, "msg_") }},
+		{"bodySha256", validSHA256},
+		{"replyStatus", func(v string) bool { return v == "success" || v == "error" }},
+		{"replyErrorCode", func(v string) bool { return v != "" }},
+		{"fencingToken", func(v string) bool { return v != "" }},
+		{"attemptOwner", func(v string) bool { return v != "" }},
+		{"requestedAt", validTimestamp},
+	}
+	for _, item := range stringChecks {
+		if value, present := raw[item.field]; present {
+			textValue, err := rawString(value, item.field)
+			if err != nil || !item.check(textValue) {
+				return fmt.Errorf("%w: invalid known field %s", ErrControlValidation, item.field)
 			}
 		}
 	}
 	if value, present := raw["bodyBytes"]; present {
-		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			return fmt.Errorf("%w: bodyBytes cannot be null", ErrControlValidation)
-		}
-		var number int64
-		if err := json.Unmarshal(value, &number); err != nil || number < 0 {
+		if number, err := rawInt(value, "bodyBytes"); err != nil || number < 0 {
 			return fmt.Errorf("%w: bodyBytes must be a nonnegative integer", ErrControlValidation)
 		}
 	}
 	if value, present := raw["requestedLease"]; present {
-		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			return fmt.Errorf("%w: requestedLease cannot be null", ErrControlValidation)
+		object, err := rawObject(value, "requestedLease")
+		if err != nil {
+			return err
 		}
-		var lease LeaseRequest
-		if err := json.Unmarshal(value, &lease); err != nil || lease.DurationMS <= 0 {
-			return fmt.Errorf("%w: requestedLease must contain a positive durationMs", ErrControlValidation)
+		if duration, ok := object["durationMs"]; !ok {
+			return fmt.Errorf("%w: requestedLease requires durationMs", ErrControlValidation)
+		} else if number, err := rawInt(duration, "requestedLease.durationMs"); err != nil || number <= 0 {
+			return fmt.Errorf("%w: requestedLease durationMs must be positive", ErrControlValidation)
 		}
 	}
 	if value, present := raw["lease"]; present {
-		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
-			return fmt.Errorf("%w: lease cannot be null", ErrControlValidation)
+		if err := validateLeaseObject(value); err != nil {
+			return err
 		}
-		var lease Lease
-		if err := json.Unmarshal(value, &lease); err != nil || !lease.valid() {
-			return fmt.Errorf("%w: invalid lease", ErrControlValidation)
+	}
+	if value, present := raw["custody"]; present {
+		object, err := rawObject(value, "custody")
+		if err != nil {
+			return err
+		}
+		if err := validateRawID(object, "endpointId", "ep_"); err != nil {
+			return err
+		}
+		if err := validateRawID(object, "storeId", "store_"); err != nil {
+			return err
+		}
+	}
+	if value, present := raw["replyDestination"]; present {
+		object, err := rawObject(value, "replyDestination")
+		if err != nil {
+			return err
+		}
+		if err := validateRawID(object, "endpointId", "ep_"); err != nil {
+			return err
+		}
+		if thread, ok := object["threadId"]; !ok {
+			return fmt.Errorf("%w: replyDestination requires threadId", ErrControlValidation)
+		} else if textValue, err := rawString(thread, "replyDestination.threadId"); err != nil || textValue == "" {
+			return fmt.Errorf("%w: invalid replyDestination.threadId", ErrControlValidation)
+		}
+		if uri, ok := object["uri"]; ok {
+			textValue, err := rawString(uri, "replyDestination.uri")
+			if err != nil || !validURI(textValue) {
+				return fmt.Errorf("%w: invalid replyDestination.uri", ErrControlValidation)
+			}
+		}
+	}
+	if value, present := raw["result"]; present {
+		if _, err := rawObject(value, "result"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rawString(value json.RawMessage, field string) (string, error) {
+	if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return "", fmt.Errorf("%w: %s cannot be null", ErrControlValidation, field)
+	}
+	var result string
+	if err := json.Unmarshal(value, &result); err != nil || result == "" {
+		return "", fmt.Errorf("%w: %s must be a nonempty string", ErrControlValidation, field)
+	}
+	return result, nil
+}
+
+func rawInt(value json.RawMessage, field string) (int64, error) {
+	if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return 0, fmt.Errorf("%w: %s cannot be null", ErrControlValidation, field)
+	}
+	var result int64
+	if err := json.Unmarshal(value, &result); err != nil {
+		return 0, fmt.Errorf("%w: %s must be an integer", ErrControlValidation, field)
+	}
+	return result, nil
+}
+
+func rawObject(value json.RawMessage, field string) (map[string]json.RawMessage, error) {
+	if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+		return nil, fmt.Errorf("%w: %s cannot be null", ErrControlValidation, field)
+	}
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(value, &result); err != nil || result == nil {
+		return nil, fmt.Errorf("%w: %s must be an object", ErrControlValidation, field)
+	}
+	return result, nil
+}
+
+func validateRawID(object map[string]json.RawMessage, field, prefix string) error {
+	value, ok := object[field]
+	if !ok {
+		return fmt.Errorf("%w: missing %s", ErrControlValidation, field)
+	}
+	textValue, err := rawString(value, field)
+	if err != nil || !validID(textValue, prefix) {
+		return fmt.Errorf("%w: invalid %s", ErrControlValidation, field)
+	}
+	return nil
+}
+
+func validateLeaseObject(value json.RawMessage) error {
+	object, err := rawObject(value, "lease")
+	if err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		field    string
+		required bool
+	}{{"expiresAt", true}, {"acquiredAt", false}, {"heartbeatAt", false}} {
+		value, present := object[item.field]
+		if !present {
+			if item.required {
+				return fmt.Errorf("%w: lease requires expiresAt", ErrControlValidation)
+			}
+			continue
+		}
+		textValue, valueErr := rawString(value, "lease."+item.field)
+		if valueErr != nil || !validTimestamp(textValue) {
+			return fmt.Errorf("%w: invalid lease.%s", ErrControlValidation, item.field)
 		}
 	}
 	return nil
@@ -295,6 +400,9 @@ func validID(value, prefix string) bool {
 
 func validTimestamp(value string) bool {
 	if len(value) < len("2006-01-02T15:04:05.0Z") || !strings.HasSuffix(value, "Z") {
+		return false
+	}
+	if len(value) <= 19 || value[19] != '.' {
 		return false
 	}
 	_, err := time.Parse(time.RFC3339Nano, value)
