@@ -16,7 +16,10 @@ import (
 	"github.com/agensfield/mektup/go/internal/rpcmeta"
 )
 
-type fakeCodex struct{ scoped bool }
+type fakeCodex struct {
+	scoped    bool
+	allowName bool
+}
 
 func (f fakeCodex) ThreadList(context.Context, codexapi.ThreadListOptions) (codexapi.ThreadListResponse, error) {
 	return codexapi.ThreadListResponse{Raw: json.RawMessage(`{"data":[],"nextCursor":"next"}`), NextCursor: "next"}, nil
@@ -31,13 +34,20 @@ func (f fakeCodex) ThreadItems(context.Context, codexapi.ItemsOptions) (codexapi
 	return codexapi.ThreadItemsResponse{Raw: json.RawMessage(`{"data":[],"nextCursor":"items"}`), NextCursor: "items"}, nil
 }
 func (f fakeCodex) ThreadStart(context.Context, codexapi.StartOptions) (codexapi.ThreadStartResponse, error) {
-	return codexapi.ThreadStartResponse{Raw: json.RawMessage(`{"thread":{"id":"thr_new"}}`)}, nil
+	return codexapi.ThreadStartResponse{Thread: codexapi.Thread{ID: "thr_new"}, Raw: json.RawMessage(`{"thread":{"id":"thr_new"}}`)}, nil
 }
 func (f fakeCodex) ThreadResume(context.Context, codexapi.ResumeOptions) (codexapi.ThreadResumeResponse, error) {
 	return codexapi.ThreadResumeResponse{Raw: json.RawMessage(`{"thread":{"id":"thr_resume"}}`)}, nil
 }
 func (f fakeCodex) ThreadFork(context.Context, codexapi.ForkOptions) (codexapi.ThreadForkResponse, error) {
-	return codexapi.ThreadForkResponse{Raw: json.RawMessage(`{"thread":{"id":"thr_fork"}}`)}, nil
+	return codexapi.ThreadForkResponse{Thread: codexapi.Thread{ID: "thr_fork"}, Raw: json.RawMessage(`{"thread":{"id":"thr_fork"}}`)}, nil
+}
+
+func (f fakeCodex) ThreadSetName(context.Context, string, string) (any, error) {
+	if !f.allowName {
+		return nil, errors.New("thread/name/set failed")
+	}
+	return map[string]any{"ok": true}, nil
 }
 func (f fakeCodex) Search(context.Context, codexapi.SearchOptions) (codexapi.SearchResponse, error) {
 	return codexapi.SearchResponse{Raw: json.RawMessage(`{"data":[],"nextCursor":"search"}`), NextCursor: "search"}, nil
@@ -231,7 +241,7 @@ func TestEndpointAddLeavesIDEmptyForStoreGeneration(t *testing.T) {
 }
 
 func TestThreadNameIsForwardedOrRejectedRatherThanIgnored(t *testing.T) {
-	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}, Receipts: &fakeReceipts{}})
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{allowName: true}}}, Receipts: &fakeReceipts{}})
 	start := invocation("thread", "start")
 	start.Options["name"] = []string{"session-name"}
 	if _, err := e.Execute(context.Background(), start); err != nil {
@@ -239,8 +249,20 @@ func TestThreadNameIsForwardedOrRejectedRatherThanIgnored(t *testing.T) {
 	}
 	fork := invocation("thread", "fork", "thr_1")
 	fork.Options["name"] = []string{"session-name"}
-	if _, err := e.Execute(context.Background(), fork); err == nil {
-		t.Fatal("thread fork silently accepted unsupported --name")
+	if _, err := e.Execute(context.Background(), fork); err != nil {
+		t.Fatalf("thread fork name was not applied through the semantic adapter: %v", err)
+	}
+}
+
+func TestThreadNameFailureCarriesPartialEffectEvidence(t *testing.T) {
+	receipts := &fakeReceipts{}
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}, Receipts: receipts})
+	start := invocation("thread", "start")
+	start.Options["name"] = []string{"session-name"}
+	_, err := e.Execute(context.Background(), start)
+	var ce *cli.Error
+	if !errors.As(err, &ce) || ce.Effect != "unknown" || ce.Details["partialEffect"] != true || receipts.count != 1 {
+		t.Fatalf("err=%v receipts=%d", err, receipts.count)
 	}
 }
 

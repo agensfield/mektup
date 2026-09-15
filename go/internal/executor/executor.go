@@ -48,6 +48,13 @@ type ScopedSearcher interface {
 	SearchOccurrences(context.Context, codexapi.SearchOccurrencesOptions) (codexapi.SearchOccurrencesResponse, error)
 }
 
+// ThreadNameSetter is the semantic adapter for the separate
+// thread/name/set mutation. It is optional on Codex so older adapters cannot
+// accidentally treat --name as a start/fork field.
+type ThreadNameSetter interface {
+	ThreadSetName(context.Context, string, string) (any, error)
+}
+
 // Connection is an already initialized, compatibility-gated endpoint. Check
 // is intentionally separate from Open so endpoint check cannot start a daemon.
 type Connection interface {
@@ -235,9 +242,14 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 		data, cursor = pageData(r.Raw, r, r.NextCursor)
 		kind = "thread.items"
 	case "start":
-		r, callErr := api.ThreadStart(ctx, codexapi.StartOptions{Model: inv.Option("model"), CWD: inv.Option("cwd"), ServiceName: inv.Option("name"), ThreadSource: inv.Option("source")})
+		r, callErr := api.ThreadStart(ctx, codexapi.StartOptions{Model: inv.Option("model"), CWD: inv.Option("cwd"), ThreadSource: inv.Option("source")})
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
+		}
+		if name := inv.Option("name"); name != "" {
+			if callErr := e.setThreadName(ctx, api, name, r.Thread.ID, r.Raw, "thread.start", inv.Resolved.Endpoint); callErr != nil {
+				return cli.ExecutionResult{}, callErr
+			}
 		}
 		data, kind = rawOr(r.Raw, r), "thread.start"
 	case "resume":
@@ -253,12 +265,14 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread fork requires a thread identifier")
 		}
-		if inv.Option("name") != "" {
-			return cli.ExecutionResult{}, usage("--name is not supported for thread fork by the pinned app-server")
-		}
 		r, callErr := api.ThreadFork(ctx, codexapi.ForkOptions{ThreadID: inv.Position[1], ThroughTurnID: inv.Option("through-turn"), BeforeTurnID: inv.Option("before-turn"), ExactRead: nil})
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
+		}
+		if name := inv.Option("name"); name != "" {
+			if callErr := e.setThreadName(ctx, api, name, r.Thread.ID, r.Raw, "thread.fork", inv.Resolved.Endpoint); callErr != nil {
+				return cli.ExecutionResult{}, callErr
+			}
 		}
 		data, kind = rawOr(r.Raw, r), "thread.fork"
 	default:
@@ -559,6 +573,39 @@ func (e *Executor) result(ctx context.Context, kind string, data any, cursor str
 		result.Receipt = receipt
 	}
 	return result, nil
+}
+
+func (e *Executor) setThreadName(ctx context.Context, api Codex, name, threadID string, raw json.RawMessage, operation, endpointID string) error {
+	if threadID == "" {
+		var envelope struct {
+			Thread struct {
+				ID string `json:"id"`
+			} `json:"thread"`
+		}
+		_ = json.Unmarshal(raw, &envelope)
+		threadID = envelope.Thread.ID
+	}
+	setter, ok := api.(ThreadNameSetter)
+	if !ok {
+		return e.partialNameFailure(ctx, operation, endpointID, threadID, name, errors.New("thread/name/set adapter is not configured"))
+	}
+	if _, err := setter.ThreadSetName(ctx, threadID, name); err != nil {
+		return e.partialNameFailure(ctx, operation, endpointID, threadID, name, err)
+	}
+	return nil
+}
+
+func (e *Executor) partialNameFailure(ctx context.Context, operation, endpointID, threadID, name string, cause error) error {
+	details := map[string]any{"partialEffect": true, "threadId": threadID, "name": name, "cause": cause.Error()}
+	if e.ports.Receipts != nil {
+		receipt, err := e.ports.Receipts.Mutation(ctx, operation, endpointID, details)
+		if err != nil {
+			details["receiptError"] = err.Error()
+		} else if receipt != nil {
+			details["receipt"] = receipt
+		}
+	}
+	return &cli.Error{Code: "internal_error", Message: "thread was created but naming failed", Effect: "unknown", Details: details, Exit: cli.ExitInternal}
 }
 
 func rawOr(raw json.RawMessage, value any) any {
