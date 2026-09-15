@@ -50,9 +50,9 @@ type fakeDelivery struct {
 }
 type deliveryCall struct{ thread, text, id string }
 
-func (d *fakeDelivery) Send(ctx context.Context, thread, text, id string) (DeliveryResult, error) {
+func (d *fakeDelivery) Send(ctx context.Context, target ResolvedTarget, text, id string) (DeliveryResult, error) {
 	d.mu.Lock()
-	d.calls = append(d.calls, deliveryCall{thread, text, id})
+	d.calls = append(d.calls, deliveryCall{target.ThreadID, text, id})
 	d.mu.Unlock()
 	if d.gate != nil {
 		select {
@@ -121,7 +121,8 @@ func (j *fakeJournal) RecordResult(_ context.Context, opID string, state mektup.
 	}
 	return nil
 }
-func (j *fakeJournal) markedCount() int { j.mu.Lock(); defer j.mu.Unlock(); return len(j.marked) }
+func (j *fakeJournal) ExpireClaims(context.Context) error { return nil }
+func (j *fakeJournal) markedCount() int                   { j.mu.Lock(); defer j.mu.Unlock(); return len(j.marked) }
 func (j *fakeJournal) Lookup(_ context.Context, ref string) (OperationStatus, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -203,8 +204,8 @@ func TestSendPreflightsMeasuredEnvelopeBeforeJournalOrWrite(t *testing.T) {
 	if d.count() != 0 || len(j.prepared) != 0 {
 		t.Fatalf("oversized body crossed preflight: writes=%d prepared=%d", d.count(), len(j.prepared))
 	}
-	if se.Details["bytes"].(int) <= MaxInputBytes {
-		t.Fatalf("missing measured byte evidence: %#v", se.Details)
+	if se.Details["inputChars"].(int) <= MaxInputChars || se.Details["inputBytes"].(int) == 0 || se.Details["envelopeOverheadBytes"].(int) == 0 {
+		t.Fatalf("missing measured size evidence: %#v", se.Details)
 	}
 }
 
@@ -246,6 +247,55 @@ func TestRecognizedNotSubmittedRetriesPinnedTargetAndIDOnce(t *testing.T) {
 	}
 }
 
+type repeatedReviewDelivery struct{ calls int }
+
+func (d *repeatedReviewDelivery) Send(context.Context, ResolvedTarget, string, string) (DeliveryResult, error) {
+	d.calls++
+	if d.calls < 3 {
+		return DeliveryResult{}, &DeliveryError{Server: &codexapi.ServerError{Code: -32603, Message: "failed to submit turn input: ActiveTurnNotSteerable { turn_kind: Review }"}, Phase: WriteComplete}
+	}
+	return DeliveryResult{Accepted: true, TurnID: "turn-repeat", Evidence: "accepted"}, nil
+}
+func (*repeatedReviewDelivery) Resume(context.Context, ResolvedTarget) (string, error) {
+	return "", nil
+}
+func (*repeatedReviewDelivery) Detach(context.Context, ResolvedTarget) error { return nil }
+
+func TestRecognizedNotSubmittedRetriesUntilDeadlineNotFixedAttemptCount(t *testing.T) {
+	r := baseResolver()
+	d := &repeatedReviewDelivery{}
+	j := newFakeJournal()
+	s := &Service{Resolver: &r, Delivery: d, Journal: j}
+	if _, err := s.Send(context.Background(), SendRequest{Target: "target", Body: "hello", DeliveryTimeout: time.Second}); err != nil {
+		t.Fatal(err)
+	}
+	if d.calls != 3 {
+		t.Fatalf("recognized temporary rejection stopped after %d calls", d.calls)
+	}
+}
+
+func TestGenericInternalServerErrorIsUnknown(t *testing.T) {
+	state, _, retry := classifyDelivery(&DeliveryError{Server: &codexapi.ServerError{Code: -32603, Message: "backend failed after submission"}, Phase: WriteComplete})
+	if state != mektup.StateOutcomeUnknown || retry {
+		t.Fatalf("generic internal error mapped to %s retry=%v", state, retry)
+	}
+}
+
+func TestReplyObservationUsesReplyBodyDigestAndPinnedReplyRoute(t *testing.T) {
+	r := baseResolver()
+	status := OperationStatus{Operation: Operation{MessageID: "msg_18999999-9999-7999-8999-999999999999", SourceRoute: "codex://local/thread/source", ReplyRoute: "codex://local/thread/source", ReplyRequested: true}, ReplyDigest: digest("answer"), ReplyBodySize: 6}
+	e := mektup.Envelope{MessageID: "msg_19999999-9999-7999-8999-999999999999", Kind: mektup.KindReply, FromEndpointID: epTarget, From: r.target.URI, FromKind: "agent", ToEndpointID: epSource, To: status.ReplyRoute, RequestedTarget: status.ReplyRoute, InReplyTo: status.MessageID, ReplyStatus: mektup.ReplySuccess, Body: "answer", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	e.PayloadBytes = uint64(len(e.Body))
+	e.PayloadSHA256 = digest(e.Body)
+	payload, err := mektup.RenderEnvelope(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateObservedEnvelope(ObservedItem{ThreadID: "source", NativeItemID: "native", ClientMessageID: e.MessageID, Text: string(payload)}, status, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type countingDelivery struct {
 	inner        *fakeDelivery
 	firstErr     error
@@ -253,9 +303,9 @@ type countingDelivery struct {
 	ids, threads []string
 }
 
-func (d *countingDelivery) Send(ctx context.Context, thread, text, id string) (DeliveryResult, error) {
+func (d *countingDelivery) Send(ctx context.Context, target ResolvedTarget, text, id string) (DeliveryResult, error) {
 	d.ids = append(d.ids, id)
-	d.threads = append(d.threads, thread)
+	d.threads = append(d.threads, target.ThreadID)
 	*d.calls++
 	if *d.calls == 1 {
 		return DeliveryResult{}, d.firstErr
@@ -345,6 +395,24 @@ func TestReplyCommitFailureDoesNotClaimAcceptance(t *testing.T) {
 	}
 }
 
+func TestReplyResumesAndDetachesUnloadedPersistentReturnTarget(t *testing.T) {
+	r := baseResolver()
+	r.pinned.Loaded = false
+	r.pinned.Persistent = true
+	d := &fakeDelivery{}
+	j := newFakeJournal()
+	original := mektup.Envelope{MessageID: "msg_20999999-9999-7999-8999-999999999999", Kind: mektup.KindMessage, FromEndpointID: epSource, From: r.source.URI, FromKind: "agent", ToEndpointID: epTarget, To: r.target.URI, RequestedTarget: "target", ReplyRequested: true, ReplyEndpointID: epSource, ReplyTo: r.source.URI, ReplyCustodyEndpointID: epSource, ReplyCustodyStoreID: storeID, Body: "request", Provenance: "observed"}
+	original.PayloadBytes = uint64(len(original.Body))
+	original.PayloadSHA256 = digest(original.Body)
+	original.SentAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := validService(&r, d, j).Reply(context.Background(), originalResolver{original: OriginalMessage{Envelope: original, CurrentThread: r.target.URI}}, ReplyRequest{Reference: original.MessageID, Body: "answer"}); err != nil {
+		t.Fatal(err)
+	}
+	if d.resume != 1 || d.detach != 1 {
+		t.Fatalf("persistent reply residency not closed: resume=%d detach=%d", d.resume, d.detach)
+	}
+}
+
 type originalResolver struct{ original OriginalMessage }
 
 func (r originalResolver) ResolveOriginal(context.Context, string) (OriginalMessage, error) {
@@ -370,12 +438,30 @@ func TestWaitGapReturnsIncompleteWithoutInventingReply(t *testing.T) {
 	}
 }
 
+func TestWaitTerminalErrorReplyIsRejectedAndReceiptIsValid(t *testing.T) {
+	r := baseResolver()
+	d := &fakeDelivery{}
+	j := newFakeJournal()
+	op := Operation{OperationID: "op_15999999-9999-7999-8999-999999999999", MessageID: "msg_16999999-9999-7999-8999-999999999999", SourceRoute: r.source.URI, TargetRoute: r.target.URI, ReplyRoute: r.source.URI, Semantics: "message", Digest: digest("question"), BodySize: 8, ReplyRequested: true, SourceEndpointID: epSource, TargetEndpointID: epTarget}
+	j.ops[op.MessageID] = OperationStatus{Operation: op, State: mektup.StateReplyAccepted, ReplyID: "msg_17999999-9999-7999-8999-999999999999", ReplyStatus: "error"}
+	got, err := validService(&r, d, j).Wait(context.Background(), WaitRequest{Reference: op.MessageID})
+	var se *Error
+	if !errors.As(err, &se) || se.Code != mektup.ErrDeliveryRejected {
+		t.Fatalf("wait error = %v", err)
+	}
+	if validateErr := got.Receipt.Validate(); validateErr != nil {
+		t.Fatalf("error reply receipt invalid: %v", validateErr)
+	}
+}
+
 type gapObservation struct{}
 
-func (gapObservation) Subscribe(context.Context, string) (EventStream, error) {
+func (gapObservation) Subscribe(context.Context, ResolvedTarget) (EventStream, error) {
 	return gapStream{}, nil
 }
-func (gapObservation) FullHistory(context.Context, string) ([]ObservedItem, error) { return nil, nil }
+func (gapObservation) FullHistory(context.Context, ResolvedTarget) ([]ObservedItem, error) {
+	return nil, nil
+}
 
 type gapStream struct{}
 

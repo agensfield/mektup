@@ -10,10 +10,11 @@ import (
 func preflight(rendered []byte, body string) error {
 	bytes := len(rendered)
 	chars := utf8.RuneCount(rendered)
-	if bytes > MaxInputBytes || chars > MaxInputChars {
+	if chars > MaxInputChars {
 		return semantic(mektup.ErrInputTooLarge, "message envelope exceeds the app-server text-input limit", map[string]any{
-			"bytes": bytes, "chars": chars, "maxBytes": MaxInputBytes, "maxChars": MaxInputChars,
-			"bodyBytes": len([]byte(body)), "bodyChars": utf8.RuneCountInString(body),
+			"inputChars": chars, "maxChars": MaxInputChars,
+			"inputBytes": bytes, "bodyBytes": len([]byte(body)), "bodyChars": utf8.RuneCountInString(body),
+			"envelopeOverheadBytes": bytes - len([]byte(body)),
 		}, nil)
 	}
 	return nil
@@ -27,11 +28,27 @@ func validateObservedEnvelope(item ObservedItem, original OperationStatus, accep
 	if e.Kind != mektup.KindReply || e.InReplyTo != original.MessageID {
 		return mektup.Envelope{}, fmt.Errorf("reply correlation mismatch")
 	}
-	if original.SourceRoute == "" || e.To != original.SourceRoute {
-		return mektup.Envelope{}, fmt.Errorf("reply route mismatch")
+	expectedRoute := original.ReplyRoute
+	if expectedRoute == "" {
+		expectedRoute = original.SourceRoute
 	}
-	if e.PayloadSHA256 != original.Digest || int64(e.PayloadBytes) != original.BodySize {
-		return mektup.Envelope{}, fmt.Errorf("reply body evidence mismatch")
+	if expectedRoute == "" || e.To != expectedRoute {
+		return mektup.Envelope{}, fmt.Errorf("reply destination mismatch")
+	}
+	if original.TargetRoute != "" && e.From != original.TargetRoute {
+		return mektup.Envelope{}, fmt.Errorf("reply sender route mismatch")
+	}
+	if original.Operation.TargetEndpointID != "" && e.FromEndpointID != original.Operation.TargetEndpointID {
+		return mektup.Envelope{}, fmt.Errorf("reply sender endpoint mismatch")
+	}
+	if original.Operation.SourceEndpointID != "" && e.ToEndpointID != original.Operation.SourceEndpointID {
+		return mektup.Envelope{}, fmt.Errorf("reply destination endpoint mismatch")
+	}
+	if original.ReplyDigest != "" && e.PayloadSHA256 != original.ReplyDigest {
+		return mektup.Envelope{}, fmt.Errorf("reply body digest mismatch")
+	}
+	if original.ReplyBodySize > 0 && int64(e.PayloadBytes) != original.ReplyBodySize {
+		return mektup.Envelope{}, fmt.Errorf("reply body size mismatch")
 	}
 	if item.ThreadID != "" && item.ThreadID != threadID(original.SourceRoute) {
 		return mektup.Envelope{}, fmt.Errorf("reply was observed in a different thread")

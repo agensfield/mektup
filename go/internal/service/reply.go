@@ -26,15 +26,16 @@ type ReplyRequest struct {
 	// leave them empty and the service allocates UUIDv7 identities; a receiver
 	// retry may supply the original pair so ClaimReply can join the fenced
 	// attempt instead of creating another body.
-	MessageID       string
-	OperationID     string
-	Body            string
-	Status          mektup.ReplyStatus
-	ErrorCode       string
-	Source          string
-	Wait            bool
-	DeliveryTimeout time.Duration
-	WaitTimeout     time.Duration
+	MessageID              string
+	OperationID            string
+	Body                   string
+	Status                 mektup.ReplyStatus
+	ErrorCode              string
+	Source                 string
+	Wait                   bool
+	DeliveryTimeout        time.Duration
+	WaitTimeout            time.Duration
+	DisableDeliveryTimeout bool
 }
 
 type ReplyResult struct {
@@ -133,7 +134,7 @@ func (s *Service) Reply(ctx context.Context, resolver OriginalResolver, req Repl
 	} else if err := mektup.ValidateID(opID, mektup.OperationIDPrefix); err != nil {
 		return ReplyResult{}, semantic(mektup.ErrInvalidArguments, "reply operation identity is invalid", nil, err)
 	}
-	op := Operation{OperationID: opID, MessageID: replyID, SourceRoute: source.URI, TargetRoute: target.URI, Semantics: "reply", ReplyRoute: e.ReplyTo, CustodyRoute: e.ReplyCustodyEndpointID, CustodyStoreID: e.ReplyCustodyStoreID,
+	op := Operation{OperationID: opID, MessageID: replyID, InReplyTo: original.Envelope.MessageID, SourceRoute: source.URI, TargetRoute: target.URI, Semantics: "reply", AttemptOwner: "reply-" + replyID, ReplyRoute: e.ReplyTo, ReplyEndpointID: e.ReplyEndpointID, CustodyRoute: e.ReplyCustodyEndpointID, CustodyStoreID: e.ReplyCustodyStoreID,
 		Digest: digest(req.Body), BodySize: int64(len([]byte(req.Body))), ReplyRequested: req.Wait, SourceEndpointID: source.EndpointID, TargetEndpointID: target.EndpointID}
 	prepared, err := s.Journal.Prepare(ctx, op)
 	if err != nil {
@@ -151,7 +152,37 @@ func (s *Service) Reply(ctx context.Context, resolver OriginalResolver, req Repl
 		return ReplyResult{}, semantic(mektup.ErrMessageIdentityConflict, "reply claim failed", nil, err)
 	}
 	if claim.Joined || claim.State == mektup.StateReplyAccepted || claim.State == mektup.StateReplyObserved {
-		return ReplyResult{Receipt: receiptFor(op, e, claim.State, "")}, nil
+		out := ReplyResult{Receipt: receiptFor(op, e, claim.State, "")}
+		if claim.State == mektup.StateReplyAccepted || claim.State == mektup.StateReplyObserved {
+			if req.Wait {
+				wait, waitErr := s.Wait(ctx, WaitRequest{Reference: replyID, Timeout: req.WaitTimeout})
+				out.Wait = &wait
+				return out, waitErr
+			}
+			return out, nil
+		}
+		if req.Wait {
+			out.Wait = &WaitResult{Receipt: out.Receipt, State: claim.State, Incomplete: true, GapReason: "reply attempt is already in flight"}
+			return out, semantic(mektup.ErrWaitIncomplete, "joined reply attempt has not reached a terminal custody state", map[string]any{"replyState": claim.State}, nil)
+		}
+		return out, semantic(mektup.ErrWaitIncomplete, "reply dispatch is already in flight", map[string]any{"replyState": claim.State}, nil)
+	}
+	resumed := false
+	if !target.Loaded && target.Persistent {
+		if _, err := s.Delivery.Resume(ctx, target); err != nil {
+			recordCtx, recordCancel := custodyContext(ctx)
+			if recordErr := s.Journal.RecordResult(recordCtx, prepared.OperationID, mektup.StateNotSent, "resume_failed"); recordErr != nil {
+				recordCancel()
+				return ReplyResult{}, semantic(mektup.ErrInternal, "resume failure evidence could not be journaled", nil, recordErr)
+			}
+			if abandonErr := s.Journal.AbandonReply(recordCtx, claim.ReplyID, claim.Owner, claim.Token); abandonErr != nil {
+				recordCancel()
+				return ReplyResult{}, semantic(mektup.ErrInternal, "resume failure and reply claim cleanup could not be journaled", nil, errors.Join(err, abandonErr))
+			}
+			recordCancel()
+			return ReplyResult{}, semantic(mektup.ErrDeliveryRejected, "persistent reply target could not be resumed", nil, err)
+		}
+		resumed = true
 	}
 
 	// Heartbeat is independent of the body call. The body path never runs
@@ -159,31 +190,99 @@ func (s *Service) Reply(ctx context.Context, resolver OriginalResolver, req Repl
 	heartbeatCtx, stopHeartbeat := context.WithCancel(context.Background())
 	defer stopHeartbeat()
 	go heartbeat(heartbeatCtx, s.Journal, claim.ReplyID, claim.Owner, claim.Token)
-	if prepared.Token != "" {
-		if err := s.Journal.MarkDispatchStarted(ctx, prepared.OperationID, prepared.Owner, prepared.Token); err != nil {
-			_ = s.Journal.AbandonReply(ctx, claim.ReplyID, claim.Owner, claim.Token)
-			return ReplyResult{}, semantic(mektup.ErrInternal, "reply dispatch fence could not be committed", nil, err)
+	if prepared.Token == "" {
+		if resumed {
+			_ = detachTarget(s.Delivery, target)
 		}
+		recordCtx, recordCancel := custodyContext(ctx)
+		if abandonErr := s.Journal.AbandonReply(recordCtx, claim.ReplyID, claim.Owner, claim.Token); abandonErr != nil {
+			recordCancel()
+			return ReplyResult{}, semantic(mektup.ErrInternal, "unowned reply attempt cleanup could not be journaled", nil, abandonErr)
+		}
+		recordCancel()
+		return ReplyResult{}, semantic(mektup.ErrInternal, "reply dispatch attempt is not owned; body was not sent", nil, nil)
 	}
-	deliveryCtx := ctx
-	var cancel context.CancelFunc
-	if req.DeliveryTimeout > 0 {
-		deliveryCtx, cancel = context.WithTimeout(ctx, req.DeliveryTimeout)
-		defer cancel()
+	if err := s.Journal.MarkDispatchStarted(ctx, prepared.OperationID, prepared.Owner, prepared.Token); err != nil {
+		if resumed {
+			_ = detachTarget(s.Delivery, target)
+		}
+		recordCtx, recordCancel := custodyContext(ctx)
+		if abandonErr := s.Journal.AbandonReply(recordCtx, claim.ReplyID, claim.Owner, claim.Token); abandonErr != nil {
+			recordCancel()
+			return ReplyResult{}, semantic(mektup.ErrInternal, "reply fence failure cleanup could not be journaled", nil, errors.Join(err, abandonErr))
+		}
+		recordCancel()
+		return ReplyResult{}, semantic(mektup.ErrInternal, "reply dispatch fence could not be committed", nil, err)
 	}
+	deliveryCtx, cancel := deliveryContext(ctx, req.DeliveryTimeout, req.DisableDeliveryTimeout)
+	defer cancel()
 	delivery, deliveryErr := s.dispatch(deliveryCtx, target, string(payload), replyID)
 	if deliveryErr != nil {
-		_ = s.Journal.AbandonReply(ctx, claim.ReplyID, claim.Owner, claim.Token)
-		state, _, _ := classifyDelivery(deliveryErr)
+		state, code, retry := classifyDelivery(deliveryErr)
+		if retry {
+			delivery, deliveryErr, state, code = s.retryNotSubmitted(deliveryCtx, target, string(payload), replyID, deliveryErr, state, code)
+		}
+		if state == mektup.StateNotSent {
+			state, code = mektup.StateOutcomeUnknown, "outcome_unknown_after_dispatch_fence"
+		}
+		recordCtx, recordCancel := custodyContext(ctx)
+		if abandonErr := s.Journal.AbandonReply(recordCtx, claim.ReplyID, claim.Owner, claim.Token); abandonErr != nil {
+			recordCancel()
+			if resumed {
+				_ = detachTarget(s.Delivery, target)
+			}
+			return ReplyResult{}, semantic(mektup.ErrInternal, "reply uncertainty could not be journaled", map[string]any{"deliveryState": state}, abandonErr)
+		}
+		if recordErr := s.Journal.RecordResult(recordCtx, prepared.OperationID, state, code); recordErr != nil {
+			recordCancel()
+			if resumed {
+				_ = detachTarget(s.Delivery, target)
+			}
+			return ReplyResult{}, semantic(mektup.ErrInternal, "reply delivery evidence could not be journaled", map[string]any{"deliveryState": state}, recordErr)
+		}
+		recordCancel()
 		if state == mektup.StateRejected || state == mektup.StateNotSent {
+			if resumed {
+				_ = detachTarget(s.Delivery, target)
+			}
 			return ReplyResult{}, semantic(mektup.ErrDeliveryRejected, "reply body was not accepted", map[string]any{"evidenceState": state}, deliveryErr)
+		}
+		if resumed {
+			_ = detachTarget(s.Delivery, target)
 		}
 		return ReplyResult{}, semantic(mektup.ErrReplyOutcomeUnknown, "reply body outcome is unknown; it will not be replayed", nil, deliveryErr)
 	}
-	if _, err := s.Journal.CommitReply(ctx, claim.ReplyID, claim.Owner, claim.Token); err != nil {
+	commitCtx, commitCancel := custodyContext(ctx)
+	if _, err := s.Journal.CommitReply(commitCtx, claim.ReplyID, claim.Owner, claim.Token); err != nil {
+		commitCancel()
+		if resumed {
+			_ = detachTarget(s.Delivery, target)
+		}
+		fallbackCtx, fallbackCancel := custodyContext(ctx)
+		if recordErr := s.Journal.RecordResult(fallbackCtx, prepared.OperationID, mektup.StateOutcomeUnknown, "reply_acceptance_commit_failed"); recordErr != nil {
+			fallbackCancel()
+			return ReplyResult{}, semantic(mektup.ErrInternal, "reply acceptance and uncertainty evidence could not be journaled", nil, errors.Join(err, recordErr))
+		}
+		fallbackCancel()
 		return ReplyResult{}, semantic(mektup.ErrReplyOutcomeUnknown, "reply acceptance commit was fenced or unavailable", nil, err)
 	}
-	_ = s.Journal.RecordResult(ctx, prepared.OperationID, mektup.StateAccepted, delivery.Evidence)
+	commitCancel()
+	recordCtx, recordCancel := custodyContext(ctx)
+	if err := s.Journal.RecordResult(recordCtx, prepared.OperationID, mektup.StateAccepted, delivery.Evidence); err != nil {
+		recordCancel()
+		if resumed {
+			_ = detachTarget(s.Delivery, target)
+		}
+		return ReplyResult{Receipt: receiptFor(op, e, mektup.StateReplyAccepted, delivery.TurnID)}, semantic(mektup.ErrInternal, "reply operation acceptance could not be journaled", nil, err)
+	}
+	recordCancel()
+	if resumed {
+		if detachErr := detachTarget(s.Delivery, target); detachErr != nil {
+			receipt := receiptFor(op, e, mektup.StateReplyAccepted, delivery.TurnID)
+			receipt.Warnings = append(receipt.Warnings, mektup.Warning{Code: mektup.WarningCleanupIncomplete, Message: "persistent reply target detach did not complete", Details: map[string]any{"error": detachErr.Error()}})
+			return ReplyResult{Receipt: receipt}, semantic(mektup.ErrInternal, "reply accepted but target cleanup is incomplete", nil, detachErr)
+		}
+	}
 	out := ReplyResult{Receipt: receiptFor(op, e, mektup.StateReplyAccepted, delivery.TurnID)}
 	if req.Wait {
 		wait, waitErr := s.Wait(ctx, WaitRequest{Reference: replyID, Timeout: req.WaitTimeout})

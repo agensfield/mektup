@@ -97,6 +97,17 @@ func (j *Journal) Operation(ctx context.Context, operationID string) (OperationR
 	return j.operation(ctx, operationID, false)
 }
 
+// OperationByMessage resolves the durable operation identity without exposing
+// the SQL schema to semantic callers.
+func (j *Journal) OperationByMessage(ctx context.Context, messageID string) (OperationRecord, error) {
+	var out OperationRecord
+	err := scanOperation(j.db.QueryRowContext(ctx, "SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE o.message_id=?", messageID), &out)
+	if err == sql.ErrNoRows {
+		return out, ErrNotFound
+	}
+	return out, err
+}
+
 func (j *Journal) operation(ctx context.Context, operationID string, includeToken bool) (OperationRecord, error) {
 	var out OperationRecord
 	err := scanOperation(j.db.QueryRowContext(ctx, "SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE o.operation_id=?", operationID), &out)

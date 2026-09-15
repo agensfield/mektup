@@ -20,11 +20,11 @@ import (
 )
 
 const (
-	// MaxInputBytes and MaxInputChars are the conservative app-server text
-	// input preflight bounds.  Both measurements are retained in errors.
-	MaxInputBytes          = 1 << 20
-	MaxInputChars          = 1 << 20
-	maxNotSubmittedRetries = 1
+	// MaxInputChars is the locked app-server character boundary. MaxInputBytes
+	// is retained only as a compatibility measurement constant and is never an
+	// input rejection threshold: UTF-8 byte size is reported separately.
+	MaxInputBytes = 1 << 20
+	MaxInputChars = 1 << 20
 )
 
 var (
@@ -143,7 +143,7 @@ type DeliveryResult struct {
 // DeliveryPort is the only body-write seam. Resume and Detach are separate
 // from Send so unloaded persistent targets can be receipted independently.
 type DeliveryPort interface {
-	Send(context.Context, string, string, string) (DeliveryResult, error)
+	Send(context.Context, ResolvedTarget, string, string) (DeliveryResult, error)
 	Resume(context.Context, ResolvedTarget) (string, error)
 	Detach(context.Context, ResolvedTarget) error
 }
@@ -170,8 +170,8 @@ type EventStream interface {
 }
 
 type ObservationPort interface {
-	Subscribe(context.Context, string) (EventStream, error)
-	FullHistory(context.Context, string) ([]ObservedItem, error)
+	Subscribe(context.Context, ResolvedTarget) (EventStream, error)
+	FullHistory(context.Context, ResolvedTarget) ([]ObservedItem, error)
 }
 
 // Operation is metadata only. Body bytes remain in the native envelope and
@@ -179,12 +179,15 @@ type ObservationPort interface {
 type Operation struct {
 	OperationID      string
 	MessageID        string
+	InReplyTo        string
 	SourceRoute      string
 	TargetRoute      string
 	Semantics        string
 	ReplyRoute       string
+	ReplyEndpointID  string
 	CustodyRoute     string
 	CustodyStoreID   string
+	AttemptOwner     string
 	Digest           string
 	BodySize         int64
 	ReplyRequested   bool
@@ -201,11 +204,13 @@ type Prepared struct {
 
 type OperationStatus struct {
 	Operation
-	State       mektup.EvidenceState
-	TurnID      string
-	ErrorCode   string
-	ReplyID     string
-	ReplyStatus string
+	State         mektup.EvidenceState
+	TurnID        string
+	ErrorCode     string
+	ReplyID       string
+	ReplyStatus   string
+	ReplyDigest   string
+	ReplyBodySize int64
 }
 
 type ReplyClaimInput struct {
@@ -243,6 +248,7 @@ type JournalPort interface {
 	Prepare(context.Context, Operation) (Prepared, error)
 	MarkDispatchStarted(context.Context, string, string, string) error
 	RecordResult(context.Context, string, mektup.EvidenceState, string) error
+	ExpireClaims(context.Context) error
 	Lookup(context.Context, string) (OperationStatus, error)
 	ClaimReply(context.Context, ReplyClaimInput) (ReplyClaim, error)
 	Heartbeat(context.Context, string, string, string) error
@@ -274,14 +280,15 @@ func (s *Service) validate() error {
 }
 
 type SendRequest struct {
-	Target          string
-	Body            string
-	Raw             bool
-	RequestReply    bool
-	Wait            bool
-	Source          string
-	DeliveryTimeout time.Duration
-	WaitTimeout     time.Duration
+	Target                 string
+	Body                   string
+	Raw                    bool
+	RequestReply           bool
+	Wait                   bool
+	Source                 string
+	DeliveryTimeout        time.Duration
+	WaitTimeout            time.Duration
+	DisableDeliveryTimeout bool
 }
 
 type SendResult struct {
@@ -369,7 +376,7 @@ func (s *Service) Send(ctx context.Context, req SendRequest) (SendResult, error)
 		sourceRoute = "human://" + source.EndpointID
 	}
 	op := Operation{OperationID: opID, MessageID: messageID, SourceRoute: sourceRoute, TargetRoute: target.URI,
-		Semantics: semantics(req.Raw), ReplyRoute: envelope.ReplyTo, CustodyRoute: envelope.ReplyCustodyEndpointID,
+		Semantics: semantics(req.Raw), ReplyRoute: envelope.ReplyTo, ReplyEndpointID: envelope.ReplyEndpointID, CustodyRoute: envelope.ReplyCustodyEndpointID,
 		CustodyStoreID: envelope.ReplyCustodyStoreID, Digest: digest, BodySize: int64(len([]byte(req.Body))),
 		ReplyRequested: req.RequestReply, SourceEndpointID: source.EndpointID, TargetEndpointID: target.EndpointID}
 	prepared, err := s.Journal.Prepare(ctx, op)
@@ -377,44 +384,77 @@ func (s *Service) Send(ctx context.Context, req SendRequest) (SendResult, error)
 		return SendResult{}, semantic(mektup.ErrMessageIdentityConflict, "message relationship could not be prepared", nil, err)
 	}
 
+	resumed := false
 	if !target.Loaded && target.Persistent {
 		if _, err := s.Delivery.Resume(ctx, target); err != nil {
-			_ = s.Journal.RecordResult(ctx, opID, mektup.StateNotSent, "resume_failed")
+			recordCtx, recordCancel := custodyContext(ctx)
+			defer recordCancel()
+			if recordErr := s.Journal.RecordResult(recordCtx, opID, mektup.StateNotSent, "resume_failed"); recordErr != nil {
+				return SendResult{}, semantic(mektup.ErrInternal, "resume failure evidence could not be journaled", nil, recordErr)
+			}
 			return SendResult{}, semantic(mektup.ErrDeliveryRejected, "persistent target could not be resumed", nil, err)
 		}
+		resumed = true
 	}
 	if err := s.Journal.MarkDispatchStarted(ctx, prepared.OperationID, prepared.Owner, prepared.Token); err != nil {
+		if resumed {
+			if detachErr := detachTarget(s.Delivery, target); detachErr != nil {
+				return SendResult{}, semantic(mektup.ErrInternal, "dispatch fence and target cleanup both failed", nil, errors.Join(err, detachErr))
+			}
+		}
 		return SendResult{}, semantic(mektup.ErrInternal, "dispatch fence could not be committed", nil, err)
 	}
 
-	deliveryCtx := ctx
-	var cancel context.CancelFunc
-	if req.DeliveryTimeout > 0 {
-		deliveryCtx, cancel = context.WithTimeout(ctx, req.DeliveryTimeout)
-		defer cancel()
-	}
+	deliveryCtx, cancel := deliveryContext(ctx, req.DeliveryTimeout, req.DisableDeliveryTimeout)
+	defer cancel()
 	result, dispatchErr := s.dispatch(deliveryCtx, target, string(payload), messageID)
 	if dispatchErr != nil {
 		state, code, retry := classifyDelivery(dispatchErr)
 		if retry {
-			for i := 0; i < maxNotSubmittedRetries; i++ {
-				result, dispatchErr = s.dispatch(deliveryCtx, target, string(payload), messageID)
-				if dispatchErr == nil {
-					break
-				}
-				state, code, _ = classifyDelivery(dispatchErr)
-			}
+			result, dispatchErr, state, code = s.retryNotSubmitted(deliveryCtx, target, string(payload), messageID, dispatchErr, state, code)
 		}
 		if dispatchErr != nil {
-			_ = s.Journal.RecordResult(ctx, opID, state, code)
+			recordCtx, recordCancel := custodyContext(ctx)
+			if state == mektup.StateNotSent {
+				state, code = mektup.StateOutcomeUnknown, "outcome_unknown_after_dispatch_fence"
+			}
+			if recordErr := s.Journal.RecordResult(recordCtx, opID, state, code); recordErr != nil {
+				recordCancel()
+				if resumed {
+					if detachErr := detachTarget(s.Delivery, target); detachErr != nil {
+						return SendResult{}, semantic(mektup.ErrInternal, "delivery and target cleanup evidence both failed", nil, errors.Join(recordErr, detachErr))
+					}
+				}
+				return SendResult{}, semantic(mektup.ErrInternal, "delivery evidence could not be journaled", map[string]any{"deliveryState": state}, recordErr)
+			}
+			recordCancel()
+			if resumed {
+				if detachErr := detachTarget(s.Delivery, target); detachErr != nil {
+					return SendResult{}, semantic(mektup.ErrInternal, "delivery outcome and target cleanup both failed", nil, errors.Join(dispatchErr, detachErr))
+				}
+			}
 			return SendResult{}, deliveryError(dispatchErr, state, code)
 		}
 	}
-	if err := s.Journal.RecordResult(ctx, opID, mektup.StateAccepted, result.Evidence); err != nil {
+	recordCtx, recordCancel := custodyContext(ctx)
+	if err := s.Journal.RecordResult(recordCtx, opID, mektup.StateAccepted, result.Evidence); err != nil {
+		recordCancel()
+		if resumed {
+			if detachErr := detachTarget(s.Delivery, target); detachErr != nil {
+				return SendResult{}, semantic(mektup.ErrInternal, "acceptance and target cleanup evidence both failed", nil, errors.Join(err, detachErr))
+			}
+		}
 		return SendResult{}, semantic(mektup.ErrInternal, "acceptance evidence could not be journaled", nil, err)
 	}
-	if !target.Loaded && target.Persistent {
-		_ = s.Delivery.Detach(context.Background(), target)
+	recordCancel()
+	if resumed {
+		if detachErr := detachTarget(s.Delivery, target); detachErr != nil {
+			// The body acceptance is already durable. Preserve it in the
+			// receipt while making cleanup degradation explicit.
+			receipt := receiptFor(op, envelope, mektup.StateAccepted, result.TurnID)
+			receipt.Warnings = append(receipt.Warnings, mektup.Warning{Code: mektup.WarningCleanupIncomplete, Message: "persistent target detach did not complete", Details: map[string]any{"error": detachErr.Error()}})
+			return SendResult{Receipt: receipt}, semantic(mektup.ErrInternal, "delivery accepted but target cleanup is incomplete", nil, detachErr)
+		}
 	}
 	receipt := receiptFor(op, envelope, mektup.StateAccepted, result.TurnID)
 	out := SendResult{Receipt: receipt}
@@ -429,7 +469,7 @@ func (s *Service) Send(ctx context.Context, req SendRequest) (SendResult, error)
 }
 
 func (s *Service) dispatch(ctx context.Context, target ResolvedTarget, text, messageID string) (DeliveryResult, *DeliveryError) {
-	result, err := s.Delivery.Send(ctx, target.ThreadID, text, messageID)
+	result, err := s.Delivery.Send(ctx, target, text, messageID)
 	if err == nil {
 		if !result.Accepted {
 			return result, &DeliveryError{Err: errors.New("delivery did not report acceptance"), Phase: WriteComplete}
@@ -443,11 +483,64 @@ func (s *Service) dispatch(ctx context.Context, target ResolvedTarget, text, mes
 	return result, &DeliveryError{Err: err, Phase: WriteMayHaveWritten}
 }
 
+func deliveryContext(parent context.Context, timeout time.Duration, disabled bool) (context.Context, context.CancelFunc) {
+	if disabled {
+		return context.WithCancel(parent)
+	}
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
+func (s *Service) retryNotSubmitted(ctx context.Context, target ResolvedTarget, text, messageID string, last *DeliveryError, state mektup.EvidenceState, code string) (DeliveryResult, *DeliveryError, mektup.EvidenceState, string) {
+	backoff := 10 * time.Millisecond
+	result := DeliveryResult{}
+	for {
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return result, last, state, code
+		case <-timer.C:
+		}
+		result, last = s.dispatch(ctx, target, text, messageID)
+		if last == nil {
+			return result, nil, mektup.StateAccepted, ""
+		}
+		state, code, retry := classifyDelivery(last)
+		if !retry {
+			return result, last, state, code
+		}
+		if backoff < 250*time.Millisecond {
+			backoff *= 2
+			if backoff > 250*time.Millisecond {
+				backoff = 250 * time.Millisecond
+			}
+		}
+	}
+}
+
 func (s *Service) now() time.Time {
 	if s != nil && s.Now != nil {
 		return s.Now()
 	}
 	return time.Now()
+}
+
+func detachTarget(delivery DeliveryPort, target ResolvedTarget) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return delivery.Detach(ctx, target)
+}
+
+func custodyContext(parent context.Context) (context.Context, context.CancelFunc) {
+	if parent.Err() == nil {
+		return parent, func() {}
+	}
+	return context.WithTimeout(context.Background(), 5*time.Second)
 }
 
 func classifyDelivery(err *DeliveryError) (mektup.EvidenceState, string, bool) {
@@ -457,6 +550,9 @@ func classifyDelivery(err *DeliveryError) (mektup.EvidenceState, string, bool) {
 	if err.Server != nil {
 		if c := codexapi.ClassifyTurnStartNotSubmitted(err.Server); c.Retry {
 			return mektup.StateRejected, "not_submitted", true
+		}
+		if err.Server.Code == -32603 {
+			return mektup.StateOutcomeUnknown, "outcome_unknown", false
 		}
 		return mektup.StateRejected, fmt.Sprintf("server_%d", err.Server.Code), false
 	}
@@ -495,9 +591,13 @@ func digest(body string) string {
 
 func receiptFor(op Operation, e mektup.Envelope, state mektup.EvidenceState, turnID string) mektup.Receipt {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	acceptedAt := ""
+	if state == mektup.StateAccepted || state == mektup.StateReplyAccepted || state == mektup.StateReplyObserved {
+		acceptedAt = now
+	}
 	return mektup.Receipt{Schema: mektup.ReceiptSchema, ReceiptID: mektup.NewReceiptID(), OperationID: op.OperationID, Operation: op.Semantics, State: state,
 		Source: mektup.ReceiptIdentity{EndpointID: op.SourceEndpointID, ThreadID: threadID(e.From)}, Target: mektup.ReceiptIdentity{EndpointID: op.TargetEndpointID, ThreadID: threadID(e.To), Requested: e.RequestedTarget, Resolved: e.To},
-		Message: mektup.ReceiptMessage{MessageID: e.MessageID, Kind: string(e.Kind), ReplyRequested: e.ReplyRequested, PayloadBytes: e.PayloadBytes, PayloadSHA256: e.PayloadSHA256, ClientMessageID: e.MessageID, TurnID: turnID, AcceptedAt: now}, Evidence: []mektup.EvidenceRecord{{State: state, At: now, Reference: turnID}}, CreatedAt: now, UpdatedAt: now}
+		Message: mektup.ReceiptMessage{MessageID: e.MessageID, InReplyTo: e.InReplyTo, Kind: string(e.Kind), ReplyRequested: e.ReplyRequested, PayloadBytes: e.PayloadBytes, PayloadSHA256: e.PayloadSHA256, ClientMessageID: e.MessageID, TurnID: turnID, AcceptedAt: acceptedAt}, Evidence: []mektup.EvidenceRecord{{State: state, At: now, Reference: turnID, Details: map[string]any{"custodyRoute": op.CustodyRoute, "custodyStoreId": op.CustodyStoreID}}}, CreatedAt: now, UpdatedAt: now}
 }
 
 func threadID(uri string) string {
