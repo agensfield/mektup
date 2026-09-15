@@ -137,11 +137,13 @@ func (j *Journal) ListReceipts(ctx context.Context, query ReceiptQuery) ([]mektu
 		where = append(where, "created_at>=?")
 		args = append(args, query.Since.UTC().UnixNano())
 	}
-	if query.EndpointID != "" {
+	if query.EndpointID != "" && query.ThreadID != "" {
+		where = append(where, "((source_endpoint_id=? AND source_thread_id=?) OR (target_endpoint_id=? AND target_thread_id=?))")
+		args = append(args, query.EndpointID, query.ThreadID, query.EndpointID, query.ThreadID)
+	} else if query.EndpointID != "" {
 		where = append(where, "(source_endpoint_id=? OR target_endpoint_id=?)")
 		args = append(args, query.EndpointID, query.EndpointID)
-	}
-	if query.ThreadID != "" {
+	} else if query.ThreadID != "" {
 		where = append(where, "(source_thread_id=? OR target_thread_id=?)")
 		args = append(args, query.ThreadID, query.ThreadID)
 	}
