@@ -26,8 +26,6 @@ import (
 
 const (
 	DefaultSSHBinary      = "ssh"
-	DefaultRemoteBinary   = "codex"
-	DefaultControlBinary  = "mektup"
 	DefaultCleanupTimeout = 2 * time.Second
 	defaultReadQueue      = 64
 	defaultReadChunk      = 32 << 10
@@ -97,13 +95,17 @@ func (f *Failure) Unwrap() error {
 	return f.Err
 }
 
+func (f *Failure) Timeout() bool {
+	return f != nil && errors.Is(f.Err, os.ErrDeadlineExceeded)
+}
+
+func (f *Failure) Temporary() bool { return f != nil && f.Timeout() }
+
 // Config is local route metadata. Empty binary fields select the system
 // defaults. No field represents a remote shell fragment.
 type Config struct {
 	Host           string
 	SSHBinary      string
-	RemoteBinary   string
-	ControlBinary  string
 	CleanupTimeout time.Duration
 	StderrLimit    int64
 	ControlLimit   int64
@@ -112,12 +114,6 @@ type Config struct {
 func (c Config) normalized() Config {
 	if c.SSHBinary == "" {
 		c.SSHBinary = DefaultSSHBinary
-	}
-	if c.RemoteBinary == "" {
-		c.RemoteBinary = DefaultRemoteBinary
-	}
-	if c.ControlBinary == "" {
-		c.ControlBinary = DefaultControlBinary
 	}
 	if c.CleanupTimeout <= 0 {
 		c.CleanupTimeout = DefaultCleanupTimeout
@@ -138,9 +134,6 @@ func (c Config) Validate() error {
 	}
 	if !validExecutable(c.SSHBinary, true) {
 		return fmt.Errorf("%w: invalid SSH executable", ErrInvalidConfig)
-	}
-	if !validExecutable(c.RemoteBinary, false) || !validExecutable(c.ControlBinary, false) {
-		return fmt.Errorf("%w: remote executable must be one shell-safe token", ErrInvalidConfig)
 	}
 	if c.CleanupTimeout <= 0 || c.StderrLimit <= 0 || c.ControlLimit <= 0 {
 		return fmt.Errorf("%w: bounds must be positive", ErrInvalidConfig)
@@ -172,7 +165,7 @@ func (c Config) ProxyArgv() ([]string, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	return []string{c.SSHBinary, "--", c.Host, c.RemoteBinary, "app-server", "proxy"}, nil
+	return []string{c.SSHBinary, "--", c.Host, "codex", "app-server", "proxy"}, nil
 }
 
 // ControlArgv returns the fixed one-shot Mektup control receiver command.
@@ -183,7 +176,7 @@ func (c Config) ControlArgv() ([]string, error) {
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
-	return []string{c.SSHBinary, "--", c.Host, c.ControlBinary, "control", "receive"}, nil
+	return []string{c.SSHBinary, "--", c.Host, "mektup", "control", "receive"}, nil
 }
 
 // Process is the narrow child-process seam used by the real OpenSSH runner
@@ -242,6 +235,8 @@ type child struct {
 	failure     *Failure
 	mu          sync.Mutex
 	closeOnce   sync.Once
+	closeDone   chan struct{}
+	closeErr    error
 }
 
 func startChild(argv []string, cfg Config, factory ProcessFactory) (*child, error) {
@@ -273,7 +268,7 @@ func startChild(argv []string, cfg Config, factory ProcessFactory) (*child, erro
 		_ = stderr.Close()
 		return nil, &Failure{Kind: FailureSpawn, Cause: FailureSpawn, Evidence: WriteNotStarted, Err: err}
 	}
-	c := &child{process: process, stdin: stdin, stdout: stdout, stderr: stderr, argv: append([]string(nil), argv...), config: cfg.normalized(), waitDone: make(chan struct{}), stderrDone: make(chan struct{})}
+	c := &child{process: process, stdin: stdin, stdout: stdout, stderr: stderr, argv: append([]string(nil), argv...), config: cfg.normalized(), waitDone: make(chan struct{}), stderrDone: make(chan struct{}), closeDone: make(chan struct{})}
 	go c.collectStderr()
 	go func() {
 		err := process.Wait()
@@ -308,8 +303,8 @@ func (c *child) status() (error, string, bool) {
 }
 
 func (c *child) close() error {
-	var result error
 	c.closeOnce.Do(func() {
+		var result error
 		_ = c.stdin.Close()
 		_ = c.stdout.Close()
 		_ = c.stderr.Close()
@@ -323,8 +318,15 @@ func (c *child) close() error {
 				result = ErrCleanupTimeout
 			}
 		}
+		c.mu.Lock()
+		c.closeErr = result
+		c.mu.Unlock()
+		close(c.closeDone)
 	})
-	return result
+	<-c.closeDone
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.closeErr
 }
 
 // Conn is a net.Conn-shaped raw byte stream over one SSH app-server proxy.
@@ -337,9 +339,12 @@ type Conn struct {
 	closeOnce     sync.Once
 	readMu        sync.Mutex
 	readBuf       []byte
+	deadlineMu    sync.Mutex
 	readDeadline  time.Time
-	writeMu       sync.Mutex
 	writeDeadline time.Time
+	readWake      chan struct{}
+	writeWake     chan struct{}
+	writeMu       sync.Mutex
 	writePhase    atomic.Value // WriteEvidence
 	host          string
 	closeErrMu    sync.Mutex
@@ -382,7 +387,7 @@ func Dial(ctx context.Context, cfg Config, factory ProcessFactory) (*Conn, error
 }
 
 func newConn(child *child, host string) *Conn {
-	c := &Conn{child: child, readCh: make(chan readChunk, defaultReadQueue), done: make(chan struct{}), host: host}
+	c := &Conn{child: child, readCh: make(chan readChunk, defaultReadQueue), done: make(chan struct{}), host: host, readWake: make(chan struct{}), writeWake: make(chan struct{})}
 	c.writePhase.Store(WriteNotStarted)
 	return c
 }
@@ -436,6 +441,18 @@ func (c *Conn) phase() WriteEvidence {
 	return WriteNotStarted
 }
 
+func (c *Conn) readState() (time.Time, <-chan struct{}) {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	return c.readDeadline, c.readWake
+}
+
+func (c *Conn) writeState() (time.Time, <-chan struct{}) {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	return c.writeDeadline, c.writeWake
+}
+
 func (c *Conn) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -449,9 +466,7 @@ func (c *Conn) Read(p []byte) (int, error) {
 	}
 	c.readMu.Unlock()
 	for {
-		c.readMu.Lock()
-		deadline := c.readDeadline
-		c.readMu.Unlock()
+		deadline, wake := c.readState()
 		wait, cancel := deadlineTimer(deadline)
 		select {
 		case chunk := <-c.readCh:
@@ -475,6 +490,11 @@ func (c *Conn) Read(p []byte) (int, error) {
 				cancel()
 			}
 			return 0, &Failure{Kind: FailureCanceled, Cause: FailureCanceled, Evidence: c.phase(), Err: context.Canceled}
+		case <-wake:
+			if cancel != nil {
+				cancel()
+			}
+			continue
 		case <-wait:
 			return 0, &Failure{Kind: FailureEOF, Cause: FailureEOF, Evidence: c.phase(), Err: osErrDeadlineExceeded}
 		}
@@ -527,14 +547,17 @@ func (c *Conn) Write(p []byte) (int, error) {
 		n, err := c.child.stdin.Write(data)
 		result <- writeResult{n: n, err: err}
 	}()
-	deadline := c.writeDeadline
+	deadline, wake := c.writeState()
 	wait, cancel := deadlineTimer(deadline)
 	select {
 	case outcome := <-result:
 		if cancel != nil {
 			cancel()
 		}
-		if outcome.err != nil {
+		if outcome.err != nil || outcome.n != len(data) {
+			if outcome.err == nil {
+				outcome.err = io.ErrShortWrite
+			}
 			return outcome.n, &Failure{Kind: FailurePossibleWrite, Cause: FailureProxy, Evidence: WriteMayHaveWritten, Err: outcome.err}
 		}
 		c.writePhase.Store(WriteComplete)
@@ -544,6 +567,46 @@ func (c *Conn) Write(p []byte) (int, error) {
 			cancel()
 		}
 		return 0, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteMayHaveWritten, Err: context.Canceled}
+	case <-wake:
+		if cancel != nil {
+			cancel()
+		}
+		// A deadline update is a control event, not a write result. Re-enter
+		// the select with the new deadline while retaining possible-write
+		// evidence.
+		return c.writeAfterWake(data, result)
+	case <-wait:
+		_ = c.abort()
+		return 0, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteMayHaveWritten, Err: osErrDeadlineExceeded}
+	}
+}
+
+func (c *Conn) writeAfterWake(data []byte, result chan writeResult) (int, error) {
+	deadline, wake := c.writeState()
+	wait, cancel := deadlineTimer(deadline)
+	select {
+	case outcome := <-result:
+		if cancel != nil {
+			cancel()
+		}
+		if outcome.err != nil || outcome.n != len(data) {
+			if outcome.err == nil {
+				outcome.err = io.ErrShortWrite
+			}
+			return outcome.n, &Failure{Kind: FailurePossibleWrite, Cause: FailureProxy, Evidence: WriteMayHaveWritten, Err: outcome.err}
+		}
+		c.writePhase.Store(WriteComplete)
+		return outcome.n, nil
+	case <-c.done:
+		if cancel != nil {
+			cancel()
+		}
+		return 0, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteMayHaveWritten, Err: context.Canceled}
+	case <-wake:
+		if cancel != nil {
+			cancel()
+		}
+		return c.writeAfterWake(data, result)
 	case <-wait:
 		_ = c.abort()
 		return 0, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteMayHaveWritten, Err: osErrDeadlineExceeded}
@@ -623,24 +686,30 @@ func (c *Conn) LocalAddr() net.Addr  { return processAddr{network: "ssh", addres
 func (c *Conn) RemoteAddr() net.Addr { return processAddr{network: "ssh", address: c.host} }
 
 func (c *Conn) SetDeadline(deadline time.Time) error {
-	c.readMu.Lock()
+	c.deadlineMu.Lock()
 	c.readDeadline = deadline
-	c.readMu.Unlock()
-	c.writeMu.Lock()
 	c.writeDeadline = deadline
-	c.writeMu.Unlock()
+	close(c.readWake)
+	close(c.writeWake)
+	c.readWake = make(chan struct{})
+	c.writeWake = make(chan struct{})
+	c.deadlineMu.Unlock()
 	return nil
 }
 func (c *Conn) SetReadDeadline(deadline time.Time) error {
-	c.readMu.Lock()
+	c.deadlineMu.Lock()
 	c.readDeadline = deadline
-	c.readMu.Unlock()
+	close(c.readWake)
+	c.readWake = make(chan struct{})
+	c.deadlineMu.Unlock()
 	return nil
 }
 func (c *Conn) SetWriteDeadline(deadline time.Time) error {
-	c.writeMu.Lock()
+	c.deadlineMu.Lock()
 	c.writeDeadline = deadline
-	c.writeMu.Unlock()
+	close(c.writeWake)
+	c.writeWake = make(chan struct{})
+	c.deadlineMu.Unlock()
 	return nil
 }
 

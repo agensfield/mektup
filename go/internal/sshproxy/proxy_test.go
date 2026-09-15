@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -13,20 +14,21 @@ import (
 )
 
 type fakeProcess struct {
-	stdinR      *io.PipeReader
-	stdinW      *io.PipeWriter
-	stdoutR     *io.PipeReader
-	stdoutW     *io.PipeWriter
-	stderrR     *io.PipeReader
-	stderrW     *io.PipeWriter
-	startErr    error
-	waitErr     error
-	waitBlock   bool
-	started     chan struct{}
-	waitRelease chan struct{}
-	killed      chan struct{}
-	killOnce    sync.Once
-	releaseOnce sync.Once
+	stdinR        *io.PipeReader
+	stdinW        *io.PipeWriter
+	stdinOverride io.WriteCloser
+	stdoutR       *io.PipeReader
+	stdoutW       *io.PipeWriter
+	stderrR       *io.PipeReader
+	stderrW       *io.PipeWriter
+	startErr      error
+	waitErr       error
+	waitBlock     bool
+	started       chan struct{}
+	waitRelease   chan struct{}
+	killed        chan struct{}
+	killOnce      sync.Once
+	releaseOnce   sync.Once
 }
 
 func newFakeProcess() *fakeProcess {
@@ -39,7 +41,12 @@ func newFakeProcess() *fakeProcess {
 	}
 }
 
-func (p *fakeProcess) StdinPipe() (io.WriteCloser, error) { return p.stdinW, nil }
+func (p *fakeProcess) StdinPipe() (io.WriteCloser, error) {
+	if p.stdinOverride != nil {
+		return p.stdinOverride, nil
+	}
+	return p.stdinW, nil
+}
 func (p *fakeProcess) StdoutPipe() (io.ReadCloser, error) { return p.stdoutR, nil }
 func (p *fakeProcess) StderrPipe() (io.ReadCloser, error) { return p.stderrR, nil }
 func (p *fakeProcess) Start() error                       { close(p.started); return p.startErr }
@@ -220,4 +227,94 @@ func TestCancellationKillsChildWithinBound(t *testing.T) {
 		t.Fatalf("close err = %v", err)
 	}
 	p.releaseWait()
+}
+
+func TestConcurrentClosePreservesFirstCleanupError(t *testing.T) {
+	p := newFakeProcess()
+	p.waitBlock = true
+	conn, err := Dial(context.Background(), Config{Host: "host", CleanupTimeout: 20 * time.Millisecond}, &fakeFactory{process: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := make(chan error, 2)
+	go func() { results <- conn.Close() }()
+	go func() { results <- conn.Close() }()
+	for i := 0; i < 2; i++ {
+		select {
+		case closeErr := <-results:
+			if !errors.Is(closeErr, ErrCleanupTimeout) {
+				t.Fatalf("close error = %v", closeErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent close did not finish")
+		}
+	}
+	p.releaseWait()
+}
+
+type shortWriter struct{}
+
+func (shortWriter) Write(data []byte) (int, error) { return 1, nil }
+func (shortWriter) Close() error                   { return nil }
+
+func TestPartialWriteWithNilErrorIsPossibleWrite(t *testing.T) {
+	p := newFakeProcess()
+	p.stdinOverride = shortWriter{}
+	conn, err := Dial(context.Background(), Config{Host: "host"}, &fakeFactory{process: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, err = conn.Write([]byte("four bytes"))
+	var failure *Failure
+	if !errors.As(err, &failure) || !errors.Is(err, io.ErrShortWrite) || failure.Evidence != WriteMayHaveWritten {
+		t.Fatalf("write error = %T %+v", err, err)
+	}
+}
+
+func TestDeadlineUpdatesWakeBlockedReadAndWrite(t *testing.T) {
+	t.Run("read", func(t *testing.T) {
+		p := newFakeProcess()
+		conn, err := Dial(context.Background(), Config{Host: "host"}, &fakeFactory{process: p})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		result := make(chan error, 1)
+		go func() { _, readErr := conn.Read(make([]byte, 1)); result <- readErr }()
+		time.Sleep(10 * time.Millisecond)
+		if err := conn.SetReadDeadline(time.Now().Add(-time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case readErr := <-result:
+			if !errors.Is(readErr, os.ErrDeadlineExceeded) {
+				t.Fatalf("read error = %v", readErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("read deadline update did not wake reader")
+		}
+	})
+	t.Run("write", func(t *testing.T) {
+		p := newFakeProcess()
+		conn, err := Dial(context.Background(), Config{Host: "host"}, &fakeFactory{process: p})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		result := make(chan error, 1)
+		go func() { _, writeErr := conn.Write([]byte("blocked")); result <- writeErr }()
+		time.Sleep(10 * time.Millisecond)
+		if err := conn.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case writeErr := <-result:
+			if !errors.Is(writeErr, os.ErrDeadlineExceeded) {
+				t.Fatalf("write error = %v", writeErr)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("write deadline update did not wake writer")
+		}
+	})
 }

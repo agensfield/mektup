@@ -16,7 +16,8 @@ The package passes this argv directly to `exec.Command`; it never invokes a
 shell. OpenSSH therefore remains authoritative for `~/.ssh/config`, host-key
 verification, the SSH agent, `ProxyJump`, and the user's configured policy.
 Mektup owns neither credentials nor SSH policy. A configured host is validated
-as one host token and the remote binary is one shell-safe token.
+as one host token; the remote executable name is a fixed literal, not route
+input.
 
 The child's stdin/stdout are exposed as a `net.Conn`-shaped byte stream. The
 bytes are the Codex app-server's raw HTTP Upgrade/WebSocket stream. There is no
@@ -42,6 +43,8 @@ caller must still redact it before putting it in an audit artifact.
 Child cancellation closes the pipes, asks the process to terminate, and waits
 only for the configured cleanup bound. A timed-out cleanup is explicit
 `ErrCleanupTimeout`; it is never silently treated as a successful disconnect.
+Deadline setters wake already-blocked reads and writes, and a short child-pipe
+write with a nil error remains `possible_write` with `io.ErrShortWrite`.
 
 ## One-shot custody control
 

@@ -13,24 +13,25 @@ import (
 // opaque identity relationships, but deliberately does not know journal
 // tables, state paths, leases, or fencing rules.
 type ControlRequest struct {
-	Schema            string         `json:"schema"`
-	Kind              string         `json:"kind"`
-	Operation         string         `json:"operation"`
-	OperationID       string         `json:"operationId"`
-	ReceiptID         string         `json:"receiptId,omitempty"`
-	ReplyMessageID    string         `json:"replyMessageId"`
-	OriginalMessageID string         `json:"originalMessageId"`
-	Custody           CustodyRef     `json:"custody"`
-	ReplyDestination  DestinationRef `json:"replyDestination"`
-	BodyBytes         *int64         `json:"bodyBytes,omitempty"`
-	BodySHA256        string         `json:"bodySha256,omitempty"`
-	ReplyStatus       string         `json:"replyStatus,omitempty"`
-	ReplyErrorCode    string         `json:"replyErrorCode,omitempty"`
-	RequestedLease    *LeaseRequest  `json:"requestedLease,omitempty"`
-	FencingToken      string         `json:"fencingToken,omitempty"`
-	Lease             *Lease         `json:"lease,omitempty"`
-	AttemptOwner      string         `json:"attemptOwner,omitempty"`
-	RequestedAt       string         `json:"requestedAt,omitempty"`
+	Schema            string          `json:"schema"`
+	Kind              string          `json:"kind"`
+	Operation         string          `json:"operation"`
+	OperationID       string          `json:"operationId"`
+	ReceiptID         string          `json:"receiptId,omitempty"`
+	ReplyMessageID    string          `json:"replyMessageId"`
+	OriginalMessageID string          `json:"originalMessageId"`
+	Custody           CustodyRef      `json:"custody"`
+	ReplyDestination  DestinationRef  `json:"replyDestination"`
+	BodyBytes         *int64          `json:"bodyBytes,omitempty"`
+	BodySHA256        string          `json:"bodySha256,omitempty"`
+	ReplyStatus       string          `json:"replyStatus,omitempty"`
+	ReplyErrorCode    string          `json:"replyErrorCode,omitempty"`
+	RequestedLease    *LeaseRequest   `json:"requestedLease,omitempty"`
+	FencingToken      string          `json:"fencingToken,omitempty"`
+	Lease             *Lease          `json:"lease,omitempty"`
+	AttemptOwner      string          `json:"attemptOwner,omitempty"`
+	RequestedAt       string          `json:"requestedAt,omitempty"`
+	Result            json.RawMessage `json:"result,omitempty"`
 }
 
 type CustodyRef struct {
@@ -94,36 +95,74 @@ func ValidateControlRequest(data []byte) (ControlRequest, error) {
 }
 
 func (r ControlRequest) Validate() error {
-	if r.Schema != "mektup/control/v1" || r.Kind != "request" {
-		return fmt.Errorf("%w: schema and kind must identify a v1 request", ErrControlValidation)
+	if r.Schema != "mektup/control/v1" || (r.Kind != "request" && r.Kind != "result") {
+		return fmt.Errorf("%w: schema and kind must identify a v1 document", ErrControlValidation)
 	}
-	if !opaqueID(r.OperationID, "op_") || !opaqueID(r.ReplyMessageID, "msg_") || !opaqueID(r.OriginalMessageID, "msg_") {
+	if !validID(r.OperationID, "op_") || !validID(r.ReplyMessageID, "msg_") || !validID(r.OriginalMessageID, "msg_") {
 		return fmt.Errorf("%w: invalid operation or message identity", ErrControlValidation)
 	}
-	if r.ReceiptID != "" && !opaqueID(r.ReceiptID, "rcpt_") {
+	if r.ReceiptID != "" && !validID(r.ReceiptID, "rcpt_") {
 		return fmt.Errorf("%w: invalid receipt identity", ErrControlValidation)
 	}
-	if !opaqueID(r.Custody.EndpointID, "ep_") || !opaqueID(r.Custody.StoreID, "store_") {
+	if !validID(r.Custody.EndpointID, "ep_") || !validID(r.Custody.StoreID, "store_") {
 		return fmt.Errorf("%w: custody must use opaque endpoint and store IDs", ErrControlValidation)
 	}
-	if !opaqueID(r.ReplyDestination.EndpointID, "ep_") || !opaqueID(r.ReplyDestination.ThreadID, "thread_") {
-		return fmt.Errorf("%w: reply destination must use opaque endpoint and thread IDs", ErrControlValidation)
+	if !validID(r.ReplyDestination.EndpointID, "ep_") || r.ReplyDestination.ThreadID == "" {
+		return fmt.Errorf("%w: reply destination must use opaque endpoint and nonempty thread ID", ErrControlValidation)
+	}
+	if r.ReplyDestination.URI != "" && !validURI(r.ReplyDestination.URI) {
+		return fmt.Errorf("%w: invalid reply destination URI", ErrControlValidation)
+	}
+	if r.RequestedAt != "" && !validTimestamp(r.RequestedAt) {
+		return fmt.Errorf("%w: invalid requestedAt timestamp", ErrControlValidation)
+	}
+	if r.Lease != nil && !r.Lease.valid() {
+		return fmt.Errorf("%w: invalid lease timestamp", ErrControlValidation)
+	}
+	if r.ReplyErrorCode != "" && r.ReplyStatus != "error" {
+		return fmt.Errorf("%w: replyErrorCode requires error status", ErrControlValidation)
 	}
 	switch r.Operation {
-	case "claim":
-		if r.FencingToken != "" || r.Lease != nil {
-			return fmt.Errorf("%w: claim cannot choose a fencing token or lease", ErrControlValidation)
-		}
-		if r.BodyBytes == nil || r.BodySHA256 == "" || r.ReplyStatus == "" || r.AttemptOwner == "" {
-			return fmt.Errorf("%w: claim requires body digest, status, and attempt owner", ErrControlValidation)
-		}
-	case "heartbeat", "commit", "abandon":
-		if r.FencingToken == "" || r.Lease == nil || r.Lease.ExpiresAt == "" {
-			return fmt.Errorf("%w: %s requires an issued fencing token and lease", ErrControlValidation, r.Operation)
-		}
-	case "status", "reconcile":
+	case "claim", "heartbeat", "commit", "abandon", "status", "reconcile":
 	default:
 		return fmt.Errorf("%w: unsupported operation %q", ErrControlValidation, r.Operation)
+	}
+	if r.Kind == "result" {
+		if len(r.Result) == 0 || string(r.Result) == "null" || r.FencingToken != "" || r.Lease != nil {
+			return fmt.Errorf("%w: result requires result object and no top-level claim lease", ErrControlValidation)
+		}
+		var resultObject map[string]json.RawMessage
+		if err := json.Unmarshal(r.Result, &resultObject); err != nil || resultObject == nil {
+			return fmt.Errorf("%w: result must be an object", ErrControlValidation)
+		}
+		if r.Operation == "claim" {
+			var result struct {
+				FencingToken string `json:"fencingToken"`
+				Lease        Lease  `json:"lease"`
+			}
+			if err := json.Unmarshal(r.Result, &result); err != nil || result.FencingToken == "" || !result.Lease.valid() {
+				return fmt.Errorf("%w: claim result requires fencingToken and lease", ErrControlValidation)
+			}
+		}
+		return nil
+	}
+	if r.Operation == "claim" && r.Result != nil {
+		return fmt.Errorf("%w: claim request cannot contain result", ErrControlValidation)
+	}
+	switch r.Operation {
+	case "claim", "heartbeat", "commit", "abandon":
+		if r.BodyBytes == nil || r.BodySHA256 == "" || r.ReplyStatus == "" || r.AttemptOwner == "" {
+			return fmt.Errorf("%w: %s requires body digest, status, and attempt owner", ErrControlValidation, r.Operation)
+		}
+		if r.Operation == "claim" && (r.FencingToken != "" || r.Lease != nil) {
+			return fmt.Errorf("%w: claim cannot choose a fencing token or lease", ErrControlValidation)
+		}
+		if r.FencingToken == "" || r.Lease == nil || r.Lease.ExpiresAt == "" {
+			if r.Operation != "claim" {
+				return fmt.Errorf("%w: %s requires an issued fencing token and lease", ErrControlValidation, r.Operation)
+			}
+		}
+	case "status", "reconcile":
 	}
 	if r.BodyBytes != nil && *r.BodyBytes < 0 {
 		return fmt.Errorf("%w: bodyBytes cannot be negative", ErrControlValidation)
@@ -137,22 +176,82 @@ func (r ControlRequest) Validate() error {
 	if r.ReplyStatus != "" && r.ReplyStatus != "success" && r.ReplyStatus != "error" {
 		return fmt.Errorf("%w: invalid reply status", ErrControlValidation)
 	}
-	if r.Custody.EndpointID == r.ReplyDestination.EndpointID && r.Custody.StoreID == "" {
-		return fmt.Errorf("%w: custody store ID is required", ErrControlValidation)
-	}
 	return nil
 }
 
-func opaqueID(value, prefix string) bool {
-	if !strings.HasPrefix(value, prefix) || len(value) <= len(prefix) {
+func validID(value, prefix string) bool {
+	// This mirrors the public mektup.ValidateID contract used by the
+	// integration branch. The appserver foundation branch intentionally does
+	// not yet contain that public package, so the transport keeps the same
+	// UUIDv7 shape locally until integration supplies the shared helper.
+	if !strings.HasPrefix(value, prefix) || len(value) != len(prefix)+36 {
 		return false
 	}
-	for _, r := range value[len(prefix):] {
-		if !(r == '-' || r == '_' || r == '.' || (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
+	uuid := value[len(prefix):]
+	for i, r := range uuid {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			if r != '-' {
+				return false
+			}
+			continue
+		}
+		if i == 14 && r != '7' {
+			return false
+		}
+		if i == 19 && r != '8' && r != '9' && r != 'a' && r != 'b' {
+			return false
+		}
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
 			return false
 		}
 	}
 	return true
+}
+
+func validTimestamp(value string) bool {
+	if len(value) < len("2006-01-02T15:04:05.0Z") || !strings.HasSuffix(value, "Z") {
+		return false
+	}
+	if value[4] != '-' || value[7] != '-' || value[10] != 'T' || value[13] != ':' || value[16] != ':' || value[19] != '.' {
+		return false
+	}
+	for i, r := range value[:19] {
+		if i == 4 || i == 7 || i == 10 || i == 13 || i == 16 {
+			continue
+		}
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	for _, r := range value[20 : len(value)-1] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func validURI(value string) bool {
+	colon := strings.Index(value, "://")
+	if colon < 1 || colon+3 >= len(value) || strings.IndexAny(value, " \t\r\n") >= 0 {
+		return false
+	}
+	for i, r := range value[:colon] {
+		if i == 0 && !(r >= 'a' && r <= 'z') {
+			return false
+		}
+		if i > 0 && !(r == '+' || r == '-' || r == '.' || (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+func (l Lease) valid() bool {
+	if l.ExpiresAt == "" || !validTimestamp(l.ExpiresAt) {
+		return false
+	}
+	return (l.AcquiredAt == "" || validTimestamp(l.AcquiredAt)) && (l.HeartbeatAt == "" || validTimestamp(l.HeartbeatAt))
 }
 
 func validSHA256(value string) bool {
@@ -177,6 +276,9 @@ func InvokeControl(ctx context.Context, cfg Config, req ControlRequest, factory 
 	}
 	if err := req.Validate(); err != nil {
 		return nil, err
+	}
+	if req.Kind != "request" {
+		return nil, fmt.Errorf("%w: control receiver accepts requests only", ErrControlValidation)
 	}
 	if validator != nil {
 		if err := validator.ValidateControl(ctx, req); err != nil {
@@ -214,7 +316,10 @@ func InvokeControl(ctx context.Context, cfg Config, req ControlRequest, factory 
 	data = append(data, '\n')
 	writeDone := make(chan error, 1)
 	go func() {
-		_, writeErr := child.stdin.Write(data)
+		written, writeErr := child.stdin.Write(data)
+		if writeErr == nil && written != len(data) {
+			writeErr = io.ErrShortWrite
+		}
 		closeErr := child.stdin.Close()
 		if writeErr != nil {
 			writeDone <- &Failure{Kind: FailurePossibleWrite, Cause: FailureProxy, Evidence: WriteMayHaveWritten, Err: writeErr}

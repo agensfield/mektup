@@ -15,9 +15,9 @@ func validControlRequest() ControlRequest {
 	bytesCount := int64(7)
 	return ControlRequest{
 		Schema: "mektup/control/v1", Kind: "request", Operation: "claim",
-		OperationID: "op_01", ReplyMessageID: "msg_01", OriginalMessageID: "msg_02",
-		Custody:          CustodyRef{EndpointID: "ep_01", StoreID: "store_01"},
-		ReplyDestination: DestinationRef{EndpointID: "ep_02", ThreadID: "thread_01"},
+		OperationID: "op_0198f0e0-0000-7000-8000-00000000000c", ReplyMessageID: "msg_0198f0e0-0000-7000-8000-000000000007", OriginalMessageID: "msg_0198f0e0-0000-7000-8000-000000000003",
+		Custody:          CustodyRef{EndpointID: "ep_0198f0e0-0000-7000-8000-000000000001", StoreID: "store_0198f0e0-0000-7000-8000-000000000002"},
+		ReplyDestination: DestinationRef{EndpointID: "ep_0198f0e0-0000-7000-8000-000000000001", ThreadID: "thread-local-001"},
 		BodyBytes:        &bytesCount, BodySHA256: "sha256:" + strings.Repeat("a", 64), ReplyStatus: "success", AttemptOwner: "owner_01",
 	}
 }
