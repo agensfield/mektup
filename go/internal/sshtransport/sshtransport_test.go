@@ -237,7 +237,8 @@ func TestSSHClientDialerCarriesRawWebSocketHandshakeAndFrames(t *testing.T) {
 		t.Fatal(err)
 	}
 	dialer := NewClientDialer(sshproxy.Config{}, factory)
-	client, err := dialer.DialClient(context.Background(), route, appserver.Options{
+	dialCtx, cancelDial := context.WithCancel(context.Background())
+	client, err := dialer.DialClient(dialCtx, route, appserver.Options{
 		ClientName: "mektup-test", ClientVersion: "test", HandshakeTimeout: time.Second,
 	})
 	if err != nil {
@@ -246,6 +247,8 @@ func TestSSHClientDialerCarriesRawWebSocketHandshakeAndFrames(t *testing.T) {
 	if _, err := client.Initialize(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	cancelDial()
+	time.Sleep(20 * time.Millisecond)
 	wantArgv := []string{"ssh", "--", "codex.example", "codex", "app-server", "proxy"}
 	if strings.Join(factory.argv, "\x00") != strings.Join(wantArgv, "\x00") {
 		t.Fatalf("proxy argv=%#v, want %#v", factory.argv, wantArgv)

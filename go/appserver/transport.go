@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -34,7 +35,7 @@ func DialUnix(ctx context.Context, socketPath string, options Options) (*Client,
 // whose connection is not addressable by a local Unix or TCP socket. The
 // handshake always uses ws://localhost/rpc, matching DialUnix exactly.
 func DialWebSocket(ctx context.Context, netDial NetDialContext, options Options) (*Client, error) {
-	transport, err := dialWebSocketTransport(ctx, netDial, "app-server transport")
+	transport, err := dialWebSocketTransportWithTimeout(ctx, netDial, "app-server transport", options.HandshakeTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -50,16 +51,102 @@ func dialUnixTransport(ctx context.Context, socketPath string) (Transport, error
 }
 
 func dialWebSocketTransport(ctx context.Context, netDial NetDialContext, description string) (Transport, error) {
+	return dialWebSocketTransportWithTimeout(ctx, netDial, description, 0)
+}
+
+func dialWebSocketTransportWithTimeout(ctx context.Context, netDial NetDialContext, description string, timeout time.Duration) (Transport, error) {
 	if netDial == nil {
 		return nil, errors.New("app-server WebSocket net dialer is nil")
 	}
-	dialer := websocket.Dialer{NetDialContext: netDial}
-	conn, _, err := dialer.DialContext(ctx, unixHandshakeURL, nil)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if timeout <= 0 {
+		timeout = defaultHandshakeWait
+	}
+	setupCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	guard := newDialGuard(setupCtx)
+	dialer := websocket.Dialer{NetDialContext: func(dialCtx context.Context, network, address string) (net.Conn, error) {
+		conn, err := netDial(dialCtx, network, address)
+		if err != nil {
+			return nil, err
+		}
+		if !guard.adopt(conn) {
+			_ = conn.Close()
+			if err := setupCtx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, errors.New("app-server WebSocket dial canceled")
+		}
+		return conn, nil
+	}}
+	conn, _, err := dialer.DialContext(setupCtx, unixHandshakeURL, nil)
 	if err != nil {
+		guard.stop()
 		return nil, fmt.Errorf("websocket handshake on %s: %w", description, err)
 	}
+	guard.stop()
 	conn.SetReadLimit(maxWebSocketMessageSize)
 	return &websocketTransport{conn: conn}, nil
+}
+
+// dialGuard closes a raw connection if setup cancellation happens while the
+// HTTP Upgrade is waiting for its response. Once the Upgrade succeeds, stop
+// detaches the guard so the setup context cannot own the established lifetime.
+type dialGuard struct {
+	mu      sync.Mutex
+	conn    net.Conn
+	stopped bool
+	done    chan struct{}
+}
+
+func newDialGuard(ctx context.Context) *dialGuard {
+	g := &dialGuard{done: make(chan struct{})}
+	go func() {
+		select {
+		case <-ctx.Done():
+			g.expire()
+		case <-g.done:
+		}
+	}()
+	return g
+}
+
+func (g *dialGuard) adopt(conn net.Conn) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.stopped {
+		return false
+	}
+	g.conn = conn
+	return true
+}
+
+func (g *dialGuard) expire() {
+	g.mu.Lock()
+	if g.stopped {
+		g.mu.Unlock()
+		return
+	}
+	g.stopped = true
+	conn := g.conn
+	g.conn = nil
+	close(g.done)
+	g.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
+func (g *dialGuard) stop() {
+	g.mu.Lock()
+	if !g.stopped {
+		g.stopped = true
+		g.conn = nil
+		close(g.done)
+	}
+	g.mu.Unlock()
 }
 
 func (t *websocketTransport) Read(ctx context.Context) (Frame, error) {
@@ -97,10 +184,10 @@ func (t *websocketTransport) Write(ctx context.Context, payload []byte) error {
 		_ = t.conn.SetWriteDeadline(time.Time{})
 	}
 	if err := t.conn.WriteMessage(websocket.TextMessage, payload); err != nil {
-		var writeErr *WriteFailure
-		if errors.As(err, &writeErr) {
-			return writeErr
-		}
+		// WriteMessage may fragment a single JSON-RPC message. A nested
+		// WriteFailure only describes the fragment that failed; an earlier
+		// fragment may already be on the wire. Preserve the safe no-write
+		// boundary above, but classify every in-message failure conservatively.
 		return &WriteFailure{Err: err, Phase: WriteMayHaveWritten}
 	}
 	return nil

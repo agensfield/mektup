@@ -49,8 +49,16 @@ func (d ClientDialer) DialClient(ctx context.Context, route endpoint.Route, opti
 		return nil, fmt.Errorf("SSH proxy host %q does not match route host %q", cfg.Host, route.SSHHost)
 	}
 	return appserver.DialWebSocket(ctx, func(dialCtx context.Context, _, _ string) (net.Conn, error) {
-		conn, err := sshproxy.Dial(dialCtx, cfg, d.Factory)
+		// dialCtx owns only HTTP Upgrade setup. The WebSocket dial guard closes
+		// this raw connection if setup is canceled; after it succeeds, the SSH
+		// child must be owned by the returned connection rather than the caller's
+		// setup context.
+		conn, err := sshproxy.Dial(context.WithoutCancel(dialCtx), cfg, d.Factory)
 		if err != nil {
+			return nil, err
+		}
+		if err := dialCtx.Err(); err != nil {
+			_ = conn.Close()
 			return nil, err
 		}
 		return &evidenceConn{Conn: conn}, nil
