@@ -4,8 +4,8 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -19,35 +19,62 @@ const (
 	StoreIDPrefix     = "store_"
 )
 
-var fallbackCounter uint64
-
 // NewUUIDv7 returns a canonical, lower-case UUIDv7 string. UUIDv7 carries the
-// current Unix millisecond timestamp and cryptographically random remainder.
 func NewUUIDv7() string {
-	var b [16]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand failure is exceptionally unusual. Keep the API total while
-		// retaining uniqueness within this process in the degraded case.
-		binary.BigEndian.PutUint64(b[8:], atomic.AddUint64(&fallbackCounter, 1))
+	id, err := NewUUIDv7Checked()
+	if err != nil {
+		panic("mektup: cannot generate collision-resistant UUIDv7: " + err.Error())
 	}
-	ms := uint64(time.Now().UnixMilli())
+	return id
+}
+
+// NewUUIDv7Checked is the fail-closed UUIDv7 generator. Callers crossing an
+// external reliability boundary should prefer this form over NewUUIDv7.
+func NewUUIDv7Checked() (string, error) {
+	return NewUUIDv7From(rand.Reader, time.Now())
+}
+
+// NewUUIDv7From is deterministic-testable UUIDv7 generation. The reader must
+// provide 10 random bytes; its failure is returned rather than degraded.
+func NewUUIDv7From(random io.Reader, now time.Time) (string, error) {
+	var randomBytes [10]byte
+	if _, err := io.ReadFull(random, randomBytes[:]); err != nil {
+		return "", fmt.Errorf("read UUID entropy: %w", err)
+	}
+	var b [16]byte
+	ms := uint64(now.UnixMilli())
 	b[0] = byte(ms >> 40)
 	b[1] = byte(ms >> 32)
 	b[2] = byte(ms >> 24)
 	b[3] = byte(ms >> 16)
 	b[4] = byte(ms >> 8)
 	b[5] = byte(ms)
+	copy(b[6:], randomBytes[:])
 	b[6] = (b[6] & 0x0f) | 0x70
 	b[8] = (b[8] & 0x3f) | 0x80
 	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
 		binary.BigEndian.Uint32(b[0:4]), binary.BigEndian.Uint16(b[4:6]),
 		binary.BigEndian.Uint16(b[6:8]), binary.BigEndian.Uint16(b[8:10]),
-		b[10:16])
+		b[10:16]), nil
+}
+
+// NewUUIDv7WithEntropy is a descriptive compatibility alias for deterministic
+// callers and conformance fixtures.
+func NewUUIDv7WithEntropy(random io.Reader, now time.Time) (string, error) {
+	return NewUUIDv7From(random, now)
 }
 
 // NewPrefixedID creates an immutable Mektup identifier with prefix prefix.
 // Prefixes conventionally end in an underscore (for example, "msg_").
 func NewPrefixedID(prefix string) string { return prefix + NewUUIDv7() }
+
+func NewPrefixedIDChecked(prefix string) (string, error) {
+	uuid, err := NewUUIDv7Checked()
+	if err != nil {
+		return "", err
+	}
+	return prefix + uuid, nil
+}
 
 func NewOperationID() string { return NewPrefixedID(OperationIDPrefix) }
 func NewMessageID() string   { return NewPrefixedID(MessageIDPrefix) }
@@ -55,6 +82,13 @@ func NewReceiptID() string   { return NewPrefixedID(ReceiptIDPrefix) }
 func NewEndpointID() string  { return NewPrefixedID(EndpointIDPrefix) }
 func NewEventID() string     { return NewPrefixedID(EventIDPrefix) }
 func NewStoreID() string     { return NewPrefixedID(StoreIDPrefix) }
+
+func NewOperationIDChecked() (string, error) { return NewPrefixedIDChecked(OperationIDPrefix) }
+func NewMessageIDChecked() (string, error)   { return NewPrefixedIDChecked(MessageIDPrefix) }
+func NewReceiptIDChecked() (string, error)   { return NewPrefixedIDChecked(ReceiptIDPrefix) }
+func NewEndpointIDChecked() (string, error)  { return NewPrefixedIDChecked(EndpointIDPrefix) }
+func NewEventIDChecked() (string, error)     { return NewPrefixedIDChecked(EventIDPrefix) }
+func NewStoreIDChecked() (string, error)     { return NewPrefixedIDChecked(StoreIDPrefix) }
 
 // ValidateID validates a UUIDv7-backed identifier and its required prefix.
 func ValidateID(value, prefix string) error {

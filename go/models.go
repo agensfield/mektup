@@ -68,27 +68,43 @@ type ManualResolution struct {
 	Presentation string `json:"presentation"`
 }
 
+func (m ManualResolution) Validate() error {
+	if m.Assertion != "accepted" && m.Assertion != "not_delivered" {
+		return fmt.Errorf("mektup: invalid manual resolution assertion %q", m.Assertion)
+	}
+	if m.Actor == "" || m.Reason == "" || m.EvidenceRef == "" || m.Presentation == "" {
+		return fmt.Errorf("mektup: manual resolution actor, reason, evidenceRef, and presentation are required")
+	}
+	return validateTimestamp(m.Timestamp, "manualResolution.timestamp")
+}
+
 // Receipt is the portable metadata-only receipt. Deliberately there is no
 // Body field anywhere in the receipt model.
 type Receipt struct {
-	Schema      string            `json:"schema"`
-	ReceiptID   string            `json:"receiptId"`
-	OperationID string            `json:"operationId"`
-	Operation   string            `json:"operation"`
-	State       EvidenceState     `json:"state"`
-	Source      ReceiptIdentity   `json:"source"`
-	Target      ReceiptIdentity   `json:"target"`
-	Message     ReceiptMessage    `json:"message"`
-	ContentRef  *ContentRef       `json:"contentRef,omitempty"`
-	Evidence    []EvidenceRecord  `json:"evidence"`
-	Warnings    []Warning         `json:"warnings"`
-	Resolution  *ManualResolution `json:"resolution,omitempty"`
-	CreatedAt   string            `json:"createdAt"`
-	UpdatedAt   string            `json:"updatedAt"`
+	Schema      string           `json:"schema"`
+	ReceiptID   string           `json:"receiptId"`
+	OperationID string           `json:"operationId"`
+	Operation   string           `json:"operation"`
+	State       EvidenceState    `json:"state"`
+	Source      ReceiptIdentity  `json:"source"`
+	Target      ReceiptIdentity  `json:"target"`
+	Message     ReceiptMessage   `json:"message"`
+	ContentRef  *ContentRef      `json:"contentRef,omitempty"`
+	Evidence    []EvidenceRecord `json:"evidence"`
+	Warnings    []Warning        `json:"warnings"`
+	// ManualResolution is the contract field. Resolution is a deprecated Go
+	// alias accepted for source compatibility and is emitted as manualResolution.
+	ManualResolution *ManualResolution `json:"manualResolution,omitempty"`
+	Resolution       *ManualResolution `json:"-"`
+	CreatedAt        string            `json:"createdAt"`
+	UpdatedAt        string            `json:"updatedAt"`
 }
 
 func (r Receipt) MarshalJSON() ([]byte, error) {
 	type plain Receipt
+	if r.ManualResolution == nil {
+		r.ManualResolution = r.Resolution
+	}
 	if r.Evidence == nil {
 		r.Evidence = []EvidenceRecord{}
 	}
@@ -153,9 +169,24 @@ func (r Receipt) Validate() error {
 			return err
 		}
 	}
+	resolution := r.ManualResolution
+	if resolution == nil {
+		resolution = r.Resolution
+	}
+	if resolution != nil {
+		if err := resolution.Validate(); err != nil {
+			return err
+		}
+	}
 	if r.ContentRef != nil {
-		if r.ContentRef.EndpointID != "" && !strings.HasPrefix(r.ContentRef.EndpointID, EndpointIDPrefix) {
+		if r.ContentRef.EndpointID == "" || ValidateID(r.ContentRef.EndpointID, EndpointIDPrefix) != nil {
 			return fmt.Errorf("mektup: invalid content endpoint")
+		}
+		if r.ContentRef.ThreadID == "" {
+			return fmt.Errorf("mektup: content thread locator is required")
+		}
+		if r.ContentRef.ItemID == "" && r.ContentRef.ClientMessageID == "" {
+			return fmt.Errorf("mektup: content item or client-message locator is required")
 		}
 		if !validDigest(r.ContentRef.PayloadSHA256) {
 			return fmt.Errorf("mektup: invalid content digest")
@@ -212,18 +243,82 @@ type Event struct {
 	OK          bool           `json:"ok"`
 	Warnings    []Warning      `json:"warnings"`
 	Data        map[string]any `json:"data"`
-	Error       *Error         `json:"error,omitempty"`
+	// Error is the ergonomic view of data.error. It is never emitted as a
+	// second top-level authority; the wire contract nests it under data.
+	Error *Error `json:"-"`
 }
 
 func (e Event) MarshalJSON() ([]byte, error) {
-	type plain Event
 	if e.Warnings == nil {
 		e.Warnings = []Warning{}
 	}
 	if e.Data == nil {
 		e.Data = map[string]any{}
 	}
-	return json.Marshal(plain(e))
+	data := make(map[string]any, len(e.Data)+1)
+	for key, value := range e.Data {
+		data[key] = value
+	}
+	if e.Error != nil {
+		if existing, ok := data["error"]; ok {
+			encoded, err := json.Marshal(existing)
+			if err != nil {
+				return nil, err
+			}
+			var prior Error
+			if json.Unmarshal(encoded, &prior) != nil || prior.Code != e.Error.Code || prior.Message != e.Error.Message {
+				return nil, fmt.Errorf("mektup: event data.error conflicts with Event.Error")
+			}
+		}
+		data["error"] = e.Error
+	}
+	type wireEvent struct {
+		Schema      string         `json:"schema"`
+		Event       string         `json:"event"`
+		EventID     string         `json:"eventId"`
+		Sequence    uint64         `json:"sequence"`
+		OperationID string         `json:"operationId"`
+		Timestamp   string         `json:"timestamp"`
+		Terminal    bool           `json:"terminal"`
+		OK          bool           `json:"ok"`
+		Warnings    []Warning      `json:"warnings"`
+		Data        map[string]any `json:"data"`
+	}
+	return json.Marshal(wireEvent{e.Schema, e.Event, e.EventID, e.Sequence, e.OperationID, e.Timestamp, e.Terminal, e.OK, e.Warnings, data})
+}
+
+func (e *Event) UnmarshalJSON(data []byte) error {
+	type wireEvent struct {
+		Schema      string         `json:"schema"`
+		Event       string         `json:"event"`
+		EventID     string         `json:"eventId"`
+		Sequence    uint64         `json:"sequence"`
+		OperationID string         `json:"operationId"`
+		Timestamp   string         `json:"timestamp"`
+		Terminal    bool           `json:"terminal"`
+		OK          bool           `json:"ok"`
+		Warnings    []Warning      `json:"warnings"`
+		Data        map[string]any `json:"data"`
+	}
+	var wire wireEvent
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*e = Event{Schema: wire.Schema, Event: wire.Event, EventID: wire.EventID, Sequence: wire.Sequence,
+		OperationID: wire.OperationID, Timestamp: wire.Timestamp, Terminal: wire.Terminal, OK: wire.OK,
+		Warnings: wire.Warnings, Data: wire.Data}
+	if raw, ok := wire.Data["error"]; ok {
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			return err
+		}
+		var nested Error
+		if err := json.Unmarshal(encoded, &nested); err != nil {
+			return fmt.Errorf("mektup: malformed data.error: %w", err)
+		}
+		e.Error = &nested
+	}
+	return nil
 }
 
 func (e Event) Validate() error {

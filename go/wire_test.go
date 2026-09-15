@@ -3,8 +3,11 @@ package mektup
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fixtureEnvelope() Envelope {
@@ -87,6 +90,47 @@ func TestEnvelopeRejectsMalformedAndMismatchedInputs(t *testing.T) {
 	if err := e.ValidateAddressToThread(e.To); err != nil {
 		t.Fatal(err)
 	}
+	if err := e.ValidateAddressToThread("codex://local/thread/source"); err == nil {
+		t.Fatal("destination URI was accepted as source thread")
+	}
+	if err := e.ValidateAddressToThread("destination"); err != nil {
+		t.Fatal(err)
+	}
+	unknown := bytes.Replace(b, []byte("[Mektup/1]\n"), []byte("[Mektup/1]\nfuture-field: {\"v\": 1}\n"), 1)
+	if _, err := ParseEnvelope(unknown); err != nil {
+		t.Fatalf("additive unknown header rejected: %v", err)
+	}
+	badUnknown := bytes.Replace(b, []byte("[Mektup/1]\n"), []byte("[Mektup/1]\nfuture-field: {\n"), 1)
+	if _, err := ParseEnvelope(badUnknown); err == nil {
+		t.Fatal("malformed unknown header accepted")
+	}
+}
+
+func TestEnvelopeURIAndReplyStatusInvariants(t *testing.T) {
+	e := fixtureEnvelope()
+	e.RequestedTarget = ""
+	if _, err := RenderEnvelope(e); err == nil {
+		t.Fatal("empty requested target accepted")
+	}
+	e = fixtureEnvelope()
+	e.Kind = KindReply
+	e.InReplyTo = NewMessageID()
+	e.ReplyStatus = ReplySuccess
+	e.ReplyErrorCode = "peer_failed"
+	e.PayloadBytes = uint64(len([]byte(e.Body)))
+	e.PayloadSHA256 = sha256Digest(e.Body)
+	if _, err := RenderEnvelope(e); err == nil {
+		t.Fatal("success reply accepted error code")
+	}
+	if _, err := ParseThreadURI("codex://local/thread/abc"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseHerdrURI("herdr://local/agent/a"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ParseThreadURI("herdr://local/agent/a"); err == nil {
+		t.Fatal("wrong URI scheme accepted")
+	}
 }
 
 func TestReplyRelationshipAndUnknownReceiptFields(t *testing.T) {
@@ -161,5 +205,57 @@ func TestEventSequencer(t *testing.T) {
 	}
 	if err := s.Append(Event{Schema: EventSchema, Event: "bad", EventID: NewEventID(), Sequence: 4, OperationID: s.OperationID(), Timestamp: a.Timestamp, OK: true}); err == nil {
 		t.Fatal("sequence gap accepted")
+	}
+}
+
+func TestEventErrorIsNestedInData(t *testing.T) {
+	e := Event{Schema: EventSchema, Event: "operation.failed", EventID: NewEventID(), Sequence: 1,
+		OperationID: NewOperationID(), Timestamp: "2026-09-15T03:00:00.000000Z", Terminal: true,
+		Error: &Error{Code: ErrInternal, Message: "boom", EffectState: "unknown"}}
+	b, err := json.Marshal(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var object map[string]any
+	if err := json.Unmarshal(b, &object); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := object["error"]; ok {
+		t.Fatal("error emitted as top-level field")
+	}
+	data, ok := object["data"].(map[string]any)
+	if !ok {
+		t.Fatalf("data missing: %s", b)
+	}
+	if _, ok := data["error"]; !ok {
+		t.Fatalf("nested error missing: %s", b)
+	}
+	parsed, err := ParseEvent(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Error == nil || parsed.Error.Code != ErrInternal {
+		t.Fatalf("nested error not recovered: %#v", parsed)
+	}
+}
+
+func TestUUIDv7CheckedFailsClosedAndIsInjectable(t *testing.T) {
+	_, err := NewUUIDv7From(strings.NewReader("x"), time.UnixMilli(1))
+	if err == nil {
+		t.Fatal("entropy failure was not returned")
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("unexpected entropy error: %v", err)
+	}
+	random := bytes.NewReader(bytes.Repeat([]byte{0x11}, 10))
+	id, err := NewUUIDv7From(random, time.UnixMilli(0x010203040506))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateID("msg_"+id, MessageIDPrefix); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(id, "01020304-0506") {
+		t.Fatalf("timestamp not encoded: %s", id)
 	}
 }

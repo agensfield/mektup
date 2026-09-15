@@ -87,6 +87,9 @@ func (e Envelope) Validate() error {
 	if e.To == "" {
 		return fmt.Errorf("mektup: destination thread is required")
 	}
+	if e.RequestedTarget == "" {
+		return fmt.Errorf("mektup: requested-target is required")
+	}
 	if e.FromKind != "agent" && e.FromKind != "human" {
 		return fmt.Errorf("mektup: invalid from-kind %q", e.FromKind)
 	}
@@ -102,6 +105,9 @@ func (e Envelope) Validate() error {
 		}
 		if e.ReplyStatus != ReplySuccess && e.ReplyStatus != ReplyError {
 			return fmt.Errorf("mektup: invalid reply status %q", e.ReplyStatus)
+		}
+		if e.ReplyStatus == ReplySuccess && e.ReplyErrorCode != "" {
+			return fmt.Errorf("mektup: successful reply cannot carry reply-error-code")
 		}
 	} else if e.InReplyTo != "" || e.ReplyStatus != "" || e.ReplyErrorCode != "" {
 		return fmt.Errorf("mektup: reply fields are not valid on a message")
@@ -143,16 +149,30 @@ func (e Envelope) Validate() error {
 	if e.Provenance != "observed" {
 		return fmt.Errorf("mektup: unsupported provenance %q", e.Provenance)
 	}
+	if err := e.validateAddresses(); err != nil {
+		return err
+	}
 	return nil
 }
 
 // ValidateAddressToThread verifies that an envelope is addressed to the
 // currently executing Codex thread. It intentionally does not infer identity.
 func (e Envelope) ValidateAddressToThread(currentThread string) error {
-	if currentThread == "" || e.To != currentThread {
-		return fmt.Errorf("%s: envelope targets %q, current thread is %q", ErrMessageNotAddressedThread, e.To, currentThread)
+	target, err := ParseThreadURI(e.To)
+	if err != nil {
+		return fmt.Errorf("%s: invalid envelope target: %w", ErrMessageNotAddressedThread, err)
 	}
-	return nil
+	if currentThread == "" {
+		return fmt.Errorf("%s: current thread is empty", ErrMessageNotAddressedThread)
+	}
+	if current, uriErr := ParseThreadURI(currentThread); uriErr == nil {
+		if current.Endpoint == target.Endpoint && current.ThreadID == target.ThreadID {
+			return nil
+		}
+	} else if currentThread == target.ThreadID {
+		return nil
+	}
+	return fmt.Errorf("%s: envelope targets %q, current thread is %q", ErrMessageNotAddressedThread, e.To, currentThread)
 }
 
 // ValidateReplyFor checks the immutable routing relationship between a reply
@@ -391,7 +411,13 @@ func ParseEnvelope(input []byte) (Envelope, error) {
 			return Envelope{}, fmt.Errorf("mektup: malformed header line %q", line)
 		}
 		if _, ok := known[key]; !ok {
-			return Envelope{}, fmt.Errorf("mektup: unknown header %q", key)
+			// Envelope extensions are additive. A future header is ignored after
+			// validating that its physical line contains one complete JSON value;
+			// known fields remain strict and canonical rendering omits extensions.
+			if !json.Valid([]byte(raw)) {
+				return Envelope{}, fmt.Errorf("mektup: malformed unknown header %q", key)
+			}
+			continue
 		}
 		if _, ok := fields[key]; ok {
 			return Envelope{}, fmt.Errorf("mektup: duplicate header %q", key)
