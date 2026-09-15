@@ -152,9 +152,9 @@ func validateDestinationThread(req sshproxy.ControlRequest) error {
 	if err != nil || segment == "." || segment == "/" || segment == "" {
 		return ErrRelationshipMismatch
 	}
-	// Existing local fixtures use the presentation form thread-<id>; Codex
-	// URIs normally carry the raw thread ID as their final path segment.
-	if req.ReplyDestination.ThreadID != segment && req.ReplyDestination.ThreadID != "thread-"+segment {
+	// The stable thread identity is the decoded final URI segment. Display
+	// aliases or presentation prefixes are not identity evidence.
+	if req.ReplyDestination.ThreadID != segment {
 		return ErrRelationshipMismatch
 	}
 	return nil

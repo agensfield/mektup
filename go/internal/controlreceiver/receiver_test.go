@@ -67,7 +67,7 @@ func request(j *journal.Journal) sshproxy.ControlRequest {
 	return sshproxy.ControlRequest{
 		Schema: "mektup/control/v1", Kind: "request", Operation: "claim", OperationID: operationID, ReplyMessageID: replyID, OriginalMessageID: originalID,
 		Custody:          sshproxy.CustodyRef{EndpointID: receiverEndpoint, StoreID: j.StoreID()},
-		ReplyDestination: sshproxy.DestinationRef{EndpointID: receiverEndpoint, ThreadID: "thread-source", URI: "codex://local/thread/source"},
+		ReplyDestination: sshproxy.DestinationRef{EndpointID: receiverEndpoint, ThreadID: "source", URI: "codex://local/thread/source"},
 		BodyBytes:        &bytesCount, BodySHA256: "sha256:" + strings.Repeat("c", 64), ReplyStatus: "success", AttemptOwner: "receiver-test",
 	}
 }
@@ -177,6 +177,11 @@ func TestReceiverRejectsWrongThreadForMatchingDestination(t *testing.T) {
 	wrong.ReplyDestination.ThreadID = "thread-other"
 	if _, err := receiver.Receive(context.Background(), mustMarshal(t, wrong)); !errors.Is(err, ErrRelationshipMismatch) {
 		t.Fatalf("wrong thread err = %v", err)
+	}
+	presentation := request(j)
+	presentation.ReplyDestination.ThreadID = "thread-source"
+	if _, err := receiver.Receive(context.Background(), mustMarshal(t, presentation)); !errors.Is(err, ErrRelationshipMismatch) {
+		t.Fatalf("presentation thread alias err = %v", err)
 	}
 }
 
