@@ -406,12 +406,12 @@ func (c *Client) enqueue(ctx context.Context, cmd command) error {
 		}
 		select {
 		case c.commands <- cmd:
-			c.admitMu.Unlock()
 			if cmd.kind == commandRequest {
 				c.mu.Lock()
 				c.queued[cmd.key] = struct{}{}
 				c.mu.Unlock()
 			}
+			c.admitMu.Unlock()
 			return nil
 		default:
 			c.admitMu.Unlock()
@@ -734,7 +734,15 @@ func (c *Client) Notify(ctx context.Context, notification RPCNotification) error
 func (c *Client) withdraw(ctx context.Context, key string) cancelOutcome {
 	c.mu.Lock()
 	c.withdrawn[key] = struct{}{}
+	_, queued := c.queued[key]
 	c.mu.Unlock()
+	if queued {
+		// The command is still in the writer queue and has not crossed the
+		// transport boundary. Leave the withdrawal marker for the pump to
+		// consume; this is an atomic, proven-before-write cancellation even if
+		// another request currently owns a stalled write.
+		return cancelOutcome{phase: WriteProvenBeforeWrite, ok: true}
+	}
 	if c.cancelActiveWrite() {
 		// The active writer may belong to another command. There is no way for
 		// this queued cancellation to receive an ordered writer acknowledgement

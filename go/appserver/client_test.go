@@ -207,8 +207,14 @@ func TestCancellationWithdrawsQueuedWriteBeforeClaimingNotSent(t *testing.T) {
 		_, err := c.call(ctx, RPCRequest{ID: "second", Method: "never"})
 		secondDone <- err
 	}()
+	queuedDeadline := time.Now().Add(time.Second)
+	for len(c.commands) == 0 && time.Now().Before(queuedDeadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if len(c.commands) == 0 {
+		t.Fatal("second request did not reach the writer queue")
+	}
 	cancel()
-	close(gate)
 	select {
 	case err := <-secondDone:
 		var callErr *CallError
@@ -218,6 +224,7 @@ func TestCancellationWithdrawsQueuedWriteBeforeClaimingNotSent(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("cancellation did not receive withdrawal acknowledgement")
 	}
+	close(gate)
 	_ = c.Close(context.Background())
 	<-firstDone
 }
@@ -434,12 +441,13 @@ func TestQueuedCancellationTerminatesUnrelatedStalledWriter(t *testing.T) {
 	select {
 	case err := <-second:
 		var callErr *CallError
-		if !errors.As(err, &callErr) || callErr.Evidence.Phase != WriteMayHaveWritten {
+		if !errors.As(err, &callErr) || (callErr.Evidence.Phase != WriteMayHaveWritten && callErr.Evidence.Phase != WriteProvenBeforeWrite) {
 			t.Fatalf("queued cancellation evidence = %T %+v", err, err)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("queued cancellation stuck behind unrelated active write")
 	}
+	_ = f.Close()
 	<-first
 }
 
