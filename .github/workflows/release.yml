@@ -33,7 +33,7 @@ jobs:
       - name: Install Syft for the GoReleaser SBOM step
         uses: anchore/sbom-action/download-syft@v0.20.5
         with:
-          syft-version: v1.31.0
+          syft-version: v1.51.1
       - name: Release with GoReleaser
         uses: goreleaser/goreleaser-action@v6
         with:

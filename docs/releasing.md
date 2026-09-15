@@ -11,7 +11,8 @@ security gates must be green on the intended merge commit. At minimum, record
 the results of:
 
 - `make fmt-check`, `make test`, `make test-race`, `make vet`, and the contract
-  JSON validation;
+  JSON validation (Draft 2020-12 positive and negative fixtures through the
+  pinned `ajv-cli@5.0.0` validator);
 - the CI Darwin/Linux amd64/arm64 build matrix;
 - the supported app-server compatibility tests, including tested Codex
   `0.154.0` evidence and the explicit untested/unsupported paths;
@@ -51,6 +52,7 @@ workflow runs GoReleaser. It is configured to produce deterministic,
 `-trimpath` Darwin/Linux amd64/arm64 `tar.gz` archives, a SHA-256 checksum
 manifest, and one SBOM document per archive. Release metadata is embedded with
 ldflags for version, commit, contract `1.0.1`, and tested Codex `0.154.0`.
+The workflow pins Syft `v1.51.1` for SBOM generation.
 The commit timestamp is used for archive metadata so rebuilding the same source
 does not acquire a wall-clock timestamp.
 
