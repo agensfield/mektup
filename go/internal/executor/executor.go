@@ -233,8 +233,15 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		}
 	}
 	defer func() {
-		if closeErr := conn.Close(); closeErr != nil && execErr == nil {
-			result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+		if closeErr := conn.Close(); closeErr != nil {
+			if execErr == nil {
+				result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+			} else if existing, ok := execErr.(*cli.Error); ok {
+				if existing.Details == nil {
+					existing.Details = map[string]any{}
+				}
+				existing.Details["cleanup"] = map[string]any{"code": "cleanup_incomplete", "error": closeErr.Error()}
+			}
 		}
 	}()
 	sub := inv.Position[0]
@@ -350,8 +357,15 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (result cli.E
 		return cli.ExecutionResult{}, err
 	}
 	defer func() {
-		if closeErr := conn.Close(); closeErr != nil && execErr == nil {
-			result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+		if closeErr := conn.Close(); closeErr != nil {
+			if execErr == nil {
+				result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+			} else if existing, ok := execErr.(*cli.Error); ok {
+				if existing.Details == nil {
+					existing.Details = map[string]any{}
+				}
+				existing.Details["cleanup"] = map[string]any{"code": "cleanup_incomplete", "error": closeErr.Error()}
+			}
 		}
 	}()
 	options := codexapi.SearchOptions{SearchTerm: inv.Position[0], Cursor: inv.Option("cursor"), Limit: optionInt(inv, "limit"), SourceKinds: options(inv, "source"), Archived: boolOption(inv, "archived")}
@@ -581,8 +595,15 @@ func (e *Executor) rpc(ctx context.Context, inv cli.Invocation) (result cli.Exec
 		return cli.ExecutionResult{}, err
 	}
 	defer func() {
-		if closeErr := conn.Close(); closeErr != nil && execErr == nil {
-			result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+		if closeErr := conn.Close(); closeErr != nil {
+			if execErr == nil {
+				result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+			} else if existing, ok := execErr.(*cli.Error); ok {
+				if existing.Details == nil {
+					existing.Details = map[string]any{}
+				}
+				existing.Details["cleanup"] = map[string]any{"code": "cleanup_incomplete", "error": closeErr.Error()}
+			}
 		}
 	}()
 	var output rawrpc.OutputOptions
