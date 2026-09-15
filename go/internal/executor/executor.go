@@ -203,6 +203,8 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 	var data any
 	var kind string
 	var cursor string
+	var collection bool
+	var resultKind string
 	var warnings = append([]string(nil), conn.Warnings()...)
 	switch sub {
 	case "list":
@@ -212,6 +214,8 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 		}
 		data, cursor = pageData(r.Raw, r, r.NextCursor)
 		kind = "thread.list"
+		data = responseDataArray(r.Raw)
+		collection, resultKind = true, "thread"
 	case "read":
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread read requires a thread identifier")
@@ -220,7 +224,8 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
-		data, kind = rawOr(r.Raw, r), "thread.read"
+		data, kind = responseThreadArray(r.Raw), "thread.read"
+		collection, resultKind = true, "thread"
 	case "turns":
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread turns requires a thread identifier")
@@ -231,6 +236,8 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 		}
 		data, cursor = pageData(r.Raw, r, r.NextCursor)
 		kind = "thread.turns"
+		data = responseDataArray(r.Raw)
+		collection, resultKind = true, "thread"
 	case "items":
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread items requires a thread identifier")
@@ -241,6 +248,8 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 		}
 		data, cursor = pageData(r.Raw, r, r.NextCursor)
 		kind = "thread.items"
+		data = responseDataArray(r.Raw)
+		collection, resultKind = true, "thread"
 	case "start":
 		r, callErr := api.ThreadStart(ctx, codexapi.StartOptions{Model: inv.Option("model"), CWD: inv.Option("cwd"), ThreadSource: inv.Option("source")})
 		if callErr != nil {
@@ -278,6 +287,9 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 	default:
 		return cli.ExecutionResult{}, usage("unsupported thread subcommand: " + sub)
 	}
+	if collection {
+		return e.collectionResult(ctx, kind, resultKind, data, cursor, warnings, mutating, inv.Resolved.Endpoint)
+	}
 	return e.result(ctx, kind, data, cursor, warnings, mutating, inv.Resolved.Endpoint)
 }
 
@@ -307,17 +319,17 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (cli.Executio
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
-		data, cursor := pageData(r.Raw, r, r.NextCursor)
+		data, cursor := responseDataArray(r.Raw), r.NextCursor
 		warnings := append([]string(nil), conn.Warnings()...)
-		return e.result(ctx, "search.scoped", data, cursor, warnings, false, inv.Resolved.Endpoint)
+		return e.collectionResult(ctx, "search", "message", data, cursor, warnings, false, inv.Resolved.Endpoint)
 	}
 	r, callErr := api.Search(ctx, options)
 	if callErr != nil {
 		return cli.ExecutionResult{}, mapError(callErr, "unknown")
 	}
-	data, cursor := pageData(r.Raw, r, r.NextCursor)
+	data, cursor := responseDataArray(r.Raw), r.NextCursor
 	warnings := append([]string(nil), conn.Warnings()...)
-	return e.result(ctx, "search", data, cursor, warnings, false, inv.Resolved.Endpoint)
+	return e.collectionResult(ctx, "search", "thread", data, cursor, warnings, false, inv.Resolved.Endpoint)
 }
 
 func (e *Executor) endpoint(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
@@ -417,13 +429,13 @@ func (e *Executor) storage(ctx context.Context, inv cli.Invocation) (cli.Executi
 		if err != nil {
 			return cli.ExecutionResult{}, mapError(err, "not_sent")
 		}
-		return e.result(ctx, "storage.status", v, "", nil, false, "local")
+		return e.storageResult(ctx, "status", v, false, "local")
 	case "check":
 		v, err := e.ports.Storage.Check(ctx)
 		if err != nil {
 			return cli.ExecutionResult{}, mapError(err, "not_sent")
 		}
-		return e.result(ctx, "storage.check", v, "", nil, false, "local")
+		return e.storageResult(ctx, "check", v, false, "local")
 	case "maintain":
 		before, err := parseTime(inv.Option("before"))
 		if err != nil {
@@ -433,13 +445,13 @@ func (e *Executor) storage(ctx context.Context, inv cli.Invocation) (cli.Executi
 		if err != nil {
 			return cli.ExecutionResult{}, mapError(err, "unknown")
 		}
-		return e.result(ctx, "storage.maintain", v, "", nil, true, "local")
+		return e.storageResult(ctx, "maintain", v, true, "local")
 	case "vacuum":
 		v, err := e.ports.Storage.Vacuum(ctx)
 		if err != nil {
 			return cli.ExecutionResult{}, mapError(err, "unknown")
 		}
-		return e.result(ctx, "storage.vacuum", v, "", nil, true, "local")
+		return e.storageResult(ctx, "vacuum", v, true, "local")
 	default:
 		return cli.ExecutionResult{}, usage("unsupported storage subcommand: " + sub)
 	}
@@ -567,26 +579,41 @@ func (e *Executor) params(ctx context.Context, inv cli.Invocation) (json.RawMess
 }
 
 func (e *Executor) result(ctx context.Context, kind string, data any, cursor string, warnings []string, mutation bool, endpointID string) (cli.ExecutionResult, error) {
-	payload := map[string]any{"resultKind": kind, "result": data}
-	if strings.HasPrefix(kind, "search") {
+	return e.resultEnvelope(ctx, kind, kind, "result", data, cursor, warnings, mutation, endpointID, "")
+}
+
+func (e *Executor) collectionResult(ctx context.Context, eventKind, resultKind string, data any, cursor string, warnings []string, mutation bool, endpointID string) (cli.ExecutionResult, error) {
+	return e.resultEnvelope(ctx, eventKind, resultKind, "data", data, cursor, warnings, mutation, endpointID, "")
+}
+
+func (e *Executor) storageResult(ctx context.Context, subcommand string, data any, mutation bool, endpointID string) (cli.ExecutionResult, error) {
+	return e.resultEnvelope(ctx, "storage", "storage", "result", data, "", nil, mutation, endpointID, subcommand)
+}
+
+func (e *Executor) resultEnvelope(ctx context.Context, eventKind, resultKind, field string, data any, cursor string, warnings []string, mutation bool, endpointID, subcommand string) (cli.ExecutionResult, error) {
+	payload := map[string]any{"resultKind": resultKind, field: data}
+	if subcommand != "" {
+		payload["subcommand"] = subcommand
+	}
+	if eventKind == "search" {
 		payload["experimental"] = true
 	}
 	if cursor != "" {
 		payload["nextCursor"] = cursor
 	}
-	eventMachine := map[string]any{"event": kind + ".completed", "terminal": true, "ok": true, "data": payload}
+	eventMachine := map[string]any{"event": eventKind + ".completed", "terminal": true, "ok": true, "data": payload}
 	if len(warnings) != 0 {
 		// warnings is a lifecycle envelope field. Keeping it out of data is
 		// important because App preserves this top-level location verbatim.
 		eventMachine["warnings"] = warningObjects(warnings)
 	}
-	event := cli.OutputEvent{Machine: eventMachine, Human: kind}
+	event := cli.OutputEvent{Machine: eventMachine, Human: eventKind}
 	result := cli.ExecutionResult{Events: []cli.OutputEvent{event}, Exit: cli.ExitSuccess}
 	if mutation {
 		if e.ports.Receipts == nil {
 			return cli.ExecutionResult{}, missing("receipt journal")
 		}
-		receipt, err := e.ports.Receipts.Mutation(ctx, kind, endpointID, data)
+		receipt, err := e.ports.Receipts.Mutation(ctx, eventKind, endpointID, data)
 		if err != nil {
 			return cli.ExecutionResult{}, mapError(err, "unknown")
 		}
@@ -596,6 +623,26 @@ func (e *Executor) result(ctx context.Context, kind string, data any, cursor str
 		result.Receipt = receipt
 	}
 	return result, nil
+}
+
+func responseDataArray(raw json.RawMessage) any {
+	var envelope struct {
+		Data json.RawMessage `json:"data"`
+	}
+	if json.Unmarshal(raw, &envelope) == nil && len(bytes.TrimSpace(envelope.Data)) != 0 && !bytes.Equal(bytes.TrimSpace(envelope.Data), []byte("null")) {
+		return json.RawMessage(envelope.Data)
+	}
+	return []any{}
+}
+
+func responseThreadArray(raw json.RawMessage) any {
+	var envelope struct {
+		Thread json.RawMessage `json:"thread"`
+	}
+	if json.Unmarshal(raw, &envelope) == nil && len(bytes.TrimSpace(envelope.Thread)) != 0 && !bytes.Equal(bytes.TrimSpace(envelope.Thread), []byte("null")) {
+		return []json.RawMessage{json.RawMessage(envelope.Thread)}
+	}
+	return []any{}
 }
 
 func warningObjects(warnings []string) []map[string]any {

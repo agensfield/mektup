@@ -324,6 +324,55 @@ func TestLifecycleWarningsRemainAtEnvelopeLevel(t *testing.T) {
 	}
 }
 
+func TestAppJSONLUsesLockedReadAndStorageFamilies(t *testing.T) {
+	commands := []struct {
+		name       string
+		args       []string
+		event      string
+		resultKind string
+		wantData   bool
+		subcommand string
+	}{
+		{"thread list", []string{"thread", "list"}, "thread.list.completed", "thread", true, ""},
+		{"thread read", []string{"thread", "read", "thr_1"}, "thread.read.completed", "thread", true, ""},
+		{"thread turns", []string{"thread", "turns", "thr_1", "--view", "summary"}, "thread.turns.completed", "thread", true, ""},
+		{"thread items", []string{"thread", "items", "thr_1"}, "thread.items.completed", "thread", true, ""},
+		{"search", []string{"search", "needle"}, "search.completed", "thread", true, ""},
+		{"search scoped", []string{"search", "needle", "--thread", "thr_1"}, "search.completed", "message", true, ""},
+		{"storage status", []string{"storage", "status"}, "storage.completed", "storage", false, "status"},
+	}
+	for _, tc := range commands {
+		t.Run(tc.name, func(t *testing.T) {
+			var out, errOut bytes.Buffer
+			e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{scoped: strings.Contains(tc.name, "scoped")}}}, Storage: &fakeStorage{}, Receipts: &fakeReceipts{}})
+			a := &cli.App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, Executor: e}
+			args := append([]string{"--json"}, tc.args...)
+			if code := a.Run(args); code != int(cli.ExitSuccess) {
+				t.Fatalf("code=%d stderr=%q", code, errOut.String())
+			}
+			var event map[string]any
+			if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &event); err != nil {
+				t.Fatal(err)
+			}
+			if event["event"] != tc.event {
+				t.Fatalf("event=%v want=%s", event["event"], tc.event)
+			}
+			data := event["data"].(map[string]any)
+			if data["resultKind"] != tc.resultKind {
+				t.Fatalf("resultKind=%v want=%s", data["resultKind"], tc.resultKind)
+			}
+			if tc.wantData {
+				if _, ok := data["data"].([]any); !ok {
+					t.Fatalf("data is not bounded array: %#v", data["data"])
+				}
+			}
+			if tc.subcommand != "" && data["subcommand"] != tc.subcommand {
+				t.Fatalf("subcommand=%v want=%s", data["subcommand"], tc.subcommand)
+			}
+		})
+	}
+}
+
 func TestEmptyInlineParamsAreRejectedBeforeRPC(t *testing.T) {
 	rpc := &fakeRPC{}
 	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}, RPC: rpc, Receipts: &fakeReceipts{}})
