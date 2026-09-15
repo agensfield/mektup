@@ -84,10 +84,13 @@ func (e *Environment) Execute(ctx context.Context, inv cli.Invocation) (result c
 		return cli.ExecutionResult{}, err
 	}
 	defer func() {
-		if closeErr := resources.Close(); closeErr != nil {
+		var closeErr error
+		result, closeErr = resources.CloseWithResult(ctx, result)
+		if closeErr != nil {
 			cleanupErr := &CleanupError{Resource: "application resources", Err: closeErr}
 			if execErr == nil {
-				result = preserveCleanupResult(result, cleanupErr)
+				// CloseWithResult has already decorated the accepted result and
+				// persisted the warning while the journal was still available.
 			} else {
 				execErr = errors.Join(execErr, cleanupErr)
 			}
@@ -117,6 +120,7 @@ type CleanupError struct {
 
 func preserveCleanupResult(result cli.ExecutionResult, cleanupErr error) cli.ExecutionResult {
 	warning := map[string]any{"code": "cleanup_incomplete", "message": "application resource cleanup failed", "details": map[string]any{"error": cleanupErr.Error()}}
+	result.Receipt = addReceiptWarning(result.Receipt, cleanupErr)
 	for index := range result.Events {
 		machine, ok := result.Events[index].Machine.(map[string]any)
 		if !ok {
@@ -134,6 +138,15 @@ func preserveCleanupResult(result cli.ExecutionResult, cleanupErr error) cli.Exe
 	}
 	result.Exit = cli.ExitInternal
 	return result
+}
+
+func addReceiptWarning(value any, cleanupErr error) any {
+	receipt, ok := value.(mektup.Receipt)
+	if !ok {
+		return value
+	}
+	receipt.Warnings = append(receipt.Warnings, mektup.Warning{Code: mektup.WarningCleanupIncomplete, Message: "application resource cleanup failed", Details: map[string]any{"error": cleanupErr.Error()}})
+	return receipt
 }
 
 func appendWireWarning(existing any, warning map[string]any) []any {
@@ -172,17 +185,47 @@ type resources struct {
 func (r *resources) Ports() executor.Ports { return r.ports.Ports }
 
 func (r *resources) Close() error {
+	_, err := r.CloseWithResult(context.Background(), cli.ExecutionResult{})
+	return err
+}
+
+func (r *resources) CloseWithResult(ctx context.Context, result cli.ExecutionResult) (cli.ExecutionResult, error) {
 	if r == nil {
-		return nil
+		return result, nil
 	}
 	var joined error
 	if r.artifact != nil {
-		joined = errors.Join(joined, r.artifact.Close())
+		if err := r.artifact.Close(); err != nil {
+			cleanupErr := &CleanupError{Resource: "artifact store", Err: err}
+			result = preserveCleanupResult(result, cleanupErr)
+			if persistErr := persistReceiptWarning(ctx, r.journal, result.Receipt); persistErr != nil {
+				joined = errors.Join(joined, cleanupErr, persistErr)
+			} else {
+				joined = errors.Join(joined, cleanupErr)
+			}
+		}
 	}
 	if r.journal != nil {
-		joined = errors.Join(joined, r.journal.Close())
+		if err := r.journal.Close(); err != nil {
+			result = preserveCleanupResult(result, &CleanupError{Resource: "journal", Err: err})
+			joined = errors.Join(joined, err)
+		}
 	}
-	return joined
+	return result, joined
+}
+
+func persistReceiptWarning(ctx context.Context, j *journal.Journal, value any) error {
+	if j == nil {
+		return nil
+	}
+	receipt, ok := value.(mektup.Receipt)
+	if !ok {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return j.PutReceipt(ctx, receipt)
 }
 
 type resourcePorts struct {
