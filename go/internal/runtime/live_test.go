@@ -87,7 +87,7 @@ func TestLiveBodyCarryAcceptance(t *testing.T) {
 	targetURI := "codex://live/thread/" + target.Thread.ID
 	targetResolved := service.ResolvedTarget{EndpointID: endpointID, URI: targetURI, ThreadID: target.Thread.ID, Loaded: true, Persistent: true}
 	senderResolver := liveResolver{source: service.SourceIdentity{EndpointID: endpointID, URI: sourceURI, CustodyEndpointID: endpointID, CustodyStoreID: store.StoreID()}, target: targetResolved}
-	receiverResolver := liveResolver{source: service.SourceIdentity{EndpointID: endpointID, URI: targetURI, CustodyEndpointID: endpointID, CustodyStoreID: store.StoreID()}, target: targetResolved}
+	receiverResolver := liveResolver{source: service.SourceIdentity{EndpointID: endpointID, URI: targetURI, CustodyEndpointID: endpointID, CustodyStoreID: store.StoreID()}, target: targetResolved, replyURI: sourceURI}
 	observe := &ObservationAdapter{Pool: pool}
 	gatedObserve := &custodyFirstObservation{inner: observe, release: make(chan struct{})}
 	sender := &service.Service{Resolver: senderResolver, Delivery: &DeliveryAdapter{Pool: pool}, Journal: journalAdapter, Observe: gatedObserve}
@@ -344,8 +344,17 @@ func (o *slowHistoryObservation) FullHistory(ctx context.Context, _ service.Reso
 }
 
 type liveResolver struct {
-	source service.SourceIdentity
-	target service.ResolvedTarget
+	source   service.SourceIdentity
+	target   service.ResolvedTarget
+	replyURI string
+}
+
+func TestReceiverResolverAcceptsOriginalReturnRoute(t *testing.T) {
+	ep := "ep_01999999-9999-7999-8999-999999999995"
+	r := liveResolver{source: service.SourceIdentity{EndpointID: ep, URI: "codex://live/thread/target"}, target: service.ResolvedTarget{EndpointID: ep, URI: "codex://live/thread/target", ThreadID: "target", Loaded: true}}
+	if _, err := r.ResolvePinned(context.Background(), ep, "codex://live/thread/source"); err != nil {
+		t.Fatalf("receiver config rejects original return route: %v", err)
+	}
 }
 
 func (r liveResolver) Resolve(context.Context, string) (service.ResolvedTarget, error) {
@@ -355,10 +364,13 @@ func (r liveResolver) ResolveSource(context.Context, string) (service.SourceIden
 	return r.source, nil
 }
 func (r liveResolver) ResolvePinned(_ context.Context, endpointID, uri string) (service.ResolvedTarget, error) {
-	if endpointID != r.source.EndpointID || uri != r.source.URI {
+	if endpointID != r.source.EndpointID {
 		return service.ResolvedTarget{}, errors.New("pinned source mismatch")
 	}
-	return service.ResolvedTarget{EndpointID: endpointID, URI: uri, ThreadID: r.source.URI[strings.LastIndex(r.source.URI, "/")+1:], Loaded: true, Persistent: true}, nil
+	if r.replyURI != "" && uri != r.replyURI {
+		return service.ResolvedTarget{}, errors.New("pinned reply destination mismatch")
+	}
+	return service.ResolvedTarget{EndpointID: endpointID, URI: uri, ThreadID: uri[strings.LastIndex(uri, "/")+1:], Loaded: true, Persistent: true}, nil
 }
 
 type custodyFirstObservation struct {
