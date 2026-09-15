@@ -59,6 +59,7 @@ func TestControlValidationRejectsUntrustedPathAndBodyFields(t *testing.T) {
 func TestInvokeControlUsesFixedArgvAndMetadataStdin(t *testing.T) {
 	p := newFakeProcess()
 	factory := &fakeFactory{process: p}
+	request := validControlRequest()
 	go func() {
 		reader := bufio.NewReader(p.stdinR)
 		line, err := reader.ReadBytes('\n')
@@ -68,17 +69,22 @@ func TestInvokeControlUsesFixedArgvAndMetadataStdin(t *testing.T) {
 		if bytes.Contains(line, []byte("/tmp")) {
 			return
 		}
-		_, _ = p.stdoutW.Write([]byte(`{"schema":"mektup/control/v1","kind":"result","operation":"claim","result":{"fencingToken":"fence"}}`))
+		result := request
+		result.Kind = "result"
+		result.Result = json.RawMessage(`{"fencingToken":"fence","lease":{"expiresAt":"2026-09-15T03:00:31.900000Z"}}`)
+		resultBytes, _ := json.Marshal(result)
+		_, _ = p.stdoutW.Write(resultBytes)
 		_ = p.stdoutW.Close()
 		_ = p.stderrW.Close()
 		p.releaseWait()
 	}()
-	response, err := InvokeControl(context.Background(), Config{Host: "remote"}, validControlRequest(), factory, nil)
+	response, err := InvokeControl(context.Background(), Config{Host: "remote"}, request, factory, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(response) != `{"schema":"mektup/control/v1","kind":"result","operation":"claim","result":{"fencingToken":"fence"}}` {
-		t.Fatalf("response = %s", response)
+	var decoded ControlRequest
+	if err := json.Unmarshal(response, &decoded); err != nil || decoded.Kind != "result" || decoded.OperationID != request.OperationID {
+		t.Fatalf("response = %s err=%v", response, err)
 	}
 	if !reflect.DeepEqual(factory.argv, []string{"ssh", "--", "remote", "mektup", "control", "receive"}) {
 		t.Fatalf("argv = %#v", factory.argv)
@@ -97,5 +103,28 @@ func TestControlValidatorRunsBeforeSpawn(t *testing.T) {
 	}))
 	if !called || factoryCalled || !strings.Contains(err.Error(), "relationship not registered") {
 		t.Fatalf("called=%v factory=%v err=%v", called, factoryCalled, err)
+	}
+}
+
+func TestInvokeControlRejectsSwappedResponseIdentity(t *testing.T) {
+	p := newFakeProcess()
+	factory := &fakeFactory{process: p}
+	request := validControlRequest()
+	go func() {
+		_, _ = bufio.NewReader(p.stdinR).ReadBytes('\n')
+		result := request
+		result.Kind = "result"
+		result.OperationID = "op_0198f0e0-0000-7000-8000-00000000000e"
+		result.Result = json.RawMessage(`{"fencingToken":"fence","lease":{"expiresAt":"2026-09-15T03:00:31.900000Z"}}`)
+		response, _ := json.Marshal(result)
+		_, _ = p.stdoutW.Write(response)
+		_ = p.stdoutW.Close()
+		_ = p.stderrW.Close()
+		p.releaseWait()
+	}()
+	_, err := InvokeControl(context.Background(), Config{Host: "remote"}, request, factory, nil)
+	var failure *Failure
+	if !errors.As(err, &failure) || failure.Kind != FailureProxy || failure.Evidence != WriteComplete || !errors.Is(err, ErrControlValidation) {
+		t.Fatalf("swapped response error = %T %+v", err, err)
 	}
 }

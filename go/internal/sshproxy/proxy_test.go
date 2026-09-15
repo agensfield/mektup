@@ -305,6 +305,11 @@ func TestDeadlineUpdatesWakeBlockedReadAndWrite(t *testing.T) {
 		result := make(chan error, 1)
 		go func() { _, writeErr := conn.Write([]byte("blocked")); result <- writeErr }()
 		time.Sleep(10 * time.Millisecond)
+		for i := 0; i < 5000; i++ {
+			if err := conn.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if err := conn.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
 			t.Fatal(err)
 		}

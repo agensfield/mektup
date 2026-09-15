@@ -547,69 +547,38 @@ func (c *Conn) Write(p []byte) (int, error) {
 		n, err := c.child.stdin.Write(data)
 		result <- writeResult{n: n, err: err}
 	}()
-	deadline, wake := c.writeState()
-	wait, cancel := deadlineTimer(deadline)
-	select {
-	case outcome := <-result:
-		if cancel != nil {
-			cancel()
-		}
-		if outcome.err != nil || outcome.n != len(data) {
-			if outcome.err == nil {
-				outcome.err = io.ErrShortWrite
+	for {
+		deadline, wake := c.writeState()
+		wait, cancel := deadlineTimer(deadline)
+		select {
+		case outcome := <-result:
+			if cancel != nil {
+				cancel()
 			}
-			return outcome.n, &Failure{Kind: FailurePossibleWrite, Cause: FailureProxy, Evidence: WriteMayHaveWritten, Err: outcome.err}
-		}
-		c.writePhase.Store(WriteComplete)
-		return outcome.n, nil
-	case <-c.done:
-		if cancel != nil {
-			cancel()
-		}
-		return 0, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteMayHaveWritten, Err: context.Canceled}
-	case <-wake:
-		if cancel != nil {
-			cancel()
-		}
-		// A deadline update is a control event, not a write result. Re-enter
-		// the select with the new deadline while retaining possible-write
-		// evidence.
-		return c.writeAfterWake(data, result)
-	case <-wait:
-		_ = c.abort()
-		return 0, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteMayHaveWritten, Err: osErrDeadlineExceeded}
-	}
-}
-
-func (c *Conn) writeAfterWake(data []byte, result chan writeResult) (int, error) {
-	deadline, wake := c.writeState()
-	wait, cancel := deadlineTimer(deadline)
-	select {
-	case outcome := <-result:
-		if cancel != nil {
-			cancel()
-		}
-		if outcome.err != nil || outcome.n != len(data) {
-			if outcome.err == nil {
-				outcome.err = io.ErrShortWrite
+			if outcome.err != nil || outcome.n != len(data) {
+				if outcome.err == nil {
+					outcome.err = io.ErrShortWrite
+				}
+				return outcome.n, &Failure{Kind: FailurePossibleWrite, Cause: FailureProxy, Evidence: WriteMayHaveWritten, Err: outcome.err}
 			}
-			return outcome.n, &Failure{Kind: FailurePossibleWrite, Cause: FailureProxy, Evidence: WriteMayHaveWritten, Err: outcome.err}
+			c.writePhase.Store(WriteComplete)
+			return outcome.n, nil
+		case <-c.done:
+			if cancel != nil {
+				cancel()
+			}
+			return 0, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteMayHaveWritten, Err: context.Canceled}
+		case <-wake:
+			if cancel != nil {
+				cancel()
+			}
+			// Deadline updates are control events. Re-arm the timer without
+			// growing the stack while the same pipe write remains pending.
+			continue
+		case <-wait:
+			_ = c.abort()
+			return 0, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteMayHaveWritten, Err: osErrDeadlineExceeded}
 		}
-		c.writePhase.Store(WriteComplete)
-		return outcome.n, nil
-	case <-c.done:
-		if cancel != nil {
-			cancel()
-		}
-		return 0, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteMayHaveWritten, Err: context.Canceled}
-	case <-wake:
-		if cancel != nil {
-			cancel()
-		}
-		return c.writeAfterWake(data, result)
-	case <-wait:
-		_ = c.abort()
-		return 0, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteMayHaveWritten, Err: osErrDeadlineExceeded}
 	}
 }
 

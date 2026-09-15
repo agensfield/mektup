@@ -356,10 +356,30 @@ func InvokeControl(ctx context.Context, cfg Config, req ControlRequest, factory 
 		if int64(len(result.body)) > limit {
 			return nil, &Failure{Kind: FailureProxy, Cause: FailureProxy, Evidence: WriteComplete, Err: ErrControlTooLarge}
 		}
+		if _, validationErr := validateControlResult(result.body, req); validationErr != nil {
+			return nil, &Failure{Kind: FailureProxy, Cause: FailureProxy, Evidence: WriteComplete, Err: validationErr}
+		}
 		return result.body, nil
 	case <-ctx.Done():
 		return nil, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteComplete, Err: ctx.Err()}
 	}
+}
+
+func validateControlResult(data []byte, request ControlRequest) (ControlRequest, error) {
+	result, err := ValidateControlRequest(data)
+	if err != nil {
+		return ControlRequest{}, err
+	}
+	if result.Kind != "result" {
+		return ControlRequest{}, fmt.Errorf("%w: control response kind is %q", ErrControlValidation, result.Kind)
+	}
+	if result.Operation != request.Operation || result.OperationID != request.OperationID ||
+		result.ReplyMessageID != request.ReplyMessageID || result.OriginalMessageID != request.OriginalMessageID ||
+		result.Custody != request.Custody || result.ReplyDestination != request.ReplyDestination ||
+		result.ReceiptID != request.ReceiptID {
+		return ControlRequest{}, fmt.Errorf("%w: control response identity does not match request", ErrControlValidation)
+	}
+	return result, nil
 }
 
 type controlReadResult struct {
