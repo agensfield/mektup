@@ -289,10 +289,17 @@ func (c *Connection) Capabilities() codexapi.Capabilities {
 	if c == nil {
 		return codexapi.Capabilities{}
 	}
-	return codexapi.Capabilities{ExperimentalAPI: c.clientOptionsExperimental()}
+	return codexapi.Capabilities{ExperimentalAPI: c.ExperimentalAPIEnabled()}
 }
 
-func (c *Connection) clientOptionsExperimental() bool {
+// ExperimentalAPIEnabled reports the experimentalApi capability negotiated for
+// this connection's initialize request. It is intentionally nil-safe so a
+// rawrpc adapter can probe an optional capability without dereferencing an
+// absent connection.
+func (c *Connection) ExperimentalAPIEnabled() bool {
+	if c == nil {
+		return false
+	}
 	// The capability is a client-side initialization fact. Keeping it on the
 	// adapter avoids making proxy metadata appear to be server authority.
 	return c.experimentalAPI

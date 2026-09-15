@@ -105,6 +105,10 @@ func connectFixture(t *testing.T, userAgent string, options Options) (*Connectio
 }
 
 func TestConnectCapturesAuthorityExperimentalGenerationAndProxySeparately(t *testing.T) {
+	var nilConnection *Connection
+	if nilConnection.ExperimentalAPIEnabled() {
+		t.Fatal("nil connection reported experimental API capability")
+	}
 	conn, f := connectFixture(t, "codex/0.154.0 (daemon)", Options{
 		ClientName:       "mektup-test",
 		ClientVersion:    "1.2.3",
@@ -120,6 +124,9 @@ func TestConnectCapturesAuthorityExperimentalGenerationAndProxySeparately(t *tes
 	}
 	if info.Compatibility.Class != compat.Tested || info.Proxy.Version != "0.999.0" {
 		t.Fatalf("authority/proxy evidence = %+v", info)
+	}
+	if !conn.ExperimentalAPIEnabled() || !conn.Capabilities().ExperimentalAPI {
+		t.Fatal("experimental API capability was not retained")
 	}
 	var initialize map[string]any
 	select {
