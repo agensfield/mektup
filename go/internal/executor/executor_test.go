@@ -370,6 +370,26 @@ func TestDomainErrorsMapToStableCLIErrors(t *testing.T) {
 	}
 }
 
+func TestPinnedDomainErrorsKeepStableExitClasses(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code cli.ExitCode
+		name string
+	}{
+		{codexapi.ErrExperimentalAPIRequired, cli.ExitRejected, "experimental"},
+		{codexapi.ErrUnsupportedOption, cli.ExitUsage, "unsupported"},
+		{codexapi.ErrUnboundedPage, cli.ExitUsage, "page"},
+		{codexapi.ErrInProgressCutoff, cli.ExitUsage, "cutoff"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var ce *cli.Error
+			if !errors.As(mapError(tc.err, "unknown"), &ce) || ce.Exit != tc.code {
+				t.Fatalf("err=%v mapped=%+v", tc.err, ce)
+			}
+		})
+	}
+}
+
 func TestExecutorRechecksPageAndCursorBounds(t *testing.T) {
 	connections := &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}
 	e := New(Ports{Connections: connections})

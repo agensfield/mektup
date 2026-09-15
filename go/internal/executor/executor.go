@@ -716,6 +716,14 @@ func mapError(err error, effect string) error {
 		stable := re.Stable()
 		return &cli.Error{Code: string(stable.Code), Message: stable.Message, Retryable: stable.Retryable, Effect: nonempty(stable.EffectState, effect), Details: stable.Details, Exit: cli.ExitCodeForError(string(stable.Code))}
 	}
+	if errors.Is(err, codexapi.ErrExperimentalAPIRequired) {
+		return &cli.Error{Code: "experimental_method_unavailable", Message: err.Error(), Effect: effect, Exit: cli.ExitRejected}
+	}
+	for _, invalid := range []error{codexapi.ErrUnsupportedOption, codexapi.ErrInProgressCutoff, codexapi.ErrUnboundedPage, codexapi.ErrInvalidCWD, codexapi.ErrConflictingCWD} {
+		if errors.Is(err, invalid) {
+			return &cli.Error{Code: "invalid_arguments", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitUsage}
+		}
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return &cli.Error{Code: "wait_interrupted", Message: err.Error(), Effect: effect, Exit: cli.ExitIncomplete}
 	}
