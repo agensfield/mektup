@@ -344,7 +344,6 @@ type Client struct {
 	queued        map[string]struct{}
 	completed     map[string]WriteEvidence
 	retired       map[string]struct{}
-	reused        map[string]struct{}
 	closeOne      sync.Once
 	info          atomic.Pointer[ServerInfo]
 	initMu        sync.Mutex
@@ -381,7 +380,6 @@ func New(transport Transport, options Options) *Client {
 		queued:    make(map[string]struct{}),
 		completed: make(map[string]WriteEvidence),
 		retired:   make(map[string]struct{}),
-		reused:    make(map[string]struct{}),
 		accepting: true,
 	}
 	go c.readLoop()
@@ -521,7 +519,6 @@ func (c *Client) completeReservation(key string, evidence WriteEvidence) {
 	delete(c.reserved, key)
 	delete(c.withdrawn, key)
 	delete(c.queued, key)
-	delete(c.reused, key)
 	c.mu.Unlock()
 }
 
@@ -642,10 +639,8 @@ func (c *Client) call(ctx context.Context, request RPCRequest) (*RPCResult, erro
 		return nil, &CallError{Err: fmt.Errorf("duplicate request id %s", key), Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
 	}
 	if _, exists := c.retired[key]; exists {
-		// A reused ID has a one-response quarantine. This keeps a late duplicate
-		// response from satisfying the new request while retaining compatibility
-		// with callers that deliberately reuse raw JSON-RPC IDs.
-		c.reused[key] = struct{}{}
+		c.mu.Unlock()
+		return nil, &CallError{Err: fmt.Errorf("request id %s was already completed on this connection", key), Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
 	}
 	c.reserved[key] = struct{}{}
 	c.mu.Unlock()
@@ -777,7 +772,6 @@ func (c *Client) release(key string) {
 	delete(c.reserved, key)
 	delete(c.withdrawn, key)
 	delete(c.queued, key)
-	delete(c.reused, key)
 	c.mu.Unlock()
 }
 
@@ -786,7 +780,6 @@ func (c *Client) releaseReservation(key string) {
 	delete(c.reserved, key)
 	delete(c.queued, key)
 	delete(c.withdrawn, key)
-	delete(c.reused, key)
 	c.mu.Unlock()
 }
 
@@ -1045,17 +1038,6 @@ func (c *Client) pump() {
 				}
 				call, exists := pending[key]
 				if !exists {
-					continue
-				}
-				c.mu.Lock()
-				_, quarantined := c.reused[key]
-				if quarantined {
-					delete(c.reused, key)
-				}
-				c.mu.Unlock()
-				if quarantined {
-					// The first response after a deliberate ID reuse is ambiguous
-					// with a late duplicate from the prior operation.
 					continue
 				}
 				delete(pending, key)

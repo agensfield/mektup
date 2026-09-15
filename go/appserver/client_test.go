@@ -359,21 +359,15 @@ func TestIDsAreCanonicalStrictAndCompletedIDsAreRetired(t *testing.T) {
 	if _, err := c.call(context.Background(), RPCRequest{ID: json.RawMessage(`"a\u0062"`), Method: "canonical"}); err != nil {
 		t.Fatal(err)
 	}
-	second := make(chan *RPCResult, 1)
-	go func() {
-		result, _ := c.call(context.Background(), RPCRequest{ID: "ab", Method: "stale"})
-		second <- result
-	}()
-	_ = waitWrite(t, f)
-	pushJSON(f, response(`"ab"`, `{"old":true}`))
-	pushJSON(f, response(`"ab"`, `{"new":true}`))
+	_, err := c.call(context.Background(), RPCRequest{ID: "ab", Method: "stale"})
+	var callErr *CallError
+	if !errors.As(err, &callErr) || callErr.Evidence.Phase != WriteProvenBeforeWrite {
+		t.Fatalf("retired ID reuse = %v", err)
+	}
 	select {
-	case result := <-second:
-		if result == nil || string(result.Value) != `{"new":true}` {
-			t.Fatalf("reused ID result = %+v", result)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("fresh response did not satisfy reused ID after stale quarantine")
+	case payload := <-f.writes:
+		t.Fatalf("retired ID reuse wrote %s", payload)
+	default:
 	}
 	if _, err := c.call(context.Background(), RPCRequest{ID: uint64(^uint64(0)), Method: "bad"}); err == nil {
 		t.Fatal("unsigned overflow ID was accepted")
@@ -390,6 +384,20 @@ func TestIDsAreCanonicalStrictAndCompletedIDsAreRetired(t *testing.T) {
 		t.Fatal("response without result/error was accepted")
 	}
 	_ = c2.Close(context.Background())
+}
+
+func TestHealthyServerOneResponse(t *testing.T) {
+	f := newFakeTransport()
+	c := New(f, Options{})
+	defer closeReview(c)
+	go func() {
+		_ = waitWrite(t, f)
+		pushJSON(f, `{"id":"healthy","result":{"accepted":true}}`)
+	}()
+	result, err := c.call(context.Background(), RPCRequest{ID: "healthy", Method: "read"})
+	if err != nil || string(result.Value) != `{"accepted":true}` {
+		t.Fatalf("healthy one-response call result=%+v err=%v", result, err)
+	}
 }
 
 func TestGenerationIncreasesAcrossConnections(t *testing.T) {
