@@ -630,7 +630,10 @@ func responseDataArray(raw json.RawMessage) any {
 		Data json.RawMessage `json:"data"`
 	}
 	if json.Unmarshal(raw, &envelope) == nil && len(bytes.TrimSpace(envelope.Data)) != 0 && !bytes.Equal(bytes.TrimSpace(envelope.Data), []byte("null")) {
-		return json.RawMessage(envelope.Data)
+		var value any
+		if json.Unmarshal(envelope.Data, &value) == nil {
+			return value
+		}
 	}
 	return []any{}
 }
@@ -640,7 +643,10 @@ func responseThreadArray(raw json.RawMessage) any {
 		Thread json.RawMessage `json:"thread"`
 	}
 	if json.Unmarshal(raw, &envelope) == nil && len(bytes.TrimSpace(envelope.Thread)) != 0 && !bytes.Equal(bytes.TrimSpace(envelope.Thread), []byte("null")) {
-		return []json.RawMessage{json.RawMessage(envelope.Thread)}
+		var value any
+		if json.Unmarshal(envelope.Thread, &value) == nil {
+			return []any{value}
+		}
 	}
 	return []any{}
 }
