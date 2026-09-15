@@ -97,6 +97,61 @@ func TestTamperedScenarioExpectationFailsSemanticValidation(t *testing.T) {
 	}
 }
 
+func TestMissingExpectedInvalidFixtureIsManifestFailure(t *testing.T) {
+	root, err := Root()
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := readJSON[manifest](filepath.Join(root, manifestPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const missing = "missing-negative.invalid.json"
+	for i := range m.Fixtures {
+		if m.Fixtures[i].Expect == "invalid" {
+			m.Fixtures[i].Path = missing
+			break
+		}
+	}
+	temp := t.TempDir()
+	fixtureRoot := filepath.Join(temp, fixturesDir)
+	if err := os.MkdirAll(fixtureRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "conformance"), filepath.Join(temp, "conformance")); err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range m.Fixtures {
+		if fixture.Path == missing {
+			continue
+		}
+		source := filepath.Join(root, fixturesDir, fixture.Path)
+		destination := filepath.Join(temp, fixturesDir, fixture.Path)
+		if err := os.Symlink(source, destination); err != nil {
+			t.Fatal(err)
+		}
+	}
+	manifestData, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(temp, manifestPath), manifestData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Run(temp); err == nil {
+		t.Fatal("missing expected-invalid fixture unexpectedly passed")
+	}
+}
+
+func TestManifestRejectsUnknownExpectedAndSchema(t *testing.T) {
+	if err := validateManifestFixture(manifestFixture{Kind: "event", Schema: "mektup/event/v1", Path: "x.json", Expect: "typo"}); err == nil {
+		t.Fatal("unknown expected value unexpectedly accepted")
+	}
+	if err := validateManifestFixture(manifestFixture{Kind: "event", Schema: "mektup/warning/v1", Path: "x.json"}); err == nil {
+		t.Fatal("schema drift unexpectedly accepted")
+	}
+}
+
 func TestManifestAndScenarioDecodeUnknownAdditiveFields(t *testing.T) {
 	root, err := Root()
 	if err != nil {

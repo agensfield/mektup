@@ -184,6 +184,9 @@ func Run(root string) (Summary, error) {
 		if f.Path == "" || filepath.IsAbs(f.Path) || filepath.Clean(f.Path) != f.Path || strings.HasPrefix(f.Path, "../") {
 			return out, fmt.Errorf("manifest: unsafe fixture path %q", f.Path)
 		}
+		if err := validateManifestFixture(f); err != nil {
+			return out, err
+		}
 		if _, exists := fixtureMap[f.Path]; exists {
 			return out, fmt.Errorf("manifest: duplicate fixture %q", f.Path)
 		}
@@ -209,18 +212,21 @@ func Run(root string) (Summary, error) {
 	for _, path := range paths {
 		f := fixtureMap[path]
 		data, readErr := os.ReadFile(filepath.Join(root, fixturesDir, path))
-		result := FixtureResult{Path: path, Kind: f.Kind, Expected: expectedLabel(f)}
-		if readErr == nil {
-			readErr = validateFixture(f, data, root)
+		if readErr != nil {
+			// A missing (or unreadable) fixture is a broken manifest/repository,
+			// never a valid way to satisfy an expected-invalid entry.
+			return out, fmt.Errorf("fixture %s: read: %w", path, readErr)
 		}
+		semanticErr := validateFixture(f, data, root)
+		result := FixtureResult{Path: path, Kind: f.Kind, Expected: expectedLabel(f)}
 		if f.Expect == "invalid" {
-			if readErr == nil {
+			if semanticErr == nil {
 				return out, fmt.Errorf("fixture %s: expected invalid, accepted", path)
 			}
 			result.Observed = "invalid"
 		} else {
-			if readErr != nil {
-				return out, fmt.Errorf("fixture %s: %w", path, readErr)
+			if semanticErr != nil {
+				return out, fmt.Errorf("fixture %s: %w", path, semanticErr)
 			}
 			result.Observed = "valid"
 		}
@@ -254,6 +260,29 @@ func expectedLabel(f manifestFixture) string {
 		return "invalid"
 	}
 	return "valid"
+}
+
+func validateManifestFixture(f manifestFixture) error {
+	if f.Expect != "" && f.Expect != "valid" && f.Expect != "invalid" {
+		return fmt.Errorf("manifest: fixture %q has unknown expected value %q", f.Path, f.Expect)
+	}
+	want, ok := map[string]string{
+		"envelope-metadata": "Mektup/1",
+		"envelope-rendered": "Mektup/1",
+		"receipt":           "mektup/receipt/v1",
+		"event":             "mektup/event/v1",
+		"warning":           "mektup/warning/v1",
+		"error":             "mektup/error/v1",
+		"control":           "mektup/control/v1",
+		"control-negative":  "mektup/control/v1",
+	}[f.Kind]
+	if !ok {
+		return fmt.Errorf("manifest: fixture %q has unknown kind %q", f.Path, f.Kind)
+	}
+	if f.Schema == "" || f.Schema != want {
+		return fmt.Errorf("manifest: fixture %q schema %q, want %q", f.Path, f.Schema, want)
+	}
+	return nil
 }
 
 func readJSON[T any](path string) (T, error) {
