@@ -187,19 +187,30 @@ func TestReceiverRejectsWrongThreadForMatchingDestination(t *testing.T) {
 
 func TestReceiverAllowsDistinctTrustedReplyEndpointTopology(t *testing.T) {
 	j, state := openReceiverJournal(t, time.Minute)
-	receiver := Receiver{Registry: makeRegistry(t, state, j.StoreID()), LocalEndpointID: receiverEndpoint}
+	trustedEndpoint := "ep_0198f0e0-0000-7000-8000-000000000099"
+	receiver := Receiver{Registry: makeRegistry(t, state, j.StoreID()), LocalEndpointID: receiverEndpoint, Destination: DestinationResolverFunc(func(_ context.Context, endpointID, uri, threadID string) error {
+		if endpointID == trustedEndpoint && uri == "codex://replyhost/thread/source" && threadID == "source" {
+			return nil
+		}
+		return ErrRelationshipMismatch
+	})}
 	otherOriginal := "msg_0198f0e0-0000-7000-8000-000000000088"
 	if _, err := j.Prepare(context.Background(), journal.Operation{OperationID: "op_0198f0e0-0000-7000-8000-000000000088", MessageID: otherOriginal, SourceRoute: "src", TargetRoute: "dst", Semantics: "message", ReplyRoute: "codex://replyhost/thread/source", CustodyRoute: receiverEndpoint, CustodyStoreID: j.StoreID(), Digest: "digest", BodySize: 1}); err != nil {
 		t.Fatal(err)
 	}
 	q := request(j)
 	q.OriginalMessageID = otherOriginal
-	q.ReplyDestination.EndpointID = "ep_0198f0e0-0000-7000-8000-000000000099"
+	q.ReplyDestination.EndpointID = trustedEndpoint
 	q.ReplyDestination.URI = "codex://replyhost/thread/source"
 	q.BodyBytes = ptrInt64(1)
 	q.BodySHA256 = "sha256:" + strings.Repeat("d", 64)
 	if _, err := receiver.Receive(context.Background(), mustMarshal(t, q)); err != nil {
 		t.Fatalf("distinct endpoint topology rejected: %v", err)
+	}
+	wrong := q
+	wrong.ReplyDestination.EndpointID = "ep_0198f0e0-0000-7000-8000-000000000098"
+	if _, err := receiver.Receive(context.Background(), mustMarshal(t, wrong)); !errors.Is(err, ErrRelationshipMismatch) {
+		t.Fatalf("unmapped endpoint err = %v", err)
 	}
 }
 

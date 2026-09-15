@@ -31,8 +31,23 @@ var (
 type Receiver struct {
 	Registry        Resolver
 	LocalEndpointID string
+	Destination     DestinationResolver
 	MaxInput        int64
 	MaxOutput       int64
+}
+
+// DestinationResolver is trusted local endpoint metadata. A control document
+// may select an endpoint ID only when the ID, URI, and thread identity are an
+// established route. It is separate from custody-store resolution because
+// reply body and custody endpoints may differ.
+type DestinationResolver interface {
+	ValidateDestination(context.Context, string, string, string) error
+}
+
+type DestinationResolverFunc func(context.Context, string, string, string) error
+
+func (f DestinationResolverFunc) ValidateDestination(ctx context.Context, endpointID, uri, threadID string) error {
+	return f(ctx, endpointID, uri, threadID)
 }
 
 // Serve reads exactly one JSON control document and writes exactly one result
@@ -90,7 +105,7 @@ func (r Receiver) Receive(ctx context.Context, data []byte) ([]byte, error) {
 	if err != nil || canonical != store.Journal.StoreID() {
 		return nil, ErrStoreUnavailable
 	}
-	if err := validateOriginal(ctx, store.Journal, request, canonical); err != nil {
+	if err := r.validateOriginal(ctx, store.Journal, request, canonical); err != nil {
 		return nil, err
 	}
 	if request.Operation == "heartbeat" || request.Operation == "commit" || request.Operation == "abandon" {
@@ -133,9 +148,16 @@ func (r Receiver) Receive(ctx context.Context, data []byte) ([]byte, error) {
 	return encoded, nil
 }
 
-func validateOriginal(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) error {
+func (r Receiver) validateOriginal(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) error {
 	if err := validateDestinationThread(req); err != nil {
 		return err
+	}
+	if r.Destination != nil {
+		if err := r.Destination.ValidateDestination(ctx, req.ReplyDestination.EndpointID, req.ReplyDestination.URI, req.ReplyDestination.ThreadID); err != nil {
+			return ErrRelationshipMismatch
+		}
+	} else if req.ReplyDestination.EndpointID != r.LocalEndpointID {
+		return ErrRelationshipMismatch
 	}
 	op, err := j.OperationByMessage(ctx, req.OriginalMessageID)
 	if err != nil {
