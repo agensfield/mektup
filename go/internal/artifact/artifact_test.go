@@ -2,7 +2,9 @@ package artifact
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,11 +25,15 @@ func TestSpillReceiptAndPrivatePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !receipt.Complete || receipt.Bytes != 5 || receipt.SHA256 != "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
+	if !receipt.Complete || receipt.Bytes != 5 || receipt.SHA256 != "sha256:2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824" {
 		t.Fatalf("unexpected receipt: %+v", receipt)
 	}
 	if receipt.MediaType != "text/plain" || !receipt.RetentionEligible || !receipt.SensitiveOutputPossible {
 		t.Fatalf("metadata was not retained: %+v", receipt)
+	}
+	encoded, err := json.Marshal(receipt)
+	if err != nil || strings.Contains(string(encoded), "retention_eligible") || !strings.Contains(string(encoded), "retentionEligible") {
+		t.Fatalf("receipt JSON = %s, err = %v", encoded, err)
 	}
 	info, err := os.Stat(receipt.Path)
 	if err != nil {
@@ -151,5 +157,92 @@ func TestConcurrentNoForcePublicationHasOneWinner(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(store.Root(), "same"))
 	if err != nil || len(b) != 100 {
 		t.Fatalf("published bytes = %d, err = %v", len(b), err)
+	}
+}
+
+func TestExplicitRPCOutputPathIsOutsideManagedRoot(t *testing.T) {
+	store, err := NewStore(filepath.Join(t.TempDir(), "managed"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "caller", "rpc.out")
+	receipt, err := store.WriteRPCOutputPath(context.Background(), outside, strings.NewReader("rpc"), RPCOutputOptions{MediaType: "text/plain"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Path != outside || receipt.SHA256 != "sha256:8e1941340511ea290acb09dde1ef0bdb2d48b10d77b774e9e6bab741022a8e4b" {
+		t.Fatalf("explicit receipt = %+v", receipt)
+	}
+	if filepath.Dir(receipt.Path) == store.Root() {
+		t.Fatal("explicit output unexpectedly used managed root")
+	}
+	if _, err := store.WriteRPCOutputPath(context.Background(), outside, strings.NewReader("again"), RPCOutputOptions{}); !errors.Is(err, ErrExists) {
+		t.Fatalf("explicit overwrite error = %v", err)
+	}
+	if _, err := store.WriteRPCOutputPath(context.Background(), outside, strings.NewReader("replaced"), RPCOutputOptions{Force: true}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(outside)
+	if err != nil || string(b) != "replaced" {
+		t.Fatalf("explicit output = %q, err = %v", b, err)
+	}
+	info, err := os.Stat(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("explicit output mode = %o", info.Mode().Perm())
+	}
+}
+
+type gatedReader struct {
+	ready chan<- struct{}
+	goOn  <-chan struct{}
+	done  bool
+}
+
+func (r *gatedReader) Read(p []byte) (int, error) {
+	if r.done {
+		return 0, io.EOF
+	}
+	r.done = true
+	close(r.ready)
+	<-r.goOn
+	p[0] = 'x'
+	return 1, io.EOF
+}
+
+func TestManagedRootSurvivesDirectorySwap(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedDir := filepath.Join(store.Root(), "nested")
+	if err := os.Mkdir(managedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	ready := make(chan struct{})
+	goOn := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		_, err := store.Spill(context.Background(), "nested/out", &gatedReader{ready: ready, goOn: goOn}, Options{})
+		result <- err
+	}()
+	<-ready
+	moved := filepath.Join(root, "nested.moved")
+	if err := os.Rename(managedDir, moved); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, managedDir); err != nil {
+		t.Fatal(err)
+	}
+	close(goOn)
+	if err := <-result; err == nil {
+		t.Fatal("directory swap unexpectedly published")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "out")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("outside path was written: %v", err)
 	}
 }

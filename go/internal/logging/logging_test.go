@@ -104,6 +104,10 @@ func TestAuditIsPrivateBoundedPerInvocationAndVisible(t *testing.T) {
 	if !receipt.Complete || receipt.Bytes != 7 || !receipt.Mode.Sensitive || receipt.Mode.NetworkTelemetry || receipt.Mode.Mode != "audit" {
 		t.Fatalf("audit receipt = %+v", receipt)
 	}
+	encoded, err := json.Marshal(receipt)
+	if err != nil || strings.Contains(string(encoded), "network_telemetry") || !strings.Contains(string(encoded), "networkTelemetry") {
+		t.Fatalf("audit JSON = %s, err = %v", encoded, err)
+	}
 	info, err := os.Stat(receipt.Path)
 	if err != nil {
 		t.Fatal(err)

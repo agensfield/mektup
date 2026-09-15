@@ -55,16 +55,20 @@ type Receipt struct {
 	Path                    string    `json:"path"`
 	Bytes                   int64     `json:"bytes"`
 	SHA256                  string    `json:"sha256"`
-	MediaType               string    `json:"media_type"`
+	MediaType               string    `json:"mediaType"`
 	Complete                bool      `json:"complete"`
-	RetentionEligible       bool      `json:"retention_eligible"`
-	SensitiveOutputPossible bool      `json:"sensitive_output_possible"`
-	CreatedAt               time.Time `json:"created_at"`
+	RetentionEligible       bool      `json:"retentionEligible"`
+	SensitiveOutputPossible bool      `json:"sensitiveOutputPossible"`
+	CreatedAt               time.Time `json:"createdAt"`
 }
 
 // Store owns one private managed root. The root and all files created by this
-// package use owner-only permissions.
-type Store struct{ root string }
+// package use owner-only permissions. The open os.Root handle makes managed
+// traversal resistant to a concurrent rename/symlink swap.
+type Store struct {
+	root string
+	fs   *os.Root
+}
 
 // NewStore creates or opens a managed owner-private root.
 func NewStore(root string) (*Store, error) {
@@ -75,11 +79,23 @@ func NewStore(root string) (*Store, error) {
 	if err := ensurePrivateDir(root); err != nil {
 		return nil, err
 	}
-	return &Store{root: root}, nil
+	managed, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, fmt.Errorf("artifact: open managed root: %w", err)
+	}
+	return &Store{root: root, fs: managed}, nil
 }
 
 // Root returns the cleaned managed root.
 func (s *Store) Root() string { return s.root }
+
+// Close releases the directory handle held by the store.
+func (s *Store) Close() error {
+	if s == nil || s.fs == nil {
+		return nil
+	}
+	return s.fs.Close()
+}
 
 // Spill atomically publishes a complete artifact. The source is streamed and
 // hashed without buffering it in memory. A read error, cancellation, or byte
@@ -100,17 +116,117 @@ func (s *Store) RPCOutput(ctx context.Context, name string, src io.Reader, opts 
 	return s.WriteRPCOutput(ctx, name, src, opts)
 }
 
+// WriteRPCOutputPath writes explicit caller-selected RPC output. Unlike
+// Spill, path is not interpreted relative to the managed artifact root. A
+// relative path is resolved by the process filesystem rules. Existing files
+// are refused unless opts.Force is true.
+func WriteRPCOutputPath(ctx context.Context, path string, src io.Reader, opts RPCOutputOptions) (Receipt, error) {
+	return writeExplicitPath(ctx, path, src, opts)
+}
+
+// WriteRPCOutputPath is also available as a method for callers that already
+// own a Store. The selected path remains independent of Store.Root.
+func (s *Store) WriteRPCOutputPath(ctx context.Context, path string, src io.Reader, opts RPCOutputOptions) (Receipt, error) {
+	return writeExplicitPath(ctx, path, src, opts)
+}
+
 // MarshalReceipt is useful to callers that need to emit the receipt without
 // depending on filesystem details.
 func MarshalReceipt(r Receipt) ([]byte, error) { return json.Marshal(r) }
 
+func writeExplicitPath(ctx context.Context, path string, src io.Reader, opts Options) (Receipt, error) {
+	var zero Receipt
+	if path == "" || src == nil || strings.ContainsRune(path, 0) {
+		return zero, fmt.Errorf("artifact: explicit output path and source are required")
+	}
+	target := filepath.Clean(path)
+	if target == "." || target == string(filepath.Separator) {
+		return zero, fmt.Errorf("artifact: explicit output path is a directory")
+	}
+	parent := filepath.Dir(target)
+	if err := ensureExplicitParent(parent); err != nil {
+		return zero, err
+	}
+	if err := checkTarget(target, opts.Force); err != nil {
+		return zero, err
+	}
+	max := opts.MaxBytes
+	if max == 0 {
+		max = DefaultMaxBytes
+	}
+	if max < 1 {
+		return zero, fmt.Errorf("artifact: max bytes must be positive")
+	}
+	if opts.MediaType == "" {
+		opts.MediaType = DefaultMediaType
+	}
+	tmp, err := os.CreateTemp(parent, ".mektup-rpc-output-*")
+	if err != nil {
+		return zero, fmt.Errorf("artifact: create explicit temporary file: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		return zero, fmt.Errorf("artifact: chmod explicit temporary file: %w", err)
+	}
+	h := sha256.New()
+	n, copyErr := copyBounded(ctx, io.MultiWriter(tmp, h), src, max)
+	if copyErr != nil {
+		tmp.Close()
+		return zero, copyErr
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return zero, fmt.Errorf("artifact: sync explicit temporary file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return zero, fmt.Errorf("artifact: close explicit temporary file: %w", err)
+	}
+	if err := checkTarget(target, opts.Force); err != nil {
+		return zero, err
+	}
+	if opts.Force {
+		if err := os.Rename(tmpName, target); err != nil {
+			return zero, fmt.Errorf("artifact: publish explicit replacement: %w", err)
+		}
+	} else if err := os.Link(tmpName, target); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return zero, ErrExists
+		}
+		return zero, fmt.Errorf("artifact: publish explicit output: %w", err)
+	} else if err := os.Remove(tmpName); err != nil {
+		return Receipt{Path: target, Bytes: n, SHA256: "sha256:" + hex.EncodeToString(h.Sum(nil)), MediaType: opts.MediaType,
+			Complete: true, RetentionEligible: opts.RetentionEligible, SensitiveOutputPossible: opts.SensitiveOutputPossible,
+			CreatedAt: time.Now().UTC()}, fmt.Errorf("artifact: explicit output published but temporary cleanup failed: %w", err)
+	}
+	return Receipt{Path: target, Bytes: n, SHA256: "sha256:" + hex.EncodeToString(h.Sum(nil)), MediaType: opts.MediaType,
+		Complete: true, RetentionEligible: opts.RetentionEligible, SensitiveOutputPossible: opts.SensitiveOutputPossible,
+		CreatedAt: time.Now().UTC()}, nil
+}
+
+func ensureExplicitParent(parent string) error {
+	if parent == "" {
+		parent = "."
+	}
+	if info, err := os.Lstat(parent); err == nil {
+		if !info.IsDir() {
+			return fmt.Errorf("artifact: explicit output parent is not a directory")
+		}
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("artifact: inspect explicit output parent: %w", err)
+	}
+	if err := os.MkdirAll(parent, 0o700); err != nil {
+		return fmt.Errorf("artifact: create explicit output parent: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) write(ctx context.Context, name string, src io.Reader, opts Options, rpc bool) (Receipt, error) {
 	var zero Receipt
-	if s == nil || s.root == "" || src == nil {
+	if s == nil || s.root == "" || s.fs == nil || src == nil {
 		return zero, fmt.Errorf("artifact: nil store or source")
-	}
-	if err := ensurePrivateDir(s.root); err != nil {
-		return zero, err
 	}
 	parts, err := pathParts(name)
 	if err != nil {
@@ -130,23 +246,23 @@ func (s *Store) write(ctx context.Context, name string, src io.Reader, opts Opti
 		opts.MediaType = DefaultMediaType
 	}
 
-	parent := s.root
-	for _, part := range parts[:len(parts)-1] {
-		parent = filepath.Join(parent, part)
-		if err := ensurePrivateDir(parent); err != nil {
-			return zero, err
-		}
+	parentName := filepath.Join(parts[:len(parts)-1]...)
+	if parentName == "." {
+		parentName = ""
 	}
-	target := filepath.Join(parent, parts[len(parts)-1])
-	if err := checkTarget(target, opts.Force); err != nil {
+	if err := ensureRootDirs(s.fs, parentName); err != nil {
 		return zero, err
 	}
-	tmp, err := os.CreateTemp(parent, ".mektup-artifact-*")
+	targetName := filepath.Join(parts...)
+	target := filepath.Join(s.root, targetName)
+	if err := checkRootTarget(s.fs, targetName, opts.Force); err != nil {
+		return zero, err
+	}
+	tmpName, tmp, err := createRootTemp(s.fs, parentName)
 	if err != nil {
 		return zero, fmt.Errorf("artifact: create temporary file: %w", err)
 	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
+	defer s.fs.Remove(tmpName)
 	if err := tmp.Chmod(0o600); err != nil {
 		tmp.Close()
 		return zero, fmt.Errorf("artifact: chmod temporary file: %w", err)
@@ -167,23 +283,25 @@ func (s *Store) write(ctx context.Context, name string, src io.Reader, opts Opti
 	}
 	// A second target check catches a destination appearing after the first
 	// check. Link gives non-force writes no-clobber publication semantics.
-	if err := checkTarget(target, opts.Force); err != nil {
+	if err := checkRootTarget(s.fs, targetName, opts.Force); err != nil {
 		return zero, err
 	}
 	if opts.Force {
-		if err := os.Rename(tmpName, target); err != nil {
+		if err := s.fs.Rename(tmpName, targetName); err != nil {
 			return zero, fmt.Errorf("artifact: publish replacement: %w", err)
 		}
-	} else if err := os.Link(tmpName, target); err != nil {
+	} else if err := s.fs.Link(tmpName, targetName); err != nil {
 		if errors.Is(err, os.ErrExist) {
 			return zero, ErrExists
 		}
 		return zero, fmt.Errorf("artifact: publish without replacement: %w", err)
-	} else if err := os.Remove(tmpName); err != nil {
-		return zero, fmt.Errorf("artifact: remove publication temporary: %w", err)
+	} else if err := s.fs.Remove(tmpName); err != nil {
+		return Receipt{Path: target, Bytes: n, SHA256: "sha256:" + hex.EncodeToString(h.Sum(nil)), MediaType: opts.MediaType,
+			Complete: true, RetentionEligible: opts.RetentionEligible, SensitiveOutputPossible: opts.SensitiveOutputPossible,
+			CreatedAt: time.Now().UTC()}, fmt.Errorf("artifact: artifact published but temporary cleanup failed: %w", err)
 	}
 	return Receipt{
-		Path: target, Bytes: n, SHA256: hex.EncodeToString(h.Sum(nil)),
+		Path: target, Bytes: n, SHA256: "sha256:" + hex.EncodeToString(h.Sum(nil)),
 		MediaType: opts.MediaType, Complete: true,
 		RetentionEligible:       opts.RetentionEligible,
 		SensitiveOutputPossible: opts.SensitiveOutputPossible,
@@ -239,6 +357,105 @@ func pathParts(name string) ([]string, error) {
 		}
 	}
 	return parts, nil
+}
+
+func ensureRootDirs(root *os.Root, parent string) error {
+	if parent == "" {
+		return nil
+	}
+	parts := strings.Split(filepath.ToSlash(parent), "/")
+	current := ""
+	for _, part := range parts {
+		if current == "" {
+			current = part
+		} else {
+			current = filepath.Join(current, part)
+		}
+		info, err := root.Lstat(current)
+		if errors.Is(err, os.ErrNotExist) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("artifact: inspect managed directory: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return ErrSymlink
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("artifact: managed path is not a directory")
+		}
+	}
+	if err := root.MkdirAll(parent, 0o700); err != nil {
+		return fmt.Errorf("artifact: create managed directory: %w", err)
+	}
+	current = ""
+	for _, part := range parts {
+		if current == "" {
+			current = part
+		} else {
+			current = filepath.Join(current, part)
+		}
+		info, err := root.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("artifact: inspect managed directory: %w", err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return ErrSymlink
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("artifact: managed path is not a directory")
+		}
+		dir, err := root.Open(current)
+		if err != nil {
+			return fmt.Errorf("artifact: open managed directory: %w", err)
+		}
+		if err := dir.Chmod(0o700); err != nil {
+			dir.Close()
+			return fmt.Errorf("artifact: make managed directory private: %w", err)
+		}
+		if err := dir.Close(); err != nil {
+			return fmt.Errorf("artifact: close managed directory: %w", err)
+		}
+	}
+	return nil
+}
+
+func createRootTemp(root *os.Root, parent string) (string, *os.File, error) {
+	for attempt := 0; attempt < 16; attempt++ {
+		name := fmt.Sprintf(".mektup-artifact-%d-%d", os.Getpid(), time.Now().UnixNano()+int64(attempt))
+		if parent != "" {
+			name = filepath.Join(parent, name)
+		}
+		f, err := root.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return "", nil, err
+		}
+		return name, f, nil
+	}
+	return "", nil, fmt.Errorf("temporary artifact name collision")
+}
+
+func checkRootTarget(root *os.Root, name string, force bool) error {
+	info, err := root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("artifact: inspect destination: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return ErrSymlink
+	}
+	if info.IsDir() {
+		return fmt.Errorf("artifact: destination is a directory")
+	}
+	if !force {
+		return ErrExists
+	}
+	return nil
 }
 
 func ensurePrivateDir(dir string) error {

@@ -82,8 +82,8 @@ type AuditOptions struct {
 type ModeMetadata struct {
 	Mode              string `json:"mode"`
 	Sensitive         bool   `json:"sensitive"`
-	NetworkTelemetry  bool   `json:"network_telemetry"`
-	RetentionEligible bool   `json:"retention_eligible"`
+	NetworkTelemetry  bool   `json:"networkTelemetry"`
+	RetentionEligible bool   `json:"retentionEligible"`
 }
 
 // AuditReceipt describes a complete audit sink.
@@ -93,7 +93,7 @@ type AuditReceipt struct {
 	SHA256    string       `json:"sha256"`
 	Complete  bool         `json:"complete"`
 	Mode      ModeMetadata `json:"mode"`
-	CreatedAt time.Time    `json:"created_at"`
+	CreatedAt time.Time    `json:"createdAt"`
 }
 
 // Logger is safe for concurrent use by local callers.
@@ -269,7 +269,7 @@ func (l *Logger) Audit(ctx context.Context, opts AuditOptions) (AuditReceipt, er
 	if err := os.Remove(tmpName); err != nil {
 		return zero, fmt.Errorf("logging: remove audit temporary: %w", err)
 	}
-	return AuditReceipt{Path: target, Bytes: n, SHA256: hex.EncodeToString(h.Sum(nil)), Complete: true,
+	return AuditReceipt{Path: target, Bytes: n, SHA256: "sha256:" + hex.EncodeToString(h.Sum(nil)), Complete: true,
 		Mode:      ModeMetadata{Mode: "audit", Sensitive: true, NetworkTelemetry: false, RetentionEligible: false},
 		CreatedAt: time.Now().UTC()}, nil
 }
