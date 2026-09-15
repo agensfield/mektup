@@ -473,50 +473,79 @@ func TestJoinedUnknownReplyIsTypedAndDoesNotRedispatch(t *testing.T) {
 
 type retryHeartbeatJournal struct {
 	*fakeJournal
-	started chan struct{}
-	release chan struct{}
-	failed  chan struct{}
-	once    sync.Once
+	initialDone  chan struct{}
+	retryStarted chan struct{}
+	release      chan struct{}
+	heartbeats   int
 }
 
 func (j *retryHeartbeatJournal) Heartbeat(context.Context, string, string, string) error {
-	j.once.Do(func() { close(j.started) })
+	j.heartbeats++
+	if j.heartbeats == 1 {
+		close(j.initialDone)
+		return nil
+	}
+	close(j.retryStarted)
 	<-j.release
-	close(j.failed)
 	return errors.New("heartbeat lost during retry")
 }
 
+type retryBoundaryDelivery struct {
+	journal       *retryHeartbeatJournal
+	calls         int
+	firstReject   chan struct{}
+	secondAttempt chan struct{}
+}
+
+func (d *retryBoundaryDelivery) Send(context.Context, ResolvedTarget, string, string) (DeliveryResult, error) {
+	d.calls++
+	switch d.calls {
+	case 1:
+		close(d.firstReject)
+		return DeliveryResult{}, &DeliveryError{Server: &codexapi.ServerError{Code: -32603, Message: "failed to submit turn input: ActiveTurnNotSteerable { turn_kind: Review }"}, Phase: WriteComplete}
+	case 2:
+		close(d.secondAttempt)
+		<-d.journal.retryStarted
+		return DeliveryResult{}, &DeliveryError{Server: &codexapi.ServerError{Code: -32603, Message: "failed to submit turn input: ActiveTurnNotSteerable { turn_kind: Review }"}, Phase: WriteComplete}
+	default:
+		return DeliveryResult{Accepted: true, TurnID: "unexpected", Evidence: "accepted"}, nil
+	}
+}
+func (*retryBoundaryDelivery) Resume(context.Context, ResolvedTarget) (string, error) { return "", nil }
+func (*retryBoundaryDelivery) Detach(context.Context, ResolvedTarget) error           { return nil }
+
 func TestReplyHeartbeatFailureDuringSafeRetryAbortsUnknown(t *testing.T) {
 	r := baseResolver()
-	d := &repeatedReviewDelivery{}
-	j := &retryHeartbeatJournal{fakeJournal: newFakeJournal(), started: make(chan struct{}), release: make(chan struct{}), failed: make(chan struct{})}
+	j := &retryHeartbeatJournal{fakeJournal: newFakeJournal(), initialDone: make(chan struct{}), retryStarted: make(chan struct{}), release: make(chan struct{})}
+	d := &retryBoundaryDelivery{journal: j, firstReject: make(chan struct{}), secondAttempt: make(chan struct{})}
 	original := mektup.Envelope{MessageID: "msg_31999999-9999-7999-8999-999999999999", Kind: mektup.KindMessage, FromEndpointID: epSource, From: r.source.URI, FromKind: "agent", ToEndpointID: epTarget, To: r.target.URI, RequestedTarget: "target", ReplyRequested: true, ReplyEndpointID: epSource, ReplyTo: r.source.URI, ReplyCustodyEndpointID: epSource, ReplyCustodyStoreID: storeID, Body: "question", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	original.PayloadBytes = uint64(len(original.Body))
 	original.PayloadSHA256 = digest(original.Body)
 	done := make(chan error, 1)
 	go func() {
-		_, err := (&Service{Resolver: &r, Delivery: d, Journal: j}).Reply(context.Background(), originalResolver{original: OriginalMessage{Envelope: original, CurrentThread: r.target.URI}}, ReplyRequest{Reference: original.MessageID, Body: "answer", DeliveryTimeout: time.Second})
+		_, err := (&Service{Resolver: &r, Delivery: d, Journal: j, heartbeatInterval: time.Millisecond}).Reply(context.Background(), originalResolver{original: OriginalMessage{Envelope: original, CurrentThread: r.target.URI}}, ReplyRequest{Reference: original.MessageID, Body: "answer", DeliveryTimeout: time.Second})
 		done <- err
 	}()
 	select {
-	case <-j.started:
+	case <-j.initialDone:
 	case <-time.After(time.Second):
-		t.Fatal("heartbeat did not start")
+		t.Fatal("initial heartbeat did not complete")
 	}
-	deadline := time.Now().Add(time.Second)
-	for d.count() < 2 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	select {
+	case <-d.firstReject:
+	case <-time.After(time.Second):
+		t.Fatal("first safe rejection did not occur")
+	}
+	select {
+	case <-d.secondAttempt:
+	case <-time.After(time.Second):
+		t.Fatal("second retry attempt did not begin")
 	}
 	close(j.release)
-	select {
-	case <-j.failed:
-	case <-time.After(time.Second):
-		t.Fatal("heartbeat failure did not complete")
-	}
 	err := <-done
 	var se *Error
-	if !errors.As(err, &se) || se.Code != mektup.ErrReplyOutcomeUnknown || d.count() < 2 {
-		t.Fatalf("retry heartbeat failure was not conservative: calls=%d err=%v", d.count(), err)
+	if !errors.As(err, &se) || se.Code != mektup.ErrReplyOutcomeUnknown || d.calls != 2 {
+		t.Fatalf("retry heartbeat failure was not conservative: calls=%d err=%v", d.calls, err)
 	}
 }
 

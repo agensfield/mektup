@@ -209,7 +209,11 @@ func (s *Service) Reply(ctx context.Context, resolver OriginalResolver, req Repl
 	defer stopHeartbeat()
 	heartbeatMonitor := newHeartbeatMonitor()
 	heartbeatErrors := make(chan error, 1)
-	go heartbeat(heartbeatCtx, s.Journal, claim.ReplyID, claim.Owner, claim.Token, heartbeatErrors, heartbeatMonitor)
+	interval := s.heartbeatInterval
+	if interval <= 0 {
+		interval = 5 * time.Second
+	}
+	go heartbeat(heartbeatCtx, s.Journal, claim.ReplyID, claim.Owner, claim.Token, heartbeatErrors, heartbeatMonitor, interval)
 	if prepared.Token == "" {
 		if resumed {
 			_ = detachTarget(s.Delivery, target)
@@ -410,7 +414,7 @@ func (m *heartbeatMonitor) wait(ctx context.Context) error {
 	}
 }
 
-func heartbeat(ctx context.Context, journal JournalPort, replyID, owner, token string, failures chan<- error, monitor *heartbeatMonitor) {
+func heartbeat(ctx context.Context, journal JournalPort, replyID, owner, token string, failures chan<- error, monitor *heartbeatMonitor, interval time.Duration) {
 	monitor.begin()
 	err := journal.Heartbeat(ctx, replyID, owner, token)
 	monitor.end(err)
@@ -421,7 +425,7 @@ func heartbeat(ctx context.Context, journal JournalPort, replyID, owner, token s
 		}
 		return
 	}
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {

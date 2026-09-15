@@ -266,11 +266,12 @@ type JoinedReplyWaiter interface {
 }
 
 type Service struct {
-	Resolver Resolver
-	Delivery DeliveryPort
-	Journal  JournalPort
-	Observe  ObservationPort
-	Now      func() time.Time
+	Resolver          Resolver
+	Delivery          DeliveryPort
+	Journal           JournalPort
+	Observe           ObservationPort
+	Now               func() time.Time
+	heartbeatInterval time.Duration
 }
 
 func (s *Service) validate() error {
