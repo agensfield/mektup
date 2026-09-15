@@ -349,8 +349,8 @@ func (s receiptStore) ReadReceipt(ctx context.Context, reference string) (mektup
 }
 
 func readFileBounded(ctx context.Context, name string, max int64) ([]byte, error) {
-	if strings.TrimSpace(name) == "" || filepath.IsAbs(name) || strings.ContainsRune(name, 0) || filepath.Clean(name) != name || strings.HasPrefix(name, ".."+string(filepath.Separator)) || name == ".." {
-		return nil, errors.New("input path must be a relative, normalized path")
+	if strings.TrimSpace(name) == "" || strings.ContainsRune(name, 0) {
+		return nil, errors.New("input path is empty or contains NUL")
 	}
 	if ctx == nil {
 		ctx = context.Background()

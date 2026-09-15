@@ -214,3 +214,14 @@ func TestProductionCompositionDoesNotRequireDaemonOrSSHProcessForInjectedRoute(t
 		t.Fatalf("dialed routes = %+v want %+v", dialer.routes, route)
 	}
 }
+
+func TestReadFileBoundedSupportsExplicitAbsoluteParamsPath(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "params.json")
+	if err := os.WriteFile(path, []byte(`{"ok":true}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := readFileBounded(context.Background(), path, 1024)
+	if err != nil || string(data) != `{"ok":true}` {
+		t.Fatalf("data=%s err=%v", data, err)
+	}
+}
