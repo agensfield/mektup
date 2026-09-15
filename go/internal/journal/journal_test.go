@@ -312,6 +312,53 @@ func TestExpiredReplyCanOnlyBeReconciledWithoutTokenRevival(t *testing.T) {
 	}
 }
 
+func TestReconciledWinnerCannotBeDisplacedByLaterCommit(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	a := claimInput()
+	a.ReplyID = "reply-reconciled"
+	ca, err := j.ClaimReply(context.Background(), a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := claimInput()
+	b.ReplyID = "reply-later"
+	cb, err := j.ClaimReply(context.Background(), b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now.Add(2 * int64(time.Second))
+	if _, err := j.db.Exec("UPDATE reply_claims SET lease_until=? WHERE reply_id=?", now.Load()-1, ca.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("UPDATE reply_claims SET lease_until=? WHERE reply_id=?", now.Load()+10*int64(time.Second), cb.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.ClaimReply(context.Background(), a); !errors.Is(err, ErrClaimExpired) {
+		t.Fatal(err)
+	}
+	if err := j.ReconcileReplyObservation(context.Background(), ca.ReplyID, "native-reconciled", ca.Digest); err != nil {
+		t.Fatal(err)
+	}
+	rb, err := j.CommitReply(context.Background(), cb.ReplyID, cb.Owner, cb.Token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rb.Won {
+		t.Fatal("later commit displaced reconciled winner")
+	}
+	w, err := j.Wait(context.Background(), "msg-1", time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w.ReplyID != ca.ReplyID || w.State != StateReplyObserved {
+		t.Fatalf("wait winner %+v", w)
+	}
+}
+
 func TestReplyRouteRelationshipIsFenced(t *testing.T) {
 	dir := t.TempDir()
 	var now atomic.Int64
@@ -616,7 +663,7 @@ func TestForeignKeyAndMigrationAreTransactional(t *testing.T) {
 	if err := j.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
+	if version != 4 {
 		t.Fatalf("schema version %d", version)
 	}
 }
@@ -671,7 +718,7 @@ PRAGMA user_version=1;`
 	if err := j.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 3 {
+	if version != 4 {
 		t.Fatalf("migrated version %d", version)
 	}
 	var columns int
@@ -680,6 +727,59 @@ PRAGMA user_version=1;`
 	}
 	if columns != 3 {
 		t.Fatalf("attempt columns %d", columns)
+	}
+}
+
+func TestV3PartialUpgradeIsCompletedIdempotently(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	for _, table := range []string{"store_id_aliases", "operation_acceptances", "reply_acceptances"} {
+		if _, err := j.db.Exec("DROP TABLE " + table); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := j.db.Exec("PRAGMA user_version=3"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	j2, err := Open(context.Background(), Options{StateDir: dir, Now: func() time.Time { return time.Unix(0, now.Load()) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j2.Close()
+	var version int
+	if err := j2.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 4 {
+		t.Fatalf("partial migration version %d", version)
+	}
+	for _, table := range []string{"store_id_aliases", "operation_acceptances", "reply_acceptances"} {
+		var n int
+		if err := j2.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", table).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Fatalf("missing table %s", table)
+		}
+	}
+	if err := j2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	j3, err := Open(context.Background(), Options{StateDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j3.Close()
+	if err := j3.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 4 {
+		t.Fatalf("idempotent migration version %d", version)
 	}
 }
 

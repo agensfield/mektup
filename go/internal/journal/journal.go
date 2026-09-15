@@ -176,22 +176,30 @@ func (j *Journal) init(ctx context.Context) error {
 	if err = tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
-	if version > 3 {
+	if version > 4 {
 		return fmt.Errorf("journal: unsupported schema version %d", version)
 	}
 	if version == 0 {
 		if _, err = tx.ExecContext(ctx, schemaV1); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
 		}
-		if _, err = tx.ExecContext(ctx, "PRAGMA user_version=3"); err != nil {
+		if _, err = tx.ExecContext(ctx, "PRAGMA user_version=4"); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
 		}
 	} else if version == 1 {
-		if err = migrateV1ToV3(ctx, tx, j.leaseDuration); err != nil {
+		if err = migrateV1ToV4(ctx, tx, j.leaseDuration); err != nil {
 			return err
 		}
 	} else if version == 2 {
-		if err = migrateV2ToV3(ctx, tx); err != nil {
+		if err = migrateV2ToV4(ctx, tx); err != nil {
+			return err
+		}
+	} else if version == 3 {
+		if err = migrateV3ToV4(ctx, tx); err != nil {
+			return err
+		}
+	} else if version == 4 {
+		if err = ensureV4Tables(ctx, tx); err != nil {
 			return err
 		}
 	}
@@ -292,7 +300,7 @@ CREATE TABLE IF NOT EXISTS reply_acceptances (
 );
 `
 
-func migrateV1ToV3(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration) error {
+func migrateV1ToV4(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration) error {
 	stmts := []string{
 		`ALTER TABLE attempts ADD COLUMN owner TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE attempts ADD COLUMN token TEXT NOT NULL DEFAULT ''`,
@@ -305,7 +313,7 @@ func migrateV1ToV3(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration)
 		`CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS operation_acceptances (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS reply_acceptances (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
-		`PRAGMA user_version=3`,
+		`PRAGMA user_version=4`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -338,7 +346,7 @@ func migrateV1ToV3(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration)
 	return nil
 }
 
-func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
+func migrateV2ToV4(ctx context.Context, tx *sql.Tx) error {
 	for _, stmt := range []string{
 		`ALTER TABLE operations ADD COLUMN reply_route TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE operations ADD COLUMN custody_route TEXT NOT NULL DEFAULT ''`,
@@ -348,7 +356,7 @@ func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
 		`CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS operation_acceptances (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS reply_acceptances (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
-		`PRAGMA user_version=3`,
+		`PRAGMA user_version=4`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
@@ -356,6 +364,22 @@ func migrateV2ToV3(ctx context.Context, tx *sql.Tx) error {
 	}
 	return nil
 }
+
+func ensureV4Tables(ctx context.Context, tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS operation_acceptances (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS reply_acceptances (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
+		`PRAGMA user_version=4`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+	}
+	return nil
+}
+
+func migrateV3ToV4(ctx context.Context, tx *sql.Tx) error { return ensureV4Tables(ctx, tx) }
 
 func (j *Journal) loadOrCreateStoreID(ctx context.Context) error {
 	var id string

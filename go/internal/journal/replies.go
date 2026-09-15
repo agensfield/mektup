@@ -187,19 +187,14 @@ func (j *Journal) CommitReply(ctx context.Context, replyID, owner, token string)
 			expired = true
 			return nil
 		}
-		var seq int64
-		if err := tx.QueryRow("SELECT COALESCE(MAX(commit_seq),0)+1 FROM reply_claims").Scan(&seq); err != nil {
+		if _, err := tx.Exec("UPDATE reply_claims SET state=?,updated_at=? WHERE reply_id=? AND owner=? AND token=? AND state=? AND lease_until>?", string(StateReplyAccepted), now, replyID, owner, token, string(StateReplyClaimed), now); err != nil {
 			return err
 		}
-		if _, err := tx.Exec("UPDATE reply_claims SET state=?,accepted_at=?,updated_at=?,commit_seq=? WHERE reply_id=? AND owner=? AND token=? AND state=? AND lease_until>?", string(StateReplyAccepted), now, now, seq, replyID, owner, token, string(StateReplyClaimed), now); err != nil {
+		seq, won, err := assignReplyCommitTx(tx, claim.OriginalID, replyID, now)
+		if err != nil {
 			return err
 		}
-		if _, err := tx.Exec("INSERT OR IGNORE INTO reply_winners(original_id,reply_id,committed_at,commit_seq) VALUES(?,?,?,?)", claim.OriginalID, replyID, now, seq); err != nil {
-			return err
-		}
-		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM reply_winners WHERE original_id=? AND reply_id=?)", claim.OriginalID, replyID).Scan(&result.Won); err != nil {
-			return err
-		}
+		result.Won = won
 		if err := emit(tx, "reply.accepted", "", replyID, StateReplyAccepted, now); err != nil {
 			return err
 		}
@@ -214,6 +209,32 @@ func (j *Journal) CommitReply(ctx context.Context, replyID, owner, token string)
 		return result, ErrClaimExpired
 	}
 	return result, err
+}
+
+// assignReplyCommitTx gives a reconciled or accepted reply a durable custody
+// order and inserts the original's first winner without replacing an earlier
+// winner. The caller must already hold the write transaction.
+func assignReplyCommitTx(tx *sql.Tx, originalID, replyID string, now int64) (int64, bool, error) {
+	var seq int64
+	if err := tx.QueryRow("SELECT COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", replyID).Scan(&seq); err != nil {
+		return 0, false, err
+	}
+	if seq == 0 {
+		if err := tx.QueryRow("SELECT COALESCE(MAX(commit_seq),0)+1 FROM reply_claims").Scan(&seq); err != nil {
+			return 0, false, err
+		}
+		if _, err := tx.Exec("UPDATE reply_claims SET accepted_at=?,commit_seq=? WHERE reply_id=?", now, seq, replyID); err != nil {
+			return 0, false, err
+		}
+	}
+	if _, err := tx.Exec("INSERT OR IGNORE INTO reply_winners(original_id,reply_id,committed_at,commit_seq) VALUES(?,?,?,?)", originalID, replyID, now, seq); err != nil {
+		return 0, false, err
+	}
+	var won bool
+	if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM reply_winners WHERE original_id=? AND reply_id=?)", originalID, replyID).Scan(&won); err != nil {
+		return 0, false, err
+	}
+	return seq, won, nil
 }
 
 func expireClaimTx(tx *sql.Tx, replyID string, now int64) error {
@@ -314,7 +335,10 @@ func (j *Journal) Wait(ctx context.Context, originalID string, poll time.Duratio
 		}
 		var out ReplyClaim
 		err := scanClaim(j.db.QueryRowContext(ctx, `SELECT c.reply_id,c.original_id,c.digest,c.body_size,c.status,c.reply_route,c.custody_route,c.custody_store_id,c.owner,c.token,c.lease_until,c.state,c.created_at,c.updated_at,COALESCE(c.accepted_at,0),COALESCE(c.commit_seq,0)
-FROM reply_claims c WHERE c.original_id=? AND c.state IN (?,?,?) ORDER BY CASE WHEN c.state IN (?,?) THEN 0 ELSE 1 END, c.commit_seq LIMIT 1`, originalID, string(StateReplyAccepted), string(StateReplyObserved), string(StateReplyOutcomeUnknown), string(StateReplyAccepted), string(StateReplyObserved)), &out)
+FROM reply_claims c LEFT JOIN reply_winners w ON w.reply_id=c.reply_id AND w.original_id=c.original_id
+WHERE c.original_id=? AND c.state IN (?,?,?)
+ORDER BY CASE WHEN w.reply_id IS NOT NULL THEN 0 WHEN c.state IN (?,?) THEN 1 ELSE 2 END,
+COALESCE(w.commit_seq,c.commit_seq,9223372036854775807), c.reply_id LIMIT 1`, originalID, string(StateReplyAccepted), string(StateReplyObserved), string(StateReplyOutcomeUnknown), string(StateReplyAccepted), string(StateReplyObserved)), &out)
 		if err == nil {
 			out.Token = ""
 			return out, nil
@@ -340,9 +364,9 @@ func (j *Journal) ObserveReply(ctx context.Context, replyID, nativeItemID, diges
 	}
 	now := j.nowUnix()
 	return j.withTx(ctx, func(tx *sql.Tx) error {
-		var expected string
+		var expected, originalID string
 		var state EvidenceState
-		if err := tx.QueryRow("SELECT digest,state FROM reply_claims WHERE reply_id=?", replyID).Scan(&expected, &state); err != nil {
+		if err := tx.QueryRow("SELECT digest,original_id,state FROM reply_claims WHERE reply_id=?", replyID).Scan(&expected, &originalID, &state); err != nil {
 			if err == sql.ErrNoRows {
 				return ErrNotFound
 			}
@@ -355,6 +379,9 @@ func (j *Journal) ObserveReply(ctx context.Context, replyID, nativeItemID, diges
 			return ErrInvalidTransition
 		}
 		if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest) VALUES(?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET native_item_id=excluded.native_item_id,observed_at=excluded.observed_at", replyID, nativeItemID, now, digest); err != nil {
+			return err
+		}
+		if _, _, err := assignReplyCommitTx(tx, originalID, replyID, now); err != nil {
 			return err
 		}
 		if state != StateReplyObserved {
@@ -376,9 +403,9 @@ func (j *Journal) ReconcileReplyObservation(ctx context.Context, replyID, native
 	}
 	return j.withTx(ctx, func(tx *sql.Tx) error {
 		now := j.nowUnix()
-		var expected string
+		var expected, originalID string
 		var state EvidenceState
-		if err := tx.QueryRow("SELECT digest,state FROM reply_claims WHERE reply_id=?", replyID).Scan(&expected, &state); err != nil {
+		if err := tx.QueryRow("SELECT digest,original_id,state FROM reply_claims WHERE reply_id=?", replyID).Scan(&expected, &originalID, &state); err != nil {
 			if err == sql.ErrNoRows {
 				return ErrNotFound
 			}
@@ -399,6 +426,9 @@ func (j *Journal) ReconcileReplyObservation(ctx context.Context, replyID, native
 		if _, err := tx.Exec("UPDATE reply_claims SET state=?,updated_at=? WHERE reply_id=? AND state=?", string(StateReplyObserved), now, replyID, string(state)); err != nil {
 			return err
 		}
+		if _, _, err := assignReplyCommitTx(tx, originalID, replyID, now); err != nil {
+			return err
+		}
 		return emit(tx, "reply.reconciled", "", replyID, StateReplyObserved, now)
 	})
 }
@@ -413,7 +443,8 @@ func (j *Journal) ReconcileReplyAccepted(ctx context.Context, replyID, evidenceR
 	return j.withTx(ctx, func(tx *sql.Tx) error {
 		now := j.nowUnix()
 		var state EvidenceState
-		if err := tx.QueryRow("SELECT state FROM reply_claims WHERE reply_id=?", replyID).Scan(&state); err != nil {
+		var originalID string
+		if err := tx.QueryRow("SELECT state,original_id FROM reply_claims WHERE reply_id=?", replyID).Scan(&state, &originalID); err != nil {
 			if err == sql.ErrNoRows {
 				return ErrNotFound
 			}
@@ -426,6 +457,9 @@ func (j *Journal) ReconcileReplyAccepted(ctx context.Context, replyID, evidenceR
 			return err
 		}
 		if _, err := tx.Exec("INSERT OR REPLACE INTO reply_acceptances(reply_id,evidence_ref,recorded_at) VALUES(?,?,?)", replyID, evidenceRef, now); err != nil {
+			return err
+		}
+		if _, _, err := assignReplyCommitTx(tx, originalID, replyID, now); err != nil {
 			return err
 		}
 		return emit(tx, "reply.reconciled", "", replyID, StateReplyAccepted, now)
