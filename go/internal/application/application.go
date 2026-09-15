@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	mektup "github.com/agensfield/mektup/go"
@@ -55,6 +56,7 @@ type Options struct {
 // executor itself.
 type Environment struct {
 	options Options
+	mu      sync.RWMutex
 	closed  bool
 }
 
@@ -69,7 +71,12 @@ var _ cli.Executor = (*Environment)(nil)
 // Execute opens only the resources needed by the production executor for this
 // invocation. No path is taken that starts a daemon.
 func (e *Environment) Execute(ctx context.Context, inv cli.Invocation) (result cli.ExecutionResult, execErr error) {
-	if e == nil || e.closed {
+	if e == nil {
+		return cli.ExecutionResult{}, &cli.Error{Code: "internal_error", Message: "application environment is closed", Effect: "not_sent", Exit: cli.ExitInternal}
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed {
 		return cli.ExecutionResult{}, &cli.Error{Code: "internal_error", Message: "application environment is closed", Effect: "not_sent", Exit: cli.ExitInternal}
 	}
 	resources, err := e.openResources(ctx, inv)
@@ -78,10 +85,11 @@ func (e *Environment) Execute(ctx context.Context, inv cli.Invocation) (result c
 	}
 	defer func() {
 		if closeErr := resources.Close(); closeErr != nil {
+			cleanupErr := &CleanupError{Resource: "application resources", Err: closeErr}
 			if execErr == nil {
-				execErr = &CleanupError{Resource: "application resources", Err: closeErr}
+				result = preserveCleanupResult(result, cleanupErr)
 			} else {
-				execErr = errors.Join(execErr, &CleanupError{Resource: "application resources", Err: closeErr})
+				execErr = errors.Join(execErr, cleanupErr)
 			}
 		}
 	}()
@@ -94,7 +102,9 @@ func (e *Environment) Close() error {
 	if e == nil {
 		return nil
 	}
+	e.mu.Lock()
 	e.closed = true
+	e.mu.Unlock()
 	return nil
 }
 
@@ -103,6 +113,40 @@ func (e *Environment) Close() error {
 type CleanupError struct {
 	Resource string
 	Err      error
+}
+
+func preserveCleanupResult(result cli.ExecutionResult, cleanupErr error) cli.ExecutionResult {
+	warning := map[string]any{"code": "cleanup_incomplete", "message": "application resource cleanup failed", "details": map[string]any{"error": cleanupErr.Error()}}
+	for index := range result.Events {
+		machine, ok := result.Events[index].Machine.(map[string]any)
+		if !ok {
+			continue
+		}
+		machine["warnings"] = appendWireWarning(machine["warnings"], warning)
+		result.Events[index].Machine = machine
+	}
+	if len(result.Events) == 0 {
+		result.Events = append(result.Events, cli.OutputEvent{Machine: map[string]any{
+			"event": "operation.cleanup_warning", "terminal": true, "ok": false, "warnings": []any{warning},
+		}, Human: "cleanup incomplete"})
+	} else if strings.TrimSpace(result.Human) != "" {
+		result.Human += " (cleanup incomplete)"
+	}
+	result.Exit = cli.ExitInternal
+	return result
+}
+
+func appendWireWarning(existing any, warning map[string]any) []any {
+	result := make([]any, 0, 1)
+	switch values := existing.(type) {
+	case []any:
+		result = append(result, values...)
+	case []map[string]any:
+		for _, value := range values {
+			result = append(result, value)
+		}
+	}
+	return append(result, warning)
 }
 
 func (e *CleanupError) Error() string {
@@ -211,7 +255,7 @@ func (e *Environment) paths(inv cli.Invocation) (string, string) {
 	// cli's built-in config value is an owner-private directory. Explicit
 	// --config/MEKTUP_CONFIG values remain exact file paths for compatibility
 	// with endpoint.EndpointStore.
-	if inv.Global.Config == "" && os.Getenv("MEKTUP_CONFIG") == "" && filepath.Base(configPath) == "mektup" && filepath.Ext(configPath) == "" {
+	if inv.Resolved.ConfigSource == cli.PathDefault && filepath.Base(configPath) == "mektup" && filepath.Ext(configPath) == "" {
 		configPath = filepath.Join(configPath, "endpoints.json")
 	}
 	return configPath, stateDir
@@ -224,6 +268,7 @@ type connectionFactory struct {
 	sshConfig      sshproxy.Config
 	sshFactory     sshproxy.ProcessFactory
 	dialerForRoute func(endpoint.Route, bool) connection.ClientDialer
+	openOverride   func(context.Context, string, executor.OpenOptions) (executor.Connection, error)
 }
 
 func (f *connectionFactory) Open(ctx context.Context, selector string) (executor.Connection, error) {
@@ -231,6 +276,9 @@ func (f *connectionFactory) Open(ctx context.Context, selector string) (executor
 }
 
 func (f *connectionFactory) OpenWithOptions(ctx context.Context, selector string, open executor.OpenOptions) (executor.Connection, error) {
+	if f.openOverride != nil {
+		return f.openOverride(ctx, selector, open)
+	}
 	ep, err := f.store.ResolveEndpoint(selector, f.codexHome)
 	if err != nil {
 		return nil, err
@@ -261,8 +309,11 @@ func (f *connectionFactory) Check(ctx context.Context, selector string) (any, er
 	if err != nil {
 		return nil, err
 	}
-	defer opened.Close()
-	return map[string]any{"endpoint": selector, "warnings": opened.Warnings()}, nil
+	result := map[string]any{"endpoint": selector, "warnings": opened.Warnings()}
+	if closeErr := opened.Close(); closeErr != nil {
+		return result, &CleanupError{Resource: "endpoint connection", Err: closeErr}
+	}
+	return result, nil
 }
 
 type endpointHealth struct{ factory *connectionFactory }

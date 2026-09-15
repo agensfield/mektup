@@ -1,12 +1,15 @@
 package application
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -17,6 +20,7 @@ import (
 	"github.com/agensfield/mektup/go/internal/endpoint"
 	"github.com/agensfield/mektup/go/internal/executor"
 	"github.com/agensfield/mektup/go/internal/journal"
+	"github.com/agensfield/mektup/go/internal/rawrpc"
 )
 
 type fakeTransport struct {
@@ -59,6 +63,13 @@ type recordingDialer struct {
 	options   []appserver.Options
 	transport *fakeTransport
 }
+
+type failingCloseConnection struct{ closeErr error }
+
+func (c failingCloseConnection) Codex() executor.Codex { return nil }
+func (c failingCloseConnection) RPC() rawrpc.Caller    { return nil }
+func (c failingCloseConnection) Warnings() []string    { return nil }
+func (c failingCloseConnection) Close() error          { return c.closeErr }
 
 func (d *recordingDialer) DialClient(_ context.Context, route endpoint.Route, options appserver.Options) (*appserver.Client, error) {
 	d.mu.Lock()
@@ -114,6 +125,53 @@ func TestEnvironmentUsesInvocationResolvedFlagAndEnvPaths(t *testing.T) {
 	_ = env.Close()
 }
 
+func TestInjectedAppEnvironmentWinsOverConflictingHostEnvironment(t *testing.T) {
+	root := t.TempDir()
+	desiredState := filepath.Join(root, "desired-state")
+	desiredConfig := filepath.Join(root, "desired-config.json")
+	conflictingState := filepath.Join(root, "conflicting-state")
+	conflictingConfig := filepath.Join(root, "conflicting-config.json")
+	t.Setenv("MEKTUP_CONFIG", conflictingConfig)
+	t.Setenv("MEKTUP_STATE_DIR", conflictingState)
+	var out, errOut bytes.Buffer
+	env := New(Options{CodexHome: filepath.Join(root, "codex")})
+	app := &cli.App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{
+		"MEKTUP_OUTPUT=json", "MEKTUP_CONFIG=" + desiredConfig, "MEKTUP_STATE_DIR=" + desiredState,
+	}, Executor: env}
+	if code := app.Run([]string{"endpoint", "list"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("exit=%d stderr=%s", code, errOut.String())
+	}
+	_ = env.Close()
+	if _, err := os.Stat(filepath.Join(desiredState, "journal.sqlite3")); err != nil {
+		t.Fatalf("desired state was not used: %v", err)
+	}
+	if _, err := os.Stat(conflictingState); !os.IsNotExist(err) {
+		t.Fatalf("conflicting host state was touched: %v", err)
+	}
+}
+
+func TestEnvironmentCloseAndExecuteAdmissionIsRaceSafe(t *testing.T) {
+	root := t.TempDir()
+	env := New(Options{CodexHome: filepath.Join(root, "codex"), StateDir: filepath.Join(root, "state"), ConfigPath: filepath.Join(root, "config.json")})
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, _ = env.Execute(context.Background(), cli.Invocation{Command: "endpoint", Position: []string{"list"}, Resolved: cli.ResolvedGlobals{StateDir: filepath.Join(root, "state"), Config: filepath.Join(root, "config.json")}})
+		}()
+		go func() {
+			defer wg.Done()
+			_ = env.Close()
+		}()
+	}
+	wg.Wait()
+	_, err := env.Execute(context.Background(), cli.Invocation{Command: "endpoint", Position: []string{"list"}, Resolved: cli.ResolvedGlobals{StateDir: filepath.Join(root, "state"), Config: filepath.Join(root, "config.json")}})
+	if err == nil {
+		t.Fatal("closed environment admitted a new execution")
+	}
+}
+
 func TestConnectionFactoryPassesExperimentalOptionAndSelectsSSHRoute(t *testing.T) {
 	root := t.TempDir()
 	state := filepath.Join(root, "state")
@@ -152,6 +210,21 @@ func TestConnectionFactoryPassesExperimentalOptionAndSelectsSSHRoute(t *testing.
 	_ = unix
 }
 
+func TestConnectionCheckSurfacesDetachFailure(t *testing.T) {
+	want := errors.New("detach failed")
+	factory := &connectionFactory{openOverride: func(context.Context, string, executor.OpenOptions) (executor.Connection, error) {
+		return failingCloseConnection{closeErr: want}, nil
+	}}
+	result, err := factory.Check(context.Background(), "remote")
+	var cleanupErr *CleanupError
+	if !errors.As(err, &cleanupErr) || !errors.Is(err, want) {
+		t.Fatalf("check error=%T %v", err, err)
+	}
+	if result == nil {
+		t.Fatal("check discarded its result while surfacing cleanup failure")
+	}
+}
+
 func TestReceiptStorePersistsStableEndpointIdentity(t *testing.T) {
 	root := t.TempDir()
 	state := filepath.Join(root, "state")
@@ -181,9 +254,43 @@ func TestReceiptStorePersistsStableEndpointIdentity(t *testing.T) {
 	if receipt.Source.EndpointID != ep.ID || receipt.Target.EndpointID != ep.ID || receipt.Source.Alias != "local" || receipt.Source.Transport != "unix" {
 		t.Fatalf("receipt identity = %+v", receipt)
 	}
+	for _, operation := range []string{"search", "rpc", "storage.maintain"} {
+		var generic any
+		if operation == "search" {
+			generic, err = receipts.Read(context.Background(), operation, "local", map[string]any{"result": true})
+		} else {
+			generic, err = receipts.Mutation(context.Background(), operation, "local", map[string]any{"result": true})
+		}
+		if err != nil {
+			t.Fatalf("%s receipt: %v", operation, err)
+		}
+		stored, ok := generic.(mektup.Receipt)
+		if !ok || stored.Operation != operation {
+			t.Fatalf("%s generic receipt = %#v", operation, generic)
+		}
+		if err := stored.Validate(); err != nil {
+			t.Fatalf("%s generic receipt validation: %v", operation, err)
+		}
+	}
 	loaded, err := j.Receipt(context.Background(), receipt.ReceiptID)
 	if err != nil || loaded.ReceiptID != receipt.ReceiptID {
 		t.Fatalf("loaded receipt = %+v err=%v", loaded, err)
+	}
+}
+
+func TestCleanupFailurePreservesAcceptedResultAndAddsWireWarning(t *testing.T) {
+	result := cli.ExecutionResult{
+		Events:  []cli.OutputEvent{{Machine: map[string]any{"event": "thread.completed", "warnings": []map[string]any{}}}},
+		Receipt: map[string]any{"receiptId": "rcpt"}, Exit: cli.ExitSuccess,
+	}
+	got := preserveCleanupResult(result, errors.New("close failed"))
+	if got.Exit != cli.ExitInternal || got.Receipt == nil {
+		t.Fatalf("cleanup result lost acceptance: %+v", got)
+	}
+	machine := got.Events[0].Machine.(map[string]any)
+	warnings, ok := machine["warnings"].([]any)
+	if !ok || len(warnings) != 1 || warnings[0].(map[string]any)["code"] != "cleanup_incomplete" {
+		t.Fatalf("cleanup warning = %#v", machine["warnings"])
 	}
 }
 

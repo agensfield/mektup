@@ -192,11 +192,24 @@ type Globals struct {
 // config/state files. Flags win over dedicated environment variables, then
 // built-in defaults are used.
 type ResolvedGlobals struct {
-	Output   Presentation
-	Endpoint string
-	Config   string
-	StateDir string
+	Output       Presentation
+	Endpoint     string
+	Config       string
+	StateDir     string
+	ConfigSource PathSource
+	StateSource  PathSource
 }
+
+// PathSource records which input won path precedence. It is intentionally
+// internal application metadata, not a wire field, so embedders can preserve
+// injected environments without consulting the host process environment.
+type PathSource string
+
+const (
+	PathDefault PathSource = "default"
+	PathFlag    PathSource = "flag"
+	PathEnv     PathSource = "environment"
+)
 
 func (i Invocation) Option(name string) string {
 	v := i.Options[name]
@@ -246,6 +259,7 @@ func resolvePresentation(explicitJSON, explicitHuman bool, env map[string]string
 
 func resolveGlobals(inv Invocation, env map[string]string) (Invocation, *Error) {
 	config, state := defaultStatePaths(env)
+	configSource, stateSource := PathDefault, PathDefault
 	endpoint := "local"
 	if inv.Global.Endpoint != "" {
 		endpoint = inv.Global.Endpoint
@@ -254,19 +268,23 @@ func resolveGlobals(inv Invocation, env map[string]string) (Invocation, *Error) 
 	}
 	if inv.Global.Config != "" {
 		config = inv.Global.Config
+		configSource = PathFlag
 	} else if value := strings.TrimSpace(env["MEKTUP_CONFIG"]); value != "" {
 		config = value
+		configSource = PathEnv
 	}
 	if inv.Global.StateDir != "" {
 		state = inv.Global.StateDir
+		stateSource = PathFlag
 	} else if value := strings.TrimSpace(env["MEKTUP_STATE_DIR"]); value != "" {
 		state = value
+		stateSource = PathEnv
 	}
 	output, err := resolvePresentation(inv.Global.JSON, inv.Global.Human, env)
 	if err != nil {
 		return inv, normalizeError(err)
 	}
-	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, Config: config, StateDir: state}
+	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, Config: config, StateDir: state, ConfigSource: configSource, StateSource: stateSource}
 	return inv, nil
 }
 
