@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
 func object(raw json.RawMessage) (map[string]json.RawMessage, error) {
@@ -125,6 +126,26 @@ func thread(raw json.RawMessage) (Thread, error) {
 	if statusRaw := bytes.TrimSpace(m["status"]); len(statusRaw) == 0 || statusRaw[0] != '{' {
 		return Thread{}, fmt.Errorf("field %q must be object", "status")
 	}
+	statusObject, err := object(m["status"])
+	if err != nil {
+		return Thread{}, fmt.Errorf("field %q must be object", "status")
+	}
+	discriminator, err := stringField(statusObject, "type", true)
+	if err != nil {
+		return Thread{}, fmt.Errorf("status discriminator: %w", err)
+	}
+	switch discriminator {
+	case "notLoaded", "idle", "systemError":
+	case "active":
+		if _, err := req(statusObject, "activeFlags"); err != nil {
+			return Thread{}, err
+		}
+		if _, err := jsonArray(statusObject["activeFlags"]); err != nil {
+			return Thread{}, fmt.Errorf("field %q must be array", "activeFlags")
+		}
+	default:
+		return Thread{}, fmt.Errorf("unknown thread status discriminator %q", discriminator)
+	}
 	if _, err := boolField(m, "ephemeral", true); err != nil {
 		return Thread{}, err
 	}
@@ -140,18 +161,19 @@ func thread(raw json.RawMessage) (Thread, error) {
 	return Thread{RawObject: ro, ID: id, Status: status}, nil
 }
 func jsonNumber(v json.RawMessage) (json.Number, error) {
-	var n json.Number
-	d := json.NewDecoder(bytes.NewReader(v))
-	d.UseNumber()
-	if err := d.Decode(&n); err != nil {
-		return "", err
+	raw := bytes.TrimSpace(v)
+	if len(raw) == 0 || raw[0] == '"' || raw[0] == '{' || raw[0] == '[' || bytes.Equal(raw, []byte("null")) {
+		return "", fmt.Errorf("not integer")
 	}
-	if n == "" {
-		return "", fmt.Errorf("not number")
+	if _, err := strconv.ParseInt(string(raw), 10, 64); err != nil {
+		return "", fmt.Errorf("not integer: %w", err)
 	}
-	return n, nil
+	return json.Number(string(raw)), nil
 }
 func jsonArray(v json.RawMessage) ([]json.RawMessage, error) {
+	if raw := bytes.TrimSpace(v); len(raw) == 0 || raw[0] != '[' {
+		return nil, fmt.Errorf("expected array")
+	}
 	var a []json.RawMessage
 	if err := json.Unmarshal(v, &a); err != nil {
 		return nil, err
@@ -174,7 +196,19 @@ func turn(raw json.RawMessage) (Turn, error) {
 	if _, err := jsonArray(m["items"]); err != nil {
 		return Turn{}, fmt.Errorf("field %q must be array", "items")
 	}
-	view, _ := stringField(m, "itemsView", false)
+	view := "full"
+	if _, present := m["itemsView"]; present {
+		var err error
+		view, err = stringField(m, "itemsView", true)
+		if err != nil {
+			return Turn{}, err
+		}
+	}
+	if view == "" {
+		view = "full"
+	} else if view != "notLoaded" && view != "summary" && view != "full" {
+		return Turn{}, fmt.Errorf("unknown itemsView %q", view)
+	}
 	return Turn{RawObject: ro, ID: id, Status: status, ItemsView: view}, nil
 }
 func item(raw json.RawMessage) (Item, error) {

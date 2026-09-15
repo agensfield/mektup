@@ -183,7 +183,7 @@ func TestClassifyNotSubmittedOnlyPinnedReviewCompactShapes(t *testing.T) {
 
 func TestThroughTurnUsesExactReadAndRejectsInProgress(t *testing.T) {
 	r := &recordingCaller{result: json.RawMessage(`{"thread":{"id":"t","cliVersion":"x","createdAt":1,"cwd":"/tmp","ephemeral":false,"modelProvider":"openai","preview":"p","projectId":null,"sessionId":"s","source":"cli","status":{"type":"idle"},"turns":[],"updatedAt":1},"model":"m","modelProvider":"openai","cwd":"/tmp","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"workspace-write"}`)}
-	reader := exactReader{turn: Turn{Status: "inProgress"}}
+	reader := exactReader{turn: Turn{ID: "turn", Status: "inProgress"}}
 	_, err := New(r, Options{ExactRead: reader}).ThreadFork(context.Background(), ForkOptions{ThreadID: "t", ThroughTurnID: "turn"})
 	if err != ErrInProgressCutoff {
 		t.Fatalf("error = %v, want %v", err, ErrInProgressCutoff)
@@ -191,6 +191,94 @@ func TestThroughTurnUsesExactReadAndRejectsInProgress(t *testing.T) {
 	if r.method != "" {
 		t.Fatalf("fork was called before cutoff check: %q", r.method)
 	}
+}
+
+func TestThroughTurnSerializesInclusiveLastTurnAndConflictsRejectBeforeRead(t *testing.T) {
+	r := &recordingCaller{result: lifecycleFixture()}
+	reader := exactReader{turn: Turn{ID: "cut", Status: "completed"}}
+	if _, err := New(r, Options{ExactRead: reader}).ThreadFork(context.Background(), ForkOptions{ThreadID: "t", ThroughTurnID: "cut"}); err != nil {
+		t.Fatal(err)
+	}
+	var params map[string]any
+	if err := json.Unmarshal(r.params, &params); err != nil {
+		t.Fatal(err)
+	}
+	if params["lastTurnId"] != "cut" || params["beforeTurnId"] != nil {
+		t.Fatalf("fork cutoff params = %#v", params)
+	}
+	r = &recordingCaller{result: lifecycleFixture()}
+	if _, err := New(r, Options{ExactRead: reader}).ThreadFork(context.Background(), ForkOptions{ThreadID: "t", ThroughTurnID: "cut", BeforeTurnID: "before"}); err == nil || r.method != "" {
+		t.Fatalf("conflicting cutoff dispatched: method=%q error=%v", r.method, err)
+	}
+}
+
+func TestThreadListDefaultSortAndExperimentalNegotiation(t *testing.T) {
+	r := &recordingCaller{result: json.RawMessage(`{"data":[]}`)}
+	if _, err := New(r, Options{}).ThreadList(context.Background(), ThreadListOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	var params map[string]any
+	if err := json.Unmarshal(r.params, &params); err != nil {
+		t.Fatal(err)
+	}
+	if params["sortKey"] != "updated_at" || params["sortDirection"] != "desc" {
+		t.Fatalf("default sort = %#v", params)
+	}
+	project := "project"
+	r = &recordingCaller{result: json.RawMessage(`{"data":[]}`)}
+	if _, err := New(r, Options{}).ThreadList(context.Background(), ThreadListOptions{ProjectID: &project}); !errors.Is(err, ErrExperimentalAPIRequired) || r.method != "" {
+		t.Fatalf("project field was dispatched without negotiation: method=%q error=%v", r.method, err)
+	}
+	r = &recordingCaller{result: json.RawMessage(`{"data":[]}`)}
+	if _, err := New(r, Options{Capabilities: Capabilities{Methods: map[string]bool{"thread/search": true}}}).Search(context.Background(), SearchOptions{SearchTerm: "x"}); !errors.Is(err, ErrExperimentalAPIRequired) || r.method != "" {
+		t.Fatalf("method inventory bypassed negotiated capability: method=%q error=%v", r.method, err)
+	}
+}
+
+func TestKnownMalformedFieldsRejectAndOmittedItemsViewDefaultsFull(t *testing.T) {
+	for _, row := range []string{
+		`{"id":"x","items":null,"status":"completed","itemsView":"full"}`,
+		`{"id":"x","items":[],"status":"completed","itemsView":42}`,
+	} {
+		if _, err := decodeTurns(json.RawMessage(`{"data":[`+row+`]}`), 1, "full"); err == nil {
+			t.Fatalf("malformed turn accepted: %s", row)
+		}
+	}
+	out, err := decodeTurns(json.RawMessage(`{"data":[{"id":"x","items":[],"status":"completed"}]}`), 1, "full")
+	if err != nil || out.Data[0].ItemsView != "full" {
+		t.Fatalf("omitted itemsView did not default full: %+v, %v", out, err)
+	}
+	rawThread := strings.Replace(threadFixture(), `"createdAt":1`, `"createdAt":1.5`, 1)
+	if _, err := thread(json.RawMessage(rawThread)); err == nil {
+		t.Fatal("fractional createdAt accepted")
+	}
+	rawThread = strings.Replace(threadFixture(), `"status":{"type":"idle"}`, `"status":{}`, 1)
+	if _, err := thread(json.RawMessage(rawThread)); err == nil {
+		t.Fatal("empty status discriminator accepted")
+	}
+}
+
+func TestInvalidCWDAndOutboundCursorRejectBeforeDispatch(t *testing.T) {
+	r := &recordingCaller{result: json.RawMessage(`{"data":[]}`)}
+	if _, err := New(r, Options{}).ThreadList(context.Background(), ThreadListOptions{CWD: 42}); !errors.Is(err, ErrInvalidCWD) || r.method != "" {
+		t.Fatalf("invalid CWD dispatched: method=%q error=%v", r.method, err)
+	}
+	r = &recordingCaller{result: json.RawMessage(`{"data":[]}`)}
+	if _, err := New(r, Options{}).ThreadList(context.Background(), ThreadListOptions{CWD: "/tmp", Cwd: "/tmp"}); !errors.Is(err, ErrConflictingCWD) || r.method != "" {
+		t.Fatalf("conflicting CWD aliases dispatched: method=%q error=%v", r.method, err)
+	}
+	r = &recordingCaller{result: json.RawMessage(`{"data":[]}`)}
+	if _, err := New(r, Options{}).ThreadLoadedList(context.Background(), strings.Repeat("x", MaxCursorBytes+1), 1); err == nil || r.method != "" {
+		t.Fatalf("oversized cursor dispatched: method=%q error=%v", r.method, err)
+	}
+}
+
+func lifecycleFixture() json.RawMessage {
+	return json.RawMessage(`{"thread":{"id":"t","cliVersion":"x","createdAt":1,"cwd":"/tmp","ephemeral":false,"modelProvider":"openai","preview":"p","projectId":null,"sessionId":"s","source":"cli","status":{"type":"idle"},"turns":[],"updatedAt":1},"model":"m","modelProvider":"openai","cwd":"/tmp","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"workspace-write"}`)
+}
+
+func threadFixture() string {
+	return `{"id":"t","cliVersion":"x","createdAt":1,"cwd":"/tmp","ephemeral":false,"modelProvider":"openai","preview":"p","projectId":null,"sessionId":"s","source":"cli","status":{"type":"idle"},"turns":[],"updatedAt":1}`
 }
 
 func TestLifecycleDefaultsDoNotSerializeNullOverrides(t *testing.T) {

@@ -24,9 +24,10 @@ type NotSubmittedClassification struct {
 
 func (c NotSubmittedClassification) Recognized() bool { return c.Kind != NotSubmittedNone }
 
-// ClassifyNotSubmitted accepts only the exact pinned -32603 evidence shape:
-// a message naming the active non-steerable turn and data.codexErrorInfo with
-// activeTurnNotSteerable.turnKind. Generic internal errors remain unknown.
+// ClassifyNotSubmitted accepts only the exact pinned -32603 message shape.
+// The actual 0.154.0 producer omits error data; if a future server attaches
+// data, it must match the nested shape before it can strengthen this evidence.
+// Generic internal errors remain unknown.
 func ClassifyNotSubmitted(err *ServerError) NotSubmittedClassification {
 	result := NotSubmittedClassification{}
 	if err == nil || err.Code != -32603 {
@@ -41,8 +42,7 @@ func ClassifyNotSubmitted(err *ServerError) NotSubmittedClassification {
 	default:
 		return result
 	}
-	// A future server may attach data, but when it does, require the same
-	// pinned nested evidence rather than accepting an arbitrary extension.
+	// Future-only nested data must not weaken the actual omitted-data contract.
 	if len(bytes.TrimSpace(err.Data)) != 0 {
 		data, ok := objectForClassification(err.Data)
 		if !ok {

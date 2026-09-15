@@ -25,6 +25,7 @@ const (
 	MaxCursorBytes              = 4096
 	MaxReconciliationPages      = 1000
 	MaxReconciliationItems      = 100000
+	MaxReconciliationBytes      = 64 << 20
 )
 
 var (
@@ -34,6 +35,9 @@ var (
 	ErrUnboundedPage           = errors.New("codexapi: response page exceeds the bounded limit")
 	ErrPaginationStalled       = errors.New("codexapi: pagination cursor repeated")
 	ErrPaginationExceeded      = errors.New("codexapi: reconciliation pagination bound exceeded")
+	ErrCutoffUnproven          = errors.New("codexapi: exact cutoff read did not prove the requested turn")
+	ErrInvalidCWD              = errors.New("codexapi: cwd must be a string or []string")
+	ErrConflictingCWD          = errors.New("codexapi: CWD and Cwd aliases conflict")
 )
 
 // ServerError is the exact JSON-RPC error evidence supplied by a Caller.
@@ -71,7 +75,9 @@ func (f FuncCaller) Call(ctx context.Context, method string, params json.RawMess
 type Capabilities struct {
 	ExperimentalAPI bool
 	ItemsList       bool
-	Methods         map[string]bool
+	// Methods is an inventory hint only. It never substitutes for the
+	// negotiated ExperimentalAPI bit when gating experimental methods/fields.
+	Methods map[string]bool
 }
 
 // CapabilityProvider can be implemented by a transport adapter.  Options
@@ -278,12 +284,27 @@ func (c *Client) ReconcileHistory(ctx context.Context, threadID string) (ThreadT
 	var all []Turn
 	cursor := ""
 	var lastRaw json.RawMessage
+	var totalItems, totalBytes int
 	for pageNo := 0; pageNo < MaxReconciliationPages; pageNo++ {
 		page, err := c.ThreadTurns(ctx, TurnsOptions{ThreadID: threadID, Cursor: cursor, Limit: MaxTurnsPageLimit, ItemsView: "full"})
 		if err != nil {
 			return ThreadTurnsResponse{}, fmt.Errorf("codexapi: reconcile turns page %d: %w", pageNo+1, err)
 		}
 		if len(all)+len(page.Data) > MaxReconciliationItems {
+			return ThreadTurnsResponse{}, ErrPaginationExceeded
+		}
+		for _, turn := range page.Data {
+			items, err := jsonArray(turn.Fields["items"])
+			if err != nil {
+				return ThreadTurnsResponse{}, fmt.Errorf("codexapi: reconcile turn %s items: %w", turn.ID, err)
+			}
+			totalItems += len(items)
+			if totalItems > MaxReconciliationItems {
+				return ThreadTurnsResponse{}, ErrPaginationExceeded
+			}
+		}
+		totalBytes += len(page.Raw)
+		if totalBytes > MaxReconciliationBytes {
 			return ThreadTurnsResponse{}, ErrPaginationExceeded
 		}
 		all = append(all, page.Data...)
@@ -357,6 +378,9 @@ type ForkOptions struct {
 var allSourceKinds = []string{"cli", "vscode", "exec", "appServer", "subAgent", "subAgentReview", "subAgentCompact", "subAgentThreadSpawn", "subAgentOther", "unknown"}
 
 func (c *Client) ThreadList(ctx context.Context, options ThreadListOptions) (ThreadListResponse, error) {
+	if err := validateCursorInput(options.Cursor); err != nil {
+		return ThreadListResponse{}, err
+	}
 	if options.Loaded {
 		if err := validateLoadedListOptions(options); err != nil {
 			return ThreadListResponse{}, err
@@ -376,11 +400,24 @@ func (c *Client) ThreadList(ctx context.Context, options ThreadListOptions) (Thr
 	if err := validatePage(options.Limit, MaxThreadPageLimit); err != nil {
 		return ThreadListResponse{}, err
 	}
+	if err := validateCWD(options.CWD, options.Cwd); err != nil {
+		return ThreadListResponse{}, err
+	}
+	if (options.ProjectID != nil || options.ParentThreadID != "" || options.AncestorThreadID != "") && !c.capabilities.ExperimentalAPI {
+		return ThreadListResponse{}, ErrExperimentalAPIRequired
+	}
 	p := map[string]any{}
 	putString(p, "cursor", options.Cursor)
 	putLimit(p, options.Limit)
-	putString(p, "sortKey", options.SortKey)
-	putString(p, "sortDirection", options.SortDirection)
+	sortKey, sortDirection := options.SortKey, options.SortDirection
+	if sortKey == "" {
+		sortKey = "updated_at"
+	}
+	if sortDirection == "" {
+		sortDirection = "desc"
+	}
+	putString(p, "sortKey", sortKey)
+	putString(p, "sortDirection", sortDirection)
 	putStrings(p, "modelProviders", options.ModelProviders)
 	sources := options.SourceKinds
 	if sources == nil {
@@ -412,6 +449,9 @@ func validateLoadedListOptions(options ThreadListOptions) error {
 }
 
 func (c *Client) ThreadLoadedList(ctx context.Context, cursor string, limit int) (ThreadLoadedListResponse, error) {
+	if err := validateCursorInput(cursor); err != nil {
+		return ThreadLoadedListResponse{}, err
+	}
 	if err := validatePage(limit, MaxThreadPageLimit); err != nil {
 		return ThreadLoadedListResponse{}, err
 	}
@@ -454,6 +494,9 @@ func (c *Client) ThreadTurns(ctx context.Context, options TurnsOptions) (ThreadT
 	if options.ThreadID == "" {
 		return ThreadTurnsResponse{}, errors.New("codexapi: threadId is required")
 	}
+	if err := validateCursorInput(options.Cursor); err != nil {
+		return ThreadTurnsResponse{}, err
+	}
 	if options.ItemsView != "summary" && options.ItemsView != "full" {
 		return ThreadTurnsResponse{}, errors.New("codexapi: itemsView must be explicitly summary or full")
 	}
@@ -476,6 +519,9 @@ func (c *Client) ThreadTurns(ctx context.Context, options TurnsOptions) (ThreadT
 func (c *Client) ThreadItems(ctx context.Context, options ItemsOptions) (ThreadItemsResponse, error) {
 	if options.ThreadID == "" {
 		return ThreadItemsResponse{}, errors.New("codexapi: threadId is required")
+	}
+	if err := validateCursorInput(options.Cursor); err != nil {
+		return ThreadItemsResponse{}, err
 	}
 	if err := validatePage(options.Limit, MaxItemsPageLimit); err != nil {
 		return ThreadItemsResponse{}, err
@@ -526,6 +572,9 @@ func (c *Client) ThreadFork(ctx context.Context, options ForkOptions) (ThreadFor
 	if options.ThreadID == "" {
 		return ThreadForkResponse{}, errors.New("codexapi: threadId is required")
 	}
+	if options.ThroughTurnID != "" && (options.LastTurnID != "" || options.BeforeTurnID != "") {
+		return ThreadForkResponse{}, errors.New("codexapi: throughTurn, lastTurnId, and beforeTurnId are mutually exclusive")
+	}
 	if options.LastTurnID != "" && options.BeforeTurnID != "" {
 		return ThreadForkResponse{}, errors.New("codexapi: lastTurnId and beforeTurnId are mutually exclusive")
 	}
@@ -538,8 +587,12 @@ func (c *Client) ThreadFork(ctx context.Context, options ForkOptions) (ThreadFor
 			return ThreadForkResponse{}, err
 		}
 	}
+	lastTurnID := options.LastTurnID
+	if options.ThroughTurnID != "" {
+		lastTurnID = options.ThroughTurnID
+	}
 	p := map[string]any{"threadId": options.ThreadID}
-	putString(p, "lastTurnId", options.LastTurnID)
+	putString(p, "lastTurnId", lastTurnID)
 	putString(p, "beforeTurnId", options.BeforeTurnID)
 	putString(p, "model", options.Model)
 	putString(p, "modelProvider", options.ModelProvider)
@@ -595,6 +648,9 @@ func (c *Client) Search(ctx context.Context, options SearchOptions) (SearchRespo
 	if strings.TrimSpace(options.SearchTerm) == "" {
 		return SearchResponse{}, errors.New("codexapi: searchTerm is required")
 	}
+	if err := validateCursorInput(options.Cursor); err != nil {
+		return SearchResponse{}, err
+	}
 	if err := validatePage(options.Limit, MaxThreadPageLimit); err != nil {
 		return SearchResponse{}, err
 	}
@@ -623,6 +679,9 @@ func (c *Client) SearchOccurrences(ctx context.Context, options SearchOccurrence
 	if options.ThreadID == "" || strings.TrimSpace(options.SearchTerm) == "" {
 		return SearchOccurrencesResponse{}, errors.New("codexapi: threadId and searchTerm are required")
 	}
+	if err := validateCursorInput(options.Cursor); err != nil {
+		return SearchOccurrencesResponse{}, err
+	}
 	if err := validatePage(options.Limit, MaxOccurrencesPageLimit); err != nil {
 		return SearchOccurrencesResponse{}, err
 	}
@@ -648,6 +707,12 @@ func (c *Client) checkThroughTurn(ctx context.Context, threadID, turnID string, 
 	if err != nil {
 		return err
 	}
+	if turn.ID != turnID {
+		return ErrCutoffUnproven
+	}
+	if turn.Status == "" {
+		return ErrCutoffUnproven
+	}
 	if strings.EqualFold(turn.Status, "inProgress") || strings.EqualFold(turn.Status, "in-progress") {
 		return ErrInProgressCutoff
 	}
@@ -655,7 +720,7 @@ func (c *Client) checkThroughTurn(ctx context.Context, threadID, turnID string, 
 }
 
 func (c *Client) callExperimentalMaybe(ctx context.Context, method string, params any, experimental bool, decode func(json.RawMessage) error) error {
-	if experimental && !c.capabilities.ExperimentalAPI && !c.capabilities.Methods[method] {
+	if experimental && !c.capabilities.ExperimentalAPI {
 		return ErrExperimentalAPIRequired
 	}
 	return c.callDecode(ctx, method, params, decode)
@@ -719,11 +784,34 @@ func putCWD(m map[string]any, value any) {
 	case nil:
 		return
 	default:
-		// Let JSON encoding report an invalid caller-provided union only when
-		// it is actually dispatched. This branch is intentionally omitted to
-		// preserve the no-local-filtering rule.
+		// Public entry points call validateCWD before this helper. Keep this
+		// defensive branch inert so an internal future caller cannot panic.
 		return
 	}
+}
+func validateCWD(primary, alias any) error {
+	if primary != nil && alias != nil {
+		return ErrConflictingCWD
+	}
+	value := primary
+	if value == nil {
+		value = alias
+	}
+	switch cwd := value.(type) {
+	case nil, string:
+		return nil
+	case []string:
+		_ = cwd
+		return nil
+	default:
+		return ErrInvalidCWD
+	}
+}
+func validateCursorInput(value string) error {
+	if len(value) > MaxCursorBytes {
+		return fmt.Errorf("codexapi: cursor exceeds %d bytes", MaxCursorBytes)
+	}
+	return nil
 }
 func validatePage(limit, max int) error {
 	if limit < 0 || limit > max {
