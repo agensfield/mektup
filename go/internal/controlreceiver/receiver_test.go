@@ -204,6 +204,43 @@ func TestReceiverTerminalClaimDuplicatesAreStatusOnly(t *testing.T) {
 	}
 }
 
+func TestReceiverClaimJoinsAcrossAttemptOwners(t *testing.T) {
+	for _, terminal := range []string{"active", "accepted"} {
+		t.Run(terminal, func(t *testing.T) {
+			j, _ := openReceiverJournal(t, time.Minute)
+			prepareOriginal(t, j)
+			receiver := Receiver{Registry: staticResolver{store: Store{Journal: j, StoreID: j.StoreID(), EndpointID: receiverEndpoint, CloseFunc: func() error { return nil }}}, LocalEndpointID: receiverEndpoint, Destination: localDestination()}
+			first := request(j)
+			claimed := receive(t, receiver, first)
+			if terminal == "accepted" {
+				var payload struct {
+					FencingToken string `json:"fencingToken"`
+				}
+				if err := json.Unmarshal(claimed.Result, &payload); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := j.CommitReply(context.Background(), first.ReplyMessageID, first.AttemptOwner, payload.FencingToken); err != nil {
+					t.Fatal(err)
+				}
+			}
+			join := first
+			join.AttemptOwner = "receiver-other"
+			response, err := receiver.Receive(context.Background(), mustMarshal(t, join))
+			if err != nil {
+				t.Fatal(err)
+			}
+			parsed, err := sshproxy.ValidateControlRequest(response)
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := string(parsed.Result)
+			if !strings.Contains(result, `"disposition":"existing"`) || strings.Contains(result, "fencingToken") || strings.Contains(result, "lease") || strings.Contains(result, "won") {
+				t.Fatalf("%s cross-owner result = %s", terminal, result)
+			}
+		})
+	}
+}
+
 func TestReceiverRejectsWrongStoreRouteAndConflict(t *testing.T) {
 	j, state := openReceiverJournal(t, time.Minute)
 	prepareOriginal(t, j)

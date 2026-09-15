@@ -186,6 +186,23 @@ func validateDestinationThread(req sshproxy.ControlRequest) error {
 }
 
 func validateClaimTuple(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) error {
+	if err := validateClaimJoinTuple(ctx, j, req, storeID); err != nil {
+		return err
+	}
+	claim, err := j.Reply(ctx, req.ReplyMessageID)
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			return journal.ErrNotFound
+		}
+		return fmt.Errorf("%w: selected claim unavailable: %v", ErrRelationshipMismatch, err)
+	}
+	if req.AttemptOwner != "" && claim.Owner != req.AttemptOwner {
+		return ErrRelationshipMismatch
+	}
+	return nil
+}
+
+func validateClaimJoinTuple(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) error {
 	claim, err := j.Reply(ctx, req.ReplyMessageID)
 	if err != nil {
 		if errors.Is(err, journal.ErrNotFound) {
@@ -196,7 +213,7 @@ func validateClaimTuple(ctx context.Context, j *journal.Journal, req sshproxy.Co
 	if claim.OriginalID != req.OriginalMessageID || claim.Digest != req.BodySHA256 ||
 		(req.BodyBytes == nil || claim.BodySize != *req.BodyBytes) || claim.Status != req.ReplyStatus ||
 		claim.ReplyRoute != req.ReplyDestination.URI || claim.CustodyRoute != req.Custody.EndpointID ||
-		claim.CustodyStoreID != storeID || (req.AttemptOwner != "" && claim.Owner != req.AttemptOwner) {
+		claim.CustodyStoreID != storeID {
 		return ErrRelationshipMismatch
 	}
 	return nil
@@ -220,7 +237,7 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 	switch req.Operation {
 	case "claim":
 		if _, inspectErr := j.Reply(ctx, req.ReplyMessageID); inspectErr == nil {
-			if err := validateClaimTuple(ctx, j, req, storeID); err != nil {
+			if err := validateClaimJoinTuple(ctx, j, req, storeID); err != nil {
 				return nil, journal.ErrIdentityConflict
 			}
 		}
@@ -228,7 +245,7 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 		if err != nil {
 			if errors.Is(err, journal.ErrClaimExpired) {
 				if terminal, inspectErr := j.Reply(ctx, req.ReplyMessageID); inspectErr == nil {
-					if tupleErr := validateClaimTuple(ctx, j, req, storeID); tupleErr == nil {
+					if tupleErr := validateClaimJoinTuple(ctx, j, req, storeID); tupleErr == nil {
 						return existingClaimResult(terminal)
 					}
 				}
