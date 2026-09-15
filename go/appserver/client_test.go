@@ -527,3 +527,54 @@ func TestCloseConcurrentReadAlwaysTerminatesPump(t *testing.T) {
 		}
 	}
 }
+
+func closeReview(c *Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_ = c.Close(ctx)
+}
+
+func TestGateNegativeZeroMatchesCanonicalResponse(t *testing.T) {
+	f := newFakeTransport()
+	c := New(f, Options{})
+	defer closeReview(c)
+	go func() {
+		<-f.writes
+		pushJSON(f, `{"id":0,"result":{"ok":true}}`)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := c.call(ctx, RPCRequest{ID: json.Number("-0"), Method: "read"}); err != nil {
+		t.Fatalf("numeric -0/0 response identity lost: %v", err)
+	}
+}
+
+func TestGateCloseWithConcurrentRead(t *testing.T) {
+	for i := 0; i < 200; i++ {
+		f := newFakeTransport()
+		pushJSON(f, `{"method":"notice"}`)
+		c := New(f, Options{})
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		err := c.Close(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("iteration %d Close left pump alive with concurrent read: %v", i, err)
+		}
+	}
+}
+
+func TestGatePublicCallRequiresInitialize(t *testing.T) {
+	f := newFakeTransport()
+	c := New(f, Options{})
+	defer closeReview(c)
+	_, err := c.Call(context.Background(), RPCRequest{ID: "before", Method: "turn/start"})
+	var callErr *CallError
+	if !errors.As(err, &callErr) || callErr.Evidence.Phase != WriteProvenBeforeWrite {
+		t.Fatalf("preinit gate = %v", err)
+	}
+	select {
+	case payload := <-f.writes:
+		t.Fatalf("preinit wrote %s", payload)
+	default:
+	}
+}
