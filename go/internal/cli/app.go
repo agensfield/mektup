@@ -102,10 +102,12 @@ type OutputEvent struct {
 // with no event, human text, or receipt is not a success: it is treated as an
 // internal executor contract violation.
 type ExecutionResult struct {
-	Events  []OutputEvent
-	Human   string
-	Receipt any
-	Exit    ExitCode
+	Events    []OutputEvent
+	Human     string
+	Receipt   any
+	Exit      ExitCode
+	Streaming bool
+	RawJSON   []byte
 }
 
 // Executor is the seam for the transport/journal implementation. It must
@@ -113,6 +115,14 @@ type ExecutionResult struct {
 // succeeds. The CLI never turns a nil/empty result into an optimistic success.
 type Executor interface {
 	Execute(context.Context, Invocation) (ExecutionResult, error)
+}
+
+// StreamingExecutor is the optional lifecycle seam for operations that must
+// expose an accepted milestone before their terminal wait completes. Each
+// callback result is rendered immediately; Streaming keeps nonterminal chunks
+// from being upgraded into terminal JSONL events.
+type StreamingExecutor interface {
+	ExecuteStream(context.Context, Invocation, func(ExecutionResult) error) error
 }
 
 type defaultExecutor struct{}
@@ -380,6 +390,17 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 	if err := validateInvocation(a, parsed); err != nil {
 		return a.finish(presentation, parsed, err)
 	}
+	if streaming, ok := a.Executor.(StreamingExecutor); ok {
+		status := int(ExitSuccess)
+		streamErr := streaming.ExecuteStream(ctx, parsed, func(result ExecutionResult) error {
+			status = a.writeExecutionResult(presentation, parsed, result)
+			return nil
+		})
+		if streamErr != nil {
+			return a.finish(presentation, parsed, normalizeError(streamErr))
+		}
+		return status
+	}
 	result, err := a.Executor.Execute(ctx, parsed)
 	if err == nil {
 		return a.writeExecutionResult(presentation, parsed, result)
@@ -487,6 +508,12 @@ func (a *App) writeExecutionResult(p Presentation, inv Invocation, result Execut
 		result.Exit = ExitSuccess
 	}
 	if p == PresentationJSON {
+		if len(result.RawJSON) > 0 {
+			if _, err := a.Out.Write(append(append([]byte(nil), result.RawJSON...), '\n')); err != nil {
+				return int(ExitInternal)
+			}
+			return int(result.Exit)
+		}
 		events, err := a.lifecycleEvents(inv, result)
 		if err != nil {
 			return a.internalFailure(err.Error())
@@ -621,13 +648,17 @@ func (a *App) lifecycleEvents(inv Invocation, result ExecutionResult) ([]map[str
 	if result.Receipt != nil {
 		data := last["data"].(map[string]any)
 		data["receipt"] = result.Receipt
-		last["terminal"] = true
-		if syntheticTerminal {
+		if !result.Streaming {
+			last["terminal"] = true
+		}
+		if syntheticTerminal && !result.Streaming {
 			last["event"] = "operation.completed"
 		}
 	}
-	if terminal, _ := last["terminal"].(bool); !terminal {
-		last["terminal"] = true
+	if !result.Streaming {
+		if terminal, _ := last["terminal"].(bool); !terminal {
+			last["terminal"] = true
+		}
 	}
 	return events, nil
 }
@@ -756,9 +787,9 @@ func exitForError(code string) ExitCode {
 	switch code {
 	case "invalid_arguments", "invalid_target", "reply_route_required", "invalid_raw_wait", "invalid_raw_reply_request", "effect_acknowledgment_required":
 		return ExitUsage
-	case "target_ambiguous", "message_not_found", "message_identity_conflict", "message_not_addressed_to_thread", "delivery_rejected", "delivery_temporarily_unavailable", "resolver_unavailable", "route_unavailable", "reply_route_unavailable", "endpoint_unavailable", "unsupported_server_version", "input_too_large", "reply_not_requested", "content_unavailable", "experimental_method_unavailable":
+	case "target_ambiguous", "message_not_found", "message_identity_conflict", "message_not_addressed_to_thread", "delivery_rejected", "delivery_temporarily_unavailable", "resolver_unavailable", "route_unavailable", "reply_route_unavailable", "endpoint_unavailable", "unsupported_server_version", "input_too_large", "reply_not_requested", "content_unavailable", "output_too_large", "experimental_method_unavailable":
 		return ExitRejected
-	case "outcome_unknown", "reply_outcome_unknown":
+	case "outcome_unknown", "reply_outcome_unknown", "storage_busy":
 		return ExitUnknown
 	case "wait_incomplete", "wait_interrupted":
 		return ExitIncomplete

@@ -72,6 +72,7 @@ func (r *recordingInput) ReadStdin(_ context.Context, limit int64) ([]byte, erro
 
 type fakeReceipts struct {
 	resolveCalls int
+	lastResolve  receipts.ResolveRequest
 	receipt      mektup.Receipt
 }
 
@@ -89,6 +90,7 @@ func (f *fakeReceipts) Reconcile(context.Context, string, receipts.HistoryPort) 
 }
 func (f *fakeReceipts) Resolve(_ context.Context, req receipts.ResolveRequest) (mektup.Receipt, error) {
 	f.resolveCalls++
+	f.lastResolve = req
 	if req.Gate == nil {
 		return mektup.Receipt{}, receipts.ErrHumanGateRequired
 	}
@@ -159,6 +161,20 @@ func TestSendJSONLStreamsAcceptedThenReplyWithOneOperationID(t *testing.T) {
 	}
 }
 
+func TestJoinedReplyClaimDoesNotAdvertiseAcceptance(t *testing.T) {
+	receipt := testReceipt(mektup.StateReplyDispatchClaimed)
+	svc := &fakeService{reply: service.ReplyResult{Receipt: receipt}, replyErr: &service.Error{Code: mektup.ErrWaitIncomplete, Message: "already in flight"}}
+	exec := New(Ports{Service: func(context.Context, cli.Invocation) (MessagingService, error) { return svc, nil }, Original: func(context.Context, cli.Invocation) (service.OriginalResolver, error) { return fakeOriginal{}, nil }})
+	var out, errOut bytes.Buffer
+	app := &cli.App{Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, Executor: exec}
+	if code := app.Run([]string{"reply", receipt.Message.MessageID, "hello"}); code != int(cli.ExitIncomplete) {
+		t.Fatalf("exit=%d stderr=%q", code, errOut.String())
+	}
+	if strings.Contains(out.String(), `"event":"reply.accepted"`) || strings.Contains(out.String(), `"ok":true`) {
+		t.Fatalf("joined claim advertised acceptance: %s", out.String())
+	}
+}
+
 func TestAcceptedReceiptIsPreservedWhenPostAcceptanceErrorReturns(t *testing.T) {
 	accepted := testReceipt(mektup.StateAccepted)
 	svc := &fakeService{send: service.SendResult{Receipt: accepted}, sendErr: &service.Error{Code: mektup.ErrInternal, Message: "receipt projection failed"}}
@@ -201,6 +217,45 @@ func TestReceiptResolveAlwaysUsesInjectedAssertionGate(t *testing.T) {
 	if err != nil || len(result.Events) != 1 || store.resolveCalls != 1 {
 		t.Fatalf("resolve = %#v err=%v calls=%d", result, err, store.resolveCalls)
 	}
+	if store.lastResolve.Presentation != "agent" {
+		t.Fatalf("machine presentation=%q, want agent", store.lastResolve.Presentation)
+	}
+}
+
+func TestPortableReceiptOutputIsDirectlyImportable(t *testing.T) {
+	store := &fakeReceipts{receipt: testReceipt(mektup.StateAccepted)}
+	exec := New(Ports{Receipts: store})
+	var out, errOut bytes.Buffer
+	app := &cli.App{Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, Executor: exec}
+	if code := app.Run([]string{"receipt", "show", store.receipt.ReceiptID, "--portable"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("exit=%d stderr=%q", code, errOut.String())
+	}
+	if _, err := receipts.Import(out.Bytes()); err != nil {
+		t.Fatalf("portable stdout is not importable: %v output=%q", err, out.String())
+	}
+}
+
+func TestHumanReceiptListAndContentHaveOutput(t *testing.T) {
+	store := &fakeReceipts{receipt: testReceipt(mektup.StateAccepted)}
+	exec := New(Ports{Receipts: store, History: func(context.Context, cli.Invocation, mektup.Receipt) (receipts.HistoryPort, error) {
+		return emptyHistory{}, nil
+	}})
+	var listOut, listErr bytes.Buffer
+	listApp := &cli.App{Out: &listOut, Err: &listErr, Executor: exec}
+	if code := listApp.Run([]string{"receipt", "list", "--human"}); code != int(cli.ExitSuccess) || !strings.Contains(listOut.String(), store.receipt.ReceiptID) {
+		t.Fatalf("human list exit=%d stderr=%q output=%q", code, listErr.String(), listOut.String())
+	}
+	var contentOut, contentErr bytes.Buffer
+	contentApp := &cli.App{Out: &contentOut, Err: &contentErr, Executor: exec}
+	if code := contentApp.Run([]string{"receipt", "show", store.receipt.ReceiptID, "--content", "--human"}); code != int(cli.ExitSuccess) || !strings.Contains(contentOut.String(), "content bytes=") {
+		t.Fatalf("human content exit=%d stderr=%q output=%q", code, contentErr.String(), contentOut.String())
+	}
+}
+
+type emptyHistory struct{}
+
+func (emptyHistory) FullHistory(context.Context, string, string) ([]receipts.HistoryItem, error) {
+	return nil, nil
 }
 
 func TestRawWaitIsRejectedByDomainMapping(t *testing.T) {
@@ -284,7 +339,7 @@ func TestWaitJSONLTerminalClasses(t *testing.T) {
 		{"success", mektup.StateReplyAccepted, "success", false, nil, "reply.accepted", cli.ExitSuccess, true},
 		{"error", mektup.StateReplyAccepted, "error", false, &service.Error{Code: mektup.ErrDeliveryRejected, Message: "error reply", Cause: errors.New("reply")}, "reply.accepted", cli.ExitRejected, false},
 		{"timeout", mektup.StateAccepted, "", true, &service.Error{Code: mektup.ErrWaitIncomplete, Message: "timeout", Cause: errors.New("timeout")}, "wait.incomplete", cli.ExitIncomplete, false},
-		{"unknown", mektup.StateReplyOutcomeUnknown, "", false, &service.Error{Code: mektup.ErrReplyOutcomeUnknown, Message: "unknown", Cause: errors.New("unknown")}, "reply.unknown", cli.ExitUnknown, false},
+		{"unknown", mektup.StateReplyOutcomeUnknown, "", true, &service.Error{Code: mektup.ErrReplyOutcomeUnknown, Message: "unknown", Cause: errors.New("unknown")}, "reply.unknown", cli.ExitUnknown, false},
 		{"cancel", mektup.StateAccepted, "", true, context.Canceled, "wait.incomplete", cli.ExitIncomplete, false},
 	}
 	for _, tc := range cases {

@@ -15,6 +15,54 @@ func (f executorFunc) Execute(ctx context.Context, inv Invocation) (ExecutionRes
 	return f(ctx, inv)
 }
 
+type streamingExecutor struct {
+	operationID string
+}
+
+func (s streamingExecutor) Execute(context.Context, Invocation) (ExecutionResult, error) {
+	return ExecutionResult{}, errors.New("streaming executor must use ExecuteStream")
+}
+
+func (s streamingExecutor) ExecuteStream(_ context.Context, _ Invocation, emit func(ExecutionResult) error) error {
+	receipt := map[string]any{"receiptId": "rcpt_03999999-9999-7999-8999-999999999999", "operationId": s.operationID, "state": "accepted"}
+	if err := emit(ExecutionResult{Streaming: true, Events: []OutputEvent{{Machine: map[string]any{
+		"schema": EventSchema, "event": "send.accepted", "operationId": s.operationID, "terminal": false, "ok": true, "data": map[string]any{"receipt": receipt},
+	}}}}); err != nil {
+		return err
+	}
+	return emit(ExecutionResult{Streaming: true, Events: []OutputEvent{{Machine: map[string]any{
+		"schema": EventSchema, "event": "reply.accepted", "operationId": s.operationID, "terminal": true, "ok": true, "data": map[string]any{"receipt": receipt},
+	}}}})
+}
+
+func TestStreamingExecutorEmitsAcceptanceBeforeWaitTerminal(t *testing.T) {
+	var out, errOut bytes.Buffer
+	app := &App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, Executor: streamingExecutor{operationID: "op_04999999-9999-7999-8999-999999999999"}}
+	if code := app.Run([]string{"send", "target", "hello", "--wait"}); code != int(ExitSuccess) {
+		t.Fatalf("exit=%d stderr=%q", code, errOut.String())
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("JSONL lines=%d output=%q", len(lines), out.String())
+	}
+	var first, second map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
+		t.Fatal(err)
+	}
+	if first["event"] != "send.accepted" || first["terminal"] != false {
+		t.Fatalf("acceptance was not a nonterminal first event: %#v", first)
+	}
+	if second["event"] != "reply.accepted" || second["terminal"] != true {
+		t.Fatalf("terminal wait event missing: %#v", second)
+	}
+	if first["operationId"] != second["operationId"] {
+		t.Fatalf("operation IDs diverged: %v vs %v", first["operationId"], second["operationId"])
+	}
+}
+
 func runTest(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
 	var out, err bytes.Buffer

@@ -5,6 +5,7 @@ package messageexecutor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	mektup "github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/internal/cli"
+	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/receipts"
 	"github.com/agensfield/mektup/go/internal/service"
 )
@@ -162,6 +164,9 @@ func (e *Executor) reply(ctx context.Context, inv cli.Invocation) (cli.Execution
 	}
 	var original service.OriginalResolver
 	if inv.Option("receipt-file") != "" {
+		if e.ports.ImportResolver == nil {
+			return cli.ExecutionResult{}, cliErr("route_unavailable", "receipt-file requires an injected untrusted receipt resolver", "not_sent", cli.ExitRejected)
+		}
 		imported, importErr := e.importReceipt(ctx, inv)
 		if importErr != nil {
 			return cli.ExecutionResult{}, importErr
@@ -214,10 +219,10 @@ func (e *Executor) wait(ctx context.Context, inv cli.Invocation) (cli.ExecutionR
 		return cli.ExecutionResult{}, cliErr("internal_error", "wait returned no receipt", "unknown", cli.ExitInternal)
 	}
 	eventName := "reply.accepted"
-	if result.Incomplete {
-		eventName = "wait.incomplete"
-	} else if result.State == mektup.StateReplyOutcomeUnknown {
+	if result.State == mektup.StateReplyOutcomeUnknown {
 		eventName = "reply.unknown"
+	} else if result.Incomplete {
+		eventName = "wait.incomplete"
 	}
 	ok := result.State == mektup.StateReplyAccepted || result.State == mektup.StateReplyObserved
 	if result.ReplyStatus == string(mektup.ReplyError) {
@@ -225,6 +230,7 @@ func (e *Executor) wait(ctx context.Context, inv cli.Invocation) (cli.ExecutionR
 	}
 	event := lifecycle(eventName, result.Receipt, true, ok)
 	if callErr != nil {
+		attachError(event, callErr)
 		return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: event}}, Receipt: result.Receipt, Exit: waitExit(&result, callErr)}, nil
 	}
 	return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: event}}, Receipt: result.Receipt}, nil
@@ -245,7 +251,16 @@ func (e *Executor) inspect(ctx context.Context, inv cli.Invocation) (cli.Executi
 	if err != nil {
 		return cli.ExecutionResult{}, mapError(err)
 	}
-	return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: map[string]any{"schema": cli.EventSchema, "event": "inspect.completed", "terminal": true, "ok": true, "data": map[string]any{"target": result.Target, "receipts": result.Receipts, "blockers": result.Blockers}}}}}, nil
+	return cli.ExecutionResult{Events: []cli.OutputEvent{{
+		Machine: map[string]any{
+			"schema":   cli.EventSchema,
+			"event":    "inspect.completed",
+			"terminal": true,
+			"ok":       true,
+			"data":     map[string]any{"target": result.Target, "receipts": result.Receipts, "blockers": result.Blockers},
+		},
+		Human: humanInspect(result),
+	}}}, nil
 }
 
 func (e *Executor) receipt(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
@@ -263,7 +278,16 @@ func (e *Executor) receipt(ctx context.Context, inv cli.Invocation) (cli.Executi
 		if err != nil {
 			return cli.ExecutionResult{}, mapError(err)
 		}
-		return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: map[string]any{"schema": cli.EventSchema, "event": "receipt.list", "terminal": true, "ok": true, "data": map[string]any{"receipts": items}}}}}, nil
+		return cli.ExecutionResult{Events: []cli.OutputEvent{{
+			Machine: map[string]any{
+				"schema":   cli.EventSchema,
+				"event":    "receipt.list",
+				"terminal": true,
+				"ok":       true,
+				"data":     map[string]any{"receipts": items},
+			},
+			Human: humanReceiptList(items),
+		}}}, nil
 	case "show":
 		if len(inv.Position) != 2 {
 			return cli.ExecutionResult{}, cliErr("invalid_arguments", "receipt show reference is required", "not_sent", cli.ExitUsage)
@@ -273,6 +297,13 @@ func (e *Executor) receipt(ctx context.Context, inv cli.Invocation) (cli.Executi
 			return cli.ExecutionResult{}, mapError(err)
 		}
 		if !has(inv, "content") {
+			if has(inv, "portable") {
+				encoded, marshalErr := json.Marshal(receipt)
+				if marshalErr != nil {
+					return cli.ExecutionResult{}, mapError(marshalErr)
+				}
+				return cli.ExecutionResult{RawJSON: encoded, Human: humanReceipt(receipt)}, nil
+			}
 			return receiptResult("receipt.show", receipt)
 		}
 		if e.ports.History == nil {
@@ -299,7 +330,10 @@ func (e *Executor) receipt(ctx context.Context, inv cli.Invocation) (cli.Executi
 		} else {
 			data["body"] = string(content.Body)
 		}
-		return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: map[string]any{"schema": cli.EventSchema, "event": "receipt.content", "terminal": true, "ok": true, "data": data}}}}, nil
+		return cli.ExecutionResult{Events: []cli.OutputEvent{{
+			Machine: map[string]any{"schema": cli.EventSchema, "event": "receipt.content", "terminal": true, "ok": true, "data": data},
+			Human:   humanContent(content),
+		}}}, nil
 	case "reconcile":
 		if len(inv.Position) != 2 || e.ports.History == nil {
 			return cli.ExecutionResult{}, cliErr("content_unavailable", "receipt reconcile requires exact history", "not_sent", cli.ExitRejected)
@@ -330,9 +364,9 @@ func (e *Executor) receipt(ctx context.Context, inv cli.Invocation) (cli.Executi
 		if actor == "" {
 			actor = "cli"
 		}
-		presentation := string(inv.Resolved.Output)
-		if presentation == "" {
-			presentation = "agent"
+		presentation := "agent"
+		if inv.Resolved.Output == cli.PresentationHuman {
+			presentation = "human"
 		}
 		updated, err := e.ports.Receipts.Resolve(ctx, receipts.ResolveRequest{Reference: inv.Position[1], Assertion: assertion, Actor: actor, Reason: inv.Option("reason"), EvidenceRef: inv.Option("evidence"), Presentation: presentation, Intent: "receipt.resolve", Gate: gate})
 		if err != nil {
@@ -406,26 +440,55 @@ func (e *Executor) messagingResult(kind string, accepted mektup.Receipt, wait *s
 		}
 		return cli.ExecutionResult{}, cliErr("internal_error", "messaging service returned no receipt", "unknown", cli.ExitInternal)
 	}
-	events := []cli.OutputEvent{{Machine: lifecycle(kind+".accepted", accepted, wait == nil, true)}}
+	acceptedEvidence := accepted.State == mektup.StateAccepted || accepted.State == mektup.StateReplyAccepted || accepted.State == mektup.StateReplyObserved
+	if wait == nil && !acceptedEvidence {
+		name := kind + ".incomplete"
+		ok := false
+		if accepted.State == mektup.StateReplyOutcomeUnknown {
+			name = kind + ".unknown"
+		}
+		event := lifecycle(name, accepted, true, ok)
+		if callErr != nil {
+			attachError(event, callErr)
+		}
+		return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: event}}, Receipt: accepted, Exit: errorExit(callErr)}, nil
+	}
+	events := []cli.OutputEvent{{Machine: lifecycle(kind+".accepted", accepted, wait == nil, acceptedEvidence)}}
 	final := accepted
 	exit := cli.ExitSuccess
 	if wait != nil {
 		final = wait.Receipt
 		name := "reply.accepted"
-		if wait.Incomplete {
-			name = "wait.incomplete"
-		}
 		if wait.State == mektup.StateReplyOutcomeUnknown {
 			name = "reply.unknown"
+		} else if wait.Incomplete {
+			name = "wait.incomplete"
 		}
 		ok := !wait.Incomplete && wait.State != mektup.StateReplyOutcomeUnknown && wait.ReplyStatus != string(mektup.ReplyError)
-		events = append(events, cli.OutputEvent{Machine: lifecycle(name, final, true, ok)})
+		terminal := lifecycle(name, final, true, ok)
+		if callErr != nil {
+			attachError(terminal, callErr)
+		}
+		events = append(events, cli.OutputEvent{Machine: terminal})
 		exit = waitExit(wait, callErr)
 	}
 	if callErr != nil && wait == nil {
+		attachError(events[0].Machine.(map[string]any), callErr)
 		return cli.ExecutionResult{Events: events, Receipt: final, Exit: errorExit(callErr)}, nil
 	}
 	return cli.ExecutionResult{Events: events, Receipt: final, Exit: exit}, nil
+}
+
+func attachError(event map[string]any, err error) {
+	data, _ := event["data"].(map[string]any)
+	if data == nil {
+		data = map[string]any{}
+		event["data"] = data
+	}
+	mapped := mapError(err)
+	if ce, ok := mapped.(*cli.Error); ok {
+		data["error"] = map[string]any{"code": ce.Code, "message": ce.Message, "effectState": ce.Effect, "details": ce.Details}
+	}
 }
 
 func lifecycle(name string, receipt mektup.Receipt, terminal, ok bool) map[string]any {
@@ -434,12 +497,38 @@ func lifecycle(name string, receipt mektup.Receipt, terminal, ok bool) map[strin
 func receiptResult(name string, receipt mektup.Receipt) (cli.ExecutionResult, error) {
 	return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: lifecycle(name, receipt, true, true)}}, Receipt: receipt}, nil
 }
-func waitExit(wait *service.WaitResult, err error) cli.ExitCode {
-	if wait.Incomplete {
-		return cli.ExitIncomplete
+
+func humanReceipt(receipt mektup.Receipt) string {
+	return fmt.Sprintf("receipt %s state=%s operation=%s", receipt.ReceiptID, receipt.State, receipt.OperationID)
+}
+func humanReceiptList(items []mektup.Receipt) string {
+	lines := make([]string, 0, len(items))
+	for _, item := range items {
+		lines = append(lines, humanReceipt(item))
 	}
+	if len(lines) == 0 {
+		return "no receipts"
+	}
+	return strings.Join(lines, "\n")
+}
+func humanInspect(result receipts.InspectResult) string {
+	return fmt.Sprintf("target %s thread=%s endpoint=%s receipts=%d blockers=%d", result.Target.Requested, result.Target.ThreadID, result.Target.EndpointID, len(result.Receipts), len(result.Blockers))
+}
+func humanContent(content receipts.ContentResult) string {
+	if content.Spill != nil {
+		return fmt.Sprintf("content spilled %s bytes=%d digest=%s", content.Spill.Path, content.Spill.Bytes, content.Spill.Digest)
+	}
+	if len(content.Body) == 0 {
+		return fmt.Sprintf("content bytes=%d digest=%s", content.Bytes, content.Digest)
+	}
+	return string(content.Body)
+}
+func waitExit(wait *service.WaitResult, err error) cli.ExitCode {
 	if wait.State == mektup.StateReplyOutcomeUnknown {
 		return cli.ExitUnknown
+	}
+	if wait.Incomplete {
+		return cli.ExitIncomplete
 	}
 	if wait.ReplyStatus == string(mektup.ReplyError) {
 		return cli.ExitRejected
@@ -479,15 +568,58 @@ func mapError(err error) error {
 	if errors.As(err, &se) {
 		return &cli.Error{Code: string(se.Code), Message: se.Message, Effect: serviceEffect(se.Code), Exit: serviceExit(se.Code), Details: se.Details}
 	}
+	if errors.Is(err, receipts.ErrNotFound) || errors.Is(err, journal.ErrNotFound) {
+		return cliErr("message_not_found", "receipt was not found", "rejected", cli.ExitRejected)
+	}
+	if errors.Is(err, receipts.ErrAmbiguous) || errors.Is(err, journal.ErrReceiptConflict) {
+		return cliErr("target_ambiguous", "receipt reference is ambiguous", "rejected", cli.ExitRejected)
+	}
+	if errors.Is(err, receipts.ErrUntrusted) {
+		return cliErr("invalid_arguments", "portable receipt is untrusted input", "not_sent", cli.ExitUsage)
+	}
+	if errors.Is(err, receipts.ErrIdentityMismatch) || errors.Is(err, receipts.ErrDigestMismatch) || errors.Is(err, journal.ErrIdentityConflict) {
+		return cliErr("message_identity_conflict", "receipt evidence does not match the pinned message identity", "rejected", cli.ExitRejected)
+	}
+	if errors.Is(err, receipts.ErrContentUnavailable) {
+		return cliErr("content_unavailable", "receipt content is unavailable", "rejected", cli.ExitRejected)
+	}
+	if errors.Is(err, receipts.ErrOutputTooLarge) {
+		return cliErr("output_too_large", "receipt content exceeds the inline output bound", "rejected", cli.ExitRejected)
+	}
+	if errors.Is(err, receipts.ErrReconcileIncomplete) {
+		return cliErr("wait_incomplete", "receipt reconciliation is incomplete", "unknown", cli.ExitIncomplete)
+	}
+	if errors.Is(err, receipts.ErrRouteUnavailable) {
+		return cliErr("route_unavailable", "receipt route is unavailable", "rejected", cli.ExitRejected)
+	}
+	if errors.Is(err, receipts.ErrHumanGateRequired) {
+		return cliErr("effect_acknowledgment_required", "an explicit assertion gate is required", "not_sent", cli.ExitUsage)
+	}
+	if errors.Is(err, receipts.ErrPortableContent) || errors.Is(err, receipts.ErrInvalidArguments) || errors.Is(err, receipts.ErrLimit) {
+		return cliErr("invalid_arguments", "invalid receipt request", "not_sent", cli.ExitUsage)
+	}
+	if errors.Is(err, journal.ErrStorageBusy) {
+		return cliErr("storage_busy", "receipt storage is busy", "unknown", cli.ExitUnknown)
+	}
+	if errors.Is(err, journal.ErrAlreadyWon) || errors.Is(err, journal.ErrClaimExpired) || errors.Is(err, journal.ErrClaimNotOwned) {
+		return cliErr("reply_outcome_unknown", "reply custody outcome is unknown", "unknown", cli.ExitUnknown)
+	}
+	if errors.Is(err, journal.ErrStorageCorrupt) || errors.Is(err, journal.ErrCorrupt) {
+		return cliErr("storage_corrupt", "receipt storage is corrupt", "unknown", cli.ExitInternal)
+	}
 	return &cli.Error{Code: "internal_error", Message: err.Error(), Effect: "unknown", Exit: cli.ExitInternal}
 }
 
 func serviceEffect(code mektup.ErrorCode) string {
 	switch code {
-	case mektup.ErrInvalidArguments, mektup.ErrInvalidTarget, mektup.ErrInputTooLarge, mektup.ErrReplyRouteRequired, mektup.ErrInvalidRawWait, mektup.ErrInvalidRawReplyRequest:
+	case mektup.ErrInvalidArguments, mektup.ErrInvalidTarget, mektup.ErrResolverUnavailable, mektup.ErrTargetAmbiguous, mektup.ErrRouteUnavailable, mektup.ErrEndpointUnavailable, mektup.ErrUnsupportedServerVersion, mektup.ErrInputTooLarge, mektup.ErrReplyRouteRequired, mektup.ErrInvalidRawWait, mektup.ErrInvalidRawReplyRequest, mektup.ErrEffectAcknowledgmentRequired:
 		return "not_sent"
-	case mektup.ErrDeliveryRejected, mektup.ErrReplyRouteUnavailable, mektup.ErrReplyNotRequested, mektup.ErrMessageNotFound, mektup.ErrMessageNotAddressedThread:
+	case mektup.ErrDeliveryRejected, mektup.ErrReplyRouteUnavailable, mektup.ErrReplyNotRequested, mektup.ErrMessageNotFound, mektup.ErrMessageIdentityConflict, mektup.ErrMessageNotAddressedThread, mektup.ErrContentUnavailable:
 		return "rejected"
+	case mektup.ErrDeliveryTemporarilyUnavailable, mektup.ErrOutcomeUnknown, mektup.ErrReplyOutcomeUnknown, mektup.ErrStorageBusy:
+		return "unknown"
+	case mektup.ErrWaitIncomplete, mektup.ErrWaitInterrupted:
+		return "unknown"
 	default:
 		return "unknown"
 	}
@@ -495,14 +627,16 @@ func serviceEffect(code mektup.ErrorCode) string {
 
 func serviceExit(code mektup.ErrorCode) cli.ExitCode {
 	switch code {
-	case mektup.ErrInvalidArguments, mektup.ErrInvalidTarget, mektup.ErrInputTooLarge, mektup.ErrReplyRouteRequired, mektup.ErrInvalidRawWait, mektup.ErrInvalidRawReplyRequest:
+	case mektup.ErrInvalidArguments, mektup.ErrInvalidTarget, mektup.ErrResolverUnavailable, mektup.ErrTargetAmbiguous, mektup.ErrRouteUnavailable, mektup.ErrEndpointUnavailable, mektup.ErrUnsupportedServerVersion, mektup.ErrInputTooLarge, mektup.ErrReplyRouteRequired, mektup.ErrInvalidRawWait, mektup.ErrInvalidRawReplyRequest, mektup.ErrEffectAcknowledgmentRequired:
 		return cli.ExitUsage
-	case mektup.ErrDeliveryRejected, mektup.ErrReplyRouteUnavailable, mektup.ErrReplyNotRequested, mektup.ErrMessageNotFound, mektup.ErrMessageNotAddressedThread:
+	case mektup.ErrDeliveryRejected, mektup.ErrReplyRouteUnavailable, mektup.ErrReplyNotRequested, mektup.ErrMessageNotFound, mektup.ErrMessageIdentityConflict, mektup.ErrMessageNotAddressedThread, mektup.ErrContentUnavailable:
 		return cli.ExitRejected
+	case mektup.ErrDeliveryTemporarilyUnavailable, mektup.ErrOutcomeUnknown, mektup.ErrReplyOutcomeUnknown, mektup.ErrStorageBusy:
+		return cli.ExitUnknown
 	case mektup.ErrWaitIncomplete:
 		return cli.ExitIncomplete
-	case mektup.ErrOutcomeUnknown, mektup.ErrReplyOutcomeUnknown:
-		return cli.ExitUnknown
+	case mektup.ErrWaitInterrupted:
+		return cli.ExitIncomplete
 	default:
 		return cli.ExitInternal
 	}
