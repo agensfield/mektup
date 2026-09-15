@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -117,8 +118,9 @@ type Request = RPCRequest
 
 // RPCNotification is a raw JSON-RPC notification.
 type RPCNotification struct {
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params,omitempty"`
+	Method     string          `json:"method"`
+	Params     json.RawMessage `json:"params,omitempty"`
+	Generation uint64          `json:"-"`
 }
 
 type Notification = RPCNotification
@@ -127,6 +129,7 @@ type Notification = RPCNotification
 type RPCResult struct {
 	ID         RequestID
 	Value      json.RawMessage
+	Evidence   WriteEvidence
 	Generation uint64
 }
 
@@ -308,9 +311,10 @@ type callOutcome struct {
 }
 
 type cancelOutcome struct {
-	phase WritePhase
-	ok    bool
-	err   error
+	phase     WritePhase
+	ok        bool
+	completed bool
+	err       error
 }
 
 type pendingCall struct {
@@ -326,17 +330,28 @@ type Client struct {
 	options    Options
 	generation uint64
 
-	commands chan command
-	reads    chan readResult
-	events   chan Event
-	done     chan struct{}
-	closed   chan struct{}
+	commands     chan command
+	commandSpace chan struct{}
+	reads        chan readResult
+	events       chan Event
+	done         chan struct{}
+	closed       chan struct{}
 
-	mu        sync.Mutex
-	reserved  map[string]struct{}
-	withdrawn map[string]struct{}
-	closeOne  sync.Once
-	info      atomic.Pointer[ServerInfo]
+	mu            sync.Mutex
+	reserved      map[string]struct{}
+	withdrawn     map[string]struct{}
+	queued        map[string]struct{}
+	completed     map[string]WriteEvidence
+	retired       map[string]struct{}
+	closeOne      sync.Once
+	info          atomic.Pointer[ServerInfo]
+	initMu        sync.Mutex
+	admitMu       sync.Mutex
+	accepting     bool
+	activeMu      sync.Mutex
+	activeKey     string
+	activeRequest bool
+	activeCancel  context.CancelFunc
 }
 
 type readResult struct {
@@ -349,17 +364,22 @@ type readResult struct {
 func New(transport Transport, options Options) *Client {
 	options = options.normalized()
 	c := &Client{
-		transport:  transport,
-		options:    options,
-		generation: 1,
-		commands:   make(chan command, options.WriterCapacity),
-		reads:      make(chan readResult, maxInt(options.EventCapacity, defaultQueueCapacity)),
+		transport:    transport,
+		options:      options,
+		generation:   nextGeneration.Add(1),
+		commands:     make(chan command, options.WriterCapacity),
+		commandSpace: make(chan struct{}, 1),
+		reads:        make(chan readResult, maxInt(options.EventCapacity, defaultQueueCapacity)),
 		// Reserve two slots for terminal gap/disconnect evidence.
 		events:    make(chan Event, options.EventCapacity+2),
 		done:      make(chan struct{}),
 		closed:    make(chan struct{}),
 		reserved:  make(map[string]struct{}),
 		withdrawn: make(map[string]struct{}),
+		queued:    make(map[string]struct{}),
+		completed: make(map[string]WriteEvidence),
+		retired:   make(map[string]struct{}),
+		accepting: true,
 	}
 	go c.readLoop()
 	go c.pump()
@@ -371,6 +391,120 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+var errClientClosed = io.ErrClosedPipe
+var nextGeneration atomic.Uint64
+
+func (c *Client) enqueue(ctx context.Context, cmd command) error {
+	for {
+		c.admitMu.Lock()
+		if !c.accepting {
+			c.admitMu.Unlock()
+			return errClientClosed
+		}
+		select {
+		case c.commands <- cmd:
+			c.admitMu.Unlock()
+			if cmd.kind == commandRequest {
+				c.mu.Lock()
+				c.queued[cmd.key] = struct{}{}
+				c.mu.Unlock()
+			}
+			return nil
+		default:
+			c.admitMu.Unlock()
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-c.closed:
+			return errClientClosed
+		case <-c.commandSpace:
+		}
+	}
+}
+
+func (c *Client) signalCommandSpace() {
+	select {
+	case c.commandSpace <- struct{}{}:
+	default:
+	}
+}
+
+func (c *Client) stopAdmission() {
+	c.admitMu.Lock()
+	c.accepting = false
+	c.admitMu.Unlock()
+}
+
+func (c *Client) beginWrite(key string, request bool) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	c.activeMu.Lock()
+	c.activeKey = key
+	c.activeRequest = request
+	c.activeCancel = cancel
+	c.activeMu.Unlock()
+	return ctx, cancel
+}
+
+func (c *Client) endWrite(key string, cancel context.CancelFunc) {
+	c.activeMu.Lock()
+	if c.activeKey == key {
+		c.activeKey = ""
+		c.activeRequest = false
+		c.activeCancel = nil
+	}
+	c.activeMu.Unlock()
+	cancel()
+}
+
+func (c *Client) cancelActiveWrite(key string) {
+	c.activeMu.Lock()
+	active := c.activeRequest && c.activeKey == key && c.activeCancel != nil
+	cancel := c.activeCancel
+	c.activeMu.Unlock()
+	if active {
+		cancel()
+		// A conforming transport must honor the context, but closing here also
+		// bounds transports that only unblock their writer from Close.
+		_ = c.transport.Close()
+	}
+}
+
+func (c *Client) cancelAnyActiveWrite() {
+	c.activeMu.Lock()
+	cancel := c.activeCancel
+	c.activeMu.Unlock()
+	if cancel != nil {
+		cancel()
+		_ = c.transport.Close()
+	}
+}
+
+func (c *Client) recordCompleted(key string, evidence WriteEvidence) {
+	c.mu.Lock()
+	c.completed[key] = evidence
+	c.mu.Unlock()
+}
+
+func (c *Client) completedEvidence(key string) (WriteEvidence, bool) {
+	c.mu.Lock()
+	evidence, ok := c.completed[key]
+	c.mu.Unlock()
+	return evidence, ok
+}
+
+func (c *Client) forgetCompleted(key string) {
+	c.mu.Lock()
+	delete(c.completed, key)
+	c.mu.Unlock()
+}
+
+func (c *Client) retire(key string) {
+	c.mu.Lock()
+	c.retired[key] = struct{}{}
+	c.mu.Unlock()
 }
 
 // NewWithTransport is an explicit spelling useful at injection sites.
@@ -396,6 +530,11 @@ func (c *Client) ServerInfo() *ServerInfo {
 // Initialize performs the Codex initialize/initialized handshake. Events that
 // arrive before the response are delivered on Events in arrival order.
 func (c *Client) Initialize(ctx context.Context) (*ServerInfo, error) {
+	c.initMu.Lock()
+	defer c.initMu.Unlock()
+	if c.info.Load() != nil {
+		return nil, errors.New("app-server client is already initialized")
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -470,33 +609,57 @@ func (c *Client) call(ctx context.Context, request RPCRequest) (*RPCResult, erro
 		c.mu.Unlock()
 		return nil, &CallError{Err: fmt.Errorf("duplicate request id %s", key), Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
 	}
+	if _, exists := c.retired[key]; exists {
+		c.mu.Unlock()
+		return nil, &CallError{Err: fmt.Errorf("request id %s was already completed on this connection", key), Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
+	}
 	c.reserved[key] = struct{}{}
 	c.mu.Unlock()
 	cmd := command{kind: commandRequest, req: request, key: key, result: resultCh}
-	select {
-	case c.commands <- cmd:
-	case <-ctx.Done():
-		cancel := c.withdraw(ctx, key)
-		phase := cancel.phase
-		if phase == WriteNotStarted {
-			phase = WriteProvenBeforeWrite
+	if err := c.enqueue(ctx, cmd); err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			cancel := c.withdraw(ctx, key)
+			phase := cancel.phase
+			if phase == WriteNotStarted {
+				phase = WriteProvenBeforeWrite
+			}
+			if cancel.err != nil {
+				return nil, &CallError{Err: cancel.err, Canceled: true, Evidence: WriteEvidence{Phase: phase, Generation: c.generation}, Generation: c.generation}
+			}
+			return nil, &CallError{Err: ctx.Err(), Canceled: true, Evidence: WriteEvidence{Phase: phase, Generation: c.generation}, Generation: c.generation}
 		}
-		if cancel.err != nil {
-			return nil, &CallError{Err: cancel.err, Canceled: true, Evidence: WriteEvidence{Phase: phase, Generation: c.generation}, Generation: c.generation}
-		}
-		return nil, &CallError{Err: ctx.Err(), Canceled: true, Evidence: WriteEvidence{Phase: phase, Generation: c.generation}, Generation: c.generation}
-	case <-c.closed:
 		c.release(key)
-		return nil, &CallError{Err: io.ErrClosedPipe, Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
+		return nil, &CallError{Err: err, Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
 	}
 	select {
 	case outcome := <-resultCh:
+		c.forgetCompleted(key)
 		if outcome.err != nil {
 			return nil, outcome.err
 		}
 		return outcome.result, nil
 	case <-ctx.Done():
+		// A response may already be buffered at the same instant cancellation
+		// becomes ready. Prefer that completed evidence before withdrawing.
+		select {
+		case outcome := <-resultCh:
+			c.forgetCompleted(key)
+			if outcome.err != nil {
+				return nil, outcome.err
+			}
+			return outcome.result, nil
+		default:
+		}
 		cancel := c.withdraw(ctx, key)
+		select {
+		case outcome := <-resultCh:
+			c.forgetCompleted(key)
+			if outcome.err != nil {
+				return nil, outcome.err
+			}
+			return outcome.result, nil
+		default:
+		}
 		if cancel.err != nil {
 			return nil, &CallError{Err: cancel.err, Canceled: true, Evidence: WriteEvidence{Phase: WriteMayHaveWritten, Generation: c.generation}, Generation: c.generation}
 		}
@@ -505,6 +668,17 @@ func (c *Client) call(ctx context.Context, request RPCRequest) (*RPCResult, erro
 			phase = WriteProvenBeforeWrite
 		}
 		return nil, &CallError{Err: ctx.Err(), Canceled: true, Evidence: WriteEvidence{Phase: phase, Generation: c.generation}, Generation: c.generation}
+	case <-c.closed:
+		select {
+		case outcome := <-resultCh:
+			c.forgetCompleted(key)
+			if outcome.err != nil {
+				return nil, outcome.err
+			}
+			return outcome.result, nil
+		default:
+		}
+		return nil, &CallError{Err: errClientClosed, Evidence: WriteEvidence{Phase: WriteMayHaveWritten, Generation: c.generation}, Generation: c.generation}
 	}
 }
 
@@ -514,20 +688,16 @@ func (c *Client) Notify(ctx context.Context, notification RPCNotification) error
 		ctx = context.Background()
 	}
 	done := make(chan error, 1)
+	if err := c.enqueue(ctx, command{kind: commandNotify, notify: notification, notifyDone: done}); err != nil {
+		return err
+	}
 	select {
-	case c.commands <- command{kind: commandNotify, notify: notification, notifyDone: done}:
-		select {
-		case err := <-done:
-			return err
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-c.closed:
-			return io.ErrClosedPipe
-		}
+	case err := <-done:
+		return err
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-c.closed:
-		return io.ErrClosedPipe
+		return errClientClosed
 	}
 }
 
@@ -535,6 +705,7 @@ func (c *Client) withdraw(ctx context.Context, key string) cancelOutcome {
 	c.mu.Lock()
 	c.withdrawn[key] = struct{}{}
 	c.mu.Unlock()
+	c.cancelActiveWrite(key)
 	ack := make(chan cancelOutcome, 1)
 	select {
 	case c.commands <- command{kind: commandCancel, key: key, ack: ack}:
@@ -563,6 +734,15 @@ func (c *Client) withdraw(ctx context.Context, key string) cancelOutcome {
 func (c *Client) release(key string) {
 	c.mu.Lock()
 	delete(c.reserved, key)
+	delete(c.withdrawn, key)
+	delete(c.queued, key)
+	c.mu.Unlock()
+}
+
+func (c *Client) releaseReservation(key string) {
+	c.mu.Lock()
+	delete(c.reserved, key)
+	delete(c.queued, key)
 	delete(c.withdrawn, key)
 	c.mu.Unlock()
 }
@@ -613,9 +793,9 @@ func (c *Client) pump() {
 	pending := make(map[string]*pendingCall)
 	var dropped uint64
 	var disconnected bool
-	deliver := func(event Event) {
+	deliver := func(event Event) bool {
 		if disconnected {
-			return
+			return false
 		}
 		select {
 		case c.events <- event:
@@ -624,12 +804,14 @@ func (c *Client) pump() {
 				// Keep terminal disconnect evidence by evicting one non-terminal
 				// event where possible. A gap is then emitted on the next read.
 				dropped++
-				return
+				return false
 			}
 			dropped++
+			return false
 		}
+		return true
 	}
-	deliverWithGap := func(event Event) {
+	deliverWithGap := func(event Event) bool {
 		if dropped > 0 {
 			gap := Event{Kind: EventGap, Gap: &Gap{Dropped: dropped, Generation: c.generation, Reason: "bounded event queue overflow"}}
 			select {
@@ -640,16 +822,17 @@ func (c *Client) pump() {
 				// event remains explicit once the queue drains.
 				if event.Kind != EventDisconnected {
 					dropped++
-					return
+					return false
 				}
 			}
 		}
-		deliver(event)
+		return deliver(event)
 	}
 	finish := func(err error) {
 		if disconnected {
 			return
 		}
+		c.stopAdmission()
 		for key, call := range pending {
 			phase := call.phase
 			if phase == WriteNotStarted {
@@ -658,6 +841,9 @@ func (c *Client) pump() {
 				phase = WriteMayHaveWritten
 			}
 			call.result <- callOutcome{err: &CallError{Err: err, Evidence: WriteEvidence{Phase: phase, Generation: c.generation}, Generation: c.generation}}
+			if phase == WriteMayHaveWritten || phase == WriteComplete {
+				c.retire(key)
+			}
 			delete(pending, key)
 			c.release(key)
 		}
@@ -667,6 +853,7 @@ func (c *Client) pump() {
 		for {
 			select {
 			case cmd := <-c.commands:
+				c.signalCommandSpace()
 				switch cmd.kind {
 				case commandRequest:
 					c.release(cmd.key)
@@ -703,8 +890,12 @@ func (c *Client) pump() {
 	for {
 		select {
 		case cmd := <-c.commands:
+			c.signalCommandSpace()
 			switch cmd.kind {
 			case commandRequest:
+				c.mu.Lock()
+				delete(c.queued, cmd.key)
+				c.mu.Unlock()
 				if c.wasWithdrawn(cmd.key) {
 					c.release(cmd.key)
 					continue
@@ -719,7 +910,12 @@ func (c *Client) pump() {
 				payload, err := marshalRequest(cmd.req)
 				writeStarted := err == nil
 				if writeStarted {
-					err = c.transport.Write(context.Background(), payload)
+					// Once ownership enters the transport, a concurrent disconnect
+					// cannot prove that no bytes crossed the boundary.
+					call.phase = WriteMayHaveWritten
+					writeCtx, writeCancel := c.beginWrite(cmd.key, true)
+					err = c.transport.Write(writeCtx, payload)
+					c.endWrite(cmd.key, writeCancel)
 				}
 				if err != nil {
 					phase := WriteProvenBeforeWrite
@@ -741,7 +937,9 @@ func (c *Client) pump() {
 			case commandNotify:
 				payload, err := marshalNotification(cmd.notify)
 				if err == nil {
-					err = c.transport.Write(context.Background(), payload)
+					writeCtx, writeCancel := c.beginWrite("", false)
+					err = c.transport.Write(writeCtx, payload)
+					c.endWrite("", writeCancel)
 				}
 				if cmd.notifyDone != nil {
 					cmd.notifyDone <- err
@@ -759,7 +957,16 @@ func (c *Client) pump() {
 					} else {
 						cmd.ack <- cancelOutcome{phase: WriteMayHaveWritten, ok: false}
 					}
+				} else if evidence, completed := c.completedEvidence(cmd.key); completed {
+					cmd.ack <- cancelOutcome{phase: evidence.Phase, completed: true, ok: false}
+					c.forgetCompleted(cmd.key)
 				} else {
+					c.mu.Lock()
+					_, queued := c.queued[cmd.key]
+					c.mu.Unlock()
+					if !queued {
+						c.releaseReservation(cmd.key)
+					}
 					cmd.ack <- cancelOutcome{phase: WriteProvenBeforeWrite, ok: true}
 				}
 			case commandClose:
@@ -791,16 +998,25 @@ func (c *Client) pump() {
 				}
 				delete(pending, key)
 				c.release(key)
+				evidence := WriteEvidence{Phase: call.phase, Generation: c.generation}
+				c.recordCompleted(key, evidence)
+				c.retire(key)
 				if msg.serverErr != nil {
 					msg.serverErr.Generation = c.generation
 					call.result <- callOutcome{err: &CallError{Server: msg.serverErr, Evidence: WriteEvidence{Phase: call.phase, Generation: c.generation}, Generation: c.generation}}
 				} else {
-					call.result <- callOutcome{result: &RPCResult{ID: msg.id, Value: msg.result, Generation: c.generation}}
+					call.result <- callOutcome{result: &RPCResult{ID: msg.id, Value: msg.result, Evidence: evidence, Generation: c.generation}}
 				}
 			case messageNotification:
-				deliverWithGap(Event{Kind: EventNotification, Notification: &RPCNotification{Method: msg.method, Params: msg.params}})
+				if !deliverWithGap(Event{Kind: EventNotification, Notification: &RPCNotification{Method: msg.method, Params: msg.params, Generation: c.generation}}) {
+					finish(errors.New("bounded app-server event queue overflow"))
+					return
+				}
 			case messageRequest:
-				deliverWithGap(Event{Kind: EventServerRequest, Request: &ServerRequest{ID: msg.id, Method: msg.method, Params: msg.params, Generation: c.generation}})
+				if !deliverWithGap(Event{Kind: EventServerRequest, Request: &ServerRequest{ID: msg.id, Method: msg.method, Params: msg.params, Generation: c.generation}}) {
+					finish(errors.New("bounded app-server event queue overflow"))
+					return
+				}
 			}
 		}
 	}
@@ -857,6 +1073,12 @@ func decodeMessage(payload []byte) (decodedMessage, error) {
 	idRaw, hasID := obj["id"]
 	methodRaw, hasMethod := obj["method"]
 	if hasMethod {
+		if _, hasResult := obj["result"]; hasResult {
+			return decodedMessage{}, errors.New("JSON-RPC request/notification cannot contain result")
+		}
+		if _, hasError := obj["error"]; hasError {
+			return decodedMessage{}, errors.New("JSON-RPC request/notification cannot contain error")
+		}
 		var method string
 		if err := json.Unmarshal(methodRaw, &method); err != nil {
 			return decodedMessage{}, fmt.Errorf("method: %w", err)
@@ -876,6 +1098,11 @@ func decodeMessage(payload []byte) (decodedMessage, error) {
 	}
 	if !hasID {
 		return decodedMessage{}, errors.New("JSON-RPC message has neither method nor id")
+	}
+	_, hasResult := obj["result"]
+	_, hasError := obj["error"]
+	if hasResult == hasError {
+		return decodedMessage{}, errors.New("JSON-RPC response must contain exactly one of result or error")
 	}
 	id, err := decodeID(idRaw)
 	if err != nil {
@@ -901,14 +1128,13 @@ func decodeID(raw json.RawMessage) (RequestID, error) {
 	if json.Unmarshal(raw, &s) == nil {
 		return s, nil
 	}
-	var n json.Number
-	if json.Unmarshal(raw, &n) == nil {
-		if strings.ContainsAny(string(raw), ".eE") {
-			return nil, errors.New("JSON-RPC request ID must be an integer")
-		}
-		return n, nil
+	if len(raw) > 0 && raw[0] != '-' && (raw[0] < '0' || raw[0] > '9') {
+		return nil, errors.New("JSON-RPC request ID must be a string or signed integer")
 	}
-	return nil, errors.New("JSON-RPC request ID must be a string or number")
+	if _, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
+		return json.Number(string(raw)), nil
+	}
+	return nil, errors.New("JSON-RPC request ID must be a signed int64")
 }
 
 func normalizeID(id RequestID) ([]byte, error) {
@@ -916,8 +1142,8 @@ func normalizeID(id RequestID) ([]byte, error) {
 	case string:
 		return json.Marshal(value)
 	case json.Number:
-		if strings.ContainsAny(value.String(), ".eE") {
-			return nil, errors.New("JSON-RPC request ID must be an integer")
+		if _, err := strconv.ParseInt(value.String(), 10, 64); err != nil {
+			return nil, errors.New("JSON-RPC request ID must be a signed int64")
 		}
 		return []byte(value.String()), nil
 	case int:
@@ -930,21 +1156,12 @@ func normalizeID(id RequestID) ([]byte, error) {
 		return []byte(fmt.Sprintf("%d", value)), nil
 	case int64:
 		return []byte(fmt.Sprintf("%d", value)), nil
-	case uint:
-		return []byte(fmt.Sprintf("%d", value)), nil
-	case uint8:
-		return []byte(fmt.Sprintf("%d", value)), nil
-	case uint16:
-		return []byte(fmt.Sprintf("%d", value)), nil
-	case uint32:
-		return []byte(fmt.Sprintf("%d", value)), nil
-	case uint64:
-		return []byte(fmt.Sprintf("%d", value)), nil
 	case json.RawMessage:
-		if _, err := decodeID(value); err != nil {
+		decoded, err := decodeID(value)
+		if err != nil {
 			return nil, err
 		}
-		return append([]byte(nil), value...), nil
+		return normalizeID(decoded)
 	default:
 		return nil, errors.New("JSON-RPC request ID must be a string or integer")
 	}
@@ -980,9 +1197,13 @@ func (c *Client) Close(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	c.closeOne.Do(func() { close(c.done) })
+	c.closeOne.Do(func() {
+		c.stopAdmission()
+		close(c.done)
+	})
 	// Closing the underlying connection is required to unblock a reader; the
 	// pump still owns all response/error publication and performs no replay.
+	c.cancelAnyActiveWrite()
 	_ = c.transport.Close()
 	select {
 	case <-c.closed:

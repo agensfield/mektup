@@ -11,6 +11,8 @@ import (
 
 const unixHandshakeURL = "ws://localhost/rpc"
 
+const maxWebSocketMessageSize = 128 << 20
+
 // UnixTransport connects directly to a Codex app-server Unix socket and uses
 // the same HTTP/WebSocket handshake as Codex's pinned Rust client.
 func DialUnix(ctx context.Context, socketPath string, options Options) (*Client, error) {
@@ -33,6 +35,7 @@ func dialUnixTransport(ctx context.Context, socketPath string) (Transport, error
 	if err != nil {
 		return nil, fmt.Errorf("websocket handshake on unix socket %q: %w", socketPath, err)
 	}
+	conn.SetReadLimit(maxWebSocketMessageSize)
 	return &websocketTransport{conn: conn}, nil
 }
 

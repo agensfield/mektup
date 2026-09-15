@@ -10,13 +10,14 @@ import (
 )
 
 type fakeTransport struct {
-	reads      chan Frame
-	readErrors chan error
-	writes     chan []byte
-	done       chan struct{}
-	onWrite    func([]byte) error
-	onClose    func()
-	one        sync.Once
+	reads          chan Frame
+	readErrors     chan error
+	writes         chan []byte
+	done           chan struct{}
+	onWrite        func([]byte) error
+	onWriteContext func(context.Context, []byte) error
+	onClose        func()
+	one            sync.Once
 }
 
 func newFakeTransport() *fakeTransport {
@@ -36,7 +37,7 @@ func (f *fakeTransport) Read(ctx context.Context) (Frame, error) {
 	}
 }
 
-func (f *fakeTransport) Write(_ context.Context, payload []byte) error {
+func (f *fakeTransport) Write(ctx context.Context, payload []byte) error {
 	select {
 	case f.writes <- append([]byte(nil), payload...):
 	case <-f.done:
@@ -44,6 +45,11 @@ func (f *fakeTransport) Write(_ context.Context, payload []byte) error {
 	}
 	if f.onWrite != nil {
 		if err := f.onWrite(payload); err != nil {
+			return err
+		}
+	}
+	if f.onWriteContext != nil {
+		if err := f.onWriteContext(ctx, payload); err != nil {
 			return err
 		}
 	}
@@ -171,8 +177,8 @@ func TestPostWriteDisconnectReportsMayHaveWritten(t *testing.T) {
 	}()
 	_, err := c.Call(context.Background(), RPCRequest{ID: "post", Method: "thread/start"})
 	var callErr *CallError
-	if !errors.As(err, &callErr) || callErr.Evidence.Phase != WriteMayHaveWritten || callErr.Evidence.Generation != 1 {
-		t.Fatalf("error evidence = %T %+v", err, err)
+	if !errors.As(err, &callErr) || callErr.Evidence.Phase != WriteMayHaveWritten || callErr.Evidence.Generation != c.Generation() {
+		t.Fatalf("error evidence = %T %+v phase=%v gen=%d", err, err, callErr.Evidence.Phase, callErr.Evidence.Generation)
 	}
 	_ = c.Close(context.Background())
 }
@@ -249,4 +255,136 @@ func TestBoundedOverflowProducesGapAndDisconnect(t *testing.T) {
 	if !gap {
 		t.Fatal("overflow did not emit a gap")
 	}
+}
+
+func TestStalledWriteIsCanceledAndConnectionCloses(t *testing.T) {
+	f := newFakeTransport()
+	f.onWriteContext = func(ctx context.Context, _ []byte) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-f.done:
+			return errors.New("fake closed")
+		}
+	}
+	c := New(f, Options{})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.Call(ctx, RPCRequest{ID: "stall", Method: "slow"})
+		done <- err
+	}()
+	_ = waitWrite(t, f)
+	cancel()
+	select {
+	case err := <-done:
+		var callErr *CallError
+		if !errors.As(err, &callErr) || callErr.Evidence.Phase != WriteMayHaveWritten {
+			t.Fatalf("stalled write evidence = %T %+v", err, err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("stalled writer did not acknowledge cancellation")
+	}
+	select {
+	case <-c.Done():
+	case <-time.After(time.Second):
+		t.Fatal("stalled writer did not close connection")
+	}
+}
+
+func TestCanceledBeforeEnqueueReleasesIDForReuse(t *testing.T) {
+	f := newFakeTransport()
+	c := New(f, Options{WriterCapacity: 1})
+	// Occupy the writer with a context-aware write so the second command cannot
+	// enqueue before its canceled context is observed.
+	f.onWriteContext = func(ctx context.Context, _ []byte) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-f.done:
+			return errors.New("fake closed")
+		}
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := c.Call(context.Background(), RPCRequest{ID: "occupy", Method: "slow"})
+		firstDone <- err
+	}()
+	_ = waitWrite(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := c.Call(ctx, RPCRequest{ID: "reuse", Method: "never"})
+		secondDone <- err
+	}()
+	// The first writer owns the pump. Closing the transport lets it finish so
+	// the queued cancellation command can be acknowledged.
+	time.Sleep(10 * time.Millisecond)
+	_ = f.Close()
+	select {
+	case err := <-secondDone:
+		if err == nil {
+			t.Fatal("canceled pre-enqueue call unexpectedly succeeded")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("canceled queued call did not complete")
+	}
+	closeErr := c.Close(context.Background())
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	<-firstDone
+	// A fresh connection may reuse the ID, proving the canceled reservation was
+	// not left in a withdrawn/reserved state.
+	f2 := newFakeTransport()
+	c2 := New(f2, Options{})
+	go func() {
+		_ = waitWrite(t, f2)
+		pushJSON(f2, response(`"reuse"`, `true`))
+	}()
+	if _, err := c2.Call(context.Background(), RPCRequest{ID: "reuse", Method: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = c2.Close(context.Background())
+}
+
+func TestIDsAreCanonicalStrictAndCompletedIDsAreRetired(t *testing.T) {
+	f := newFakeTransport()
+	c := New(f, Options{})
+	go func() {
+		_ = waitWrite(t, f)
+		pushJSON(f, response(`"ab"`, `true`))
+	}()
+	if _, err := c.Call(context.Background(), RPCRequest{ID: json.RawMessage(`"a\u0062"`), Method: "canonical"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Call(context.Background(), RPCRequest{ID: "ab", Method: "stale"}); err == nil {
+		t.Fatal("completed request ID was reusable")
+	}
+	if _, err := c.Call(context.Background(), RPCRequest{ID: uint64(^uint64(0)), Method: "bad"}); err == nil {
+		t.Fatal("unsigned overflow ID was accepted")
+	}
+	_ = c.Close(context.Background())
+
+	f2 := newFakeTransport()
+	c2 := New(f2, Options{})
+	go func() {
+		_ = waitWrite(t, f2)
+		pushJSON(f2, `{"id":"shape"}`)
+	}()
+	if _, err := c2.Call(context.Background(), RPCRequest{ID: "shape", Method: "shape"}); err == nil {
+		t.Fatal("response without result/error was accepted")
+	}
+	_ = c2.Close(context.Background())
+}
+
+func TestGenerationIncreasesAcrossConnections(t *testing.T) {
+	f1, f2 := newFakeTransport(), newFakeTransport()
+	c1, c2 := New(f1, Options{}), New(f2, Options{})
+	if c2.Generation() <= c1.Generation() {
+		t.Fatalf("generations did not increase: %d then %d", c1.Generation(), c2.Generation())
+	}
+	_ = c1.Close(context.Background())
+	_ = c2.Close(context.Background())
 }
