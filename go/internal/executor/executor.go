@@ -17,6 +17,7 @@ import (
 	"github.com/agensfield/mektup/go/internal/artifact"
 	"github.com/agensfield/mektup/go/internal/cli"
 	"github.com/agensfield/mektup/go/internal/codexapi"
+	"github.com/agensfield/mektup/go/internal/connection"
 	"github.com/agensfield/mektup/go/internal/doctor"
 	"github.com/agensfield/mektup/go/internal/endpoint"
 	"github.com/agensfield/mektup/go/internal/journal"
@@ -69,6 +70,15 @@ type ConnectionFactory interface {
 	Check(context.Context, string) (any, error)
 }
 
+// OpenOptions carries request-specific initialize requirements. The legacy
+// Open method remains supported for adapters that negotiate a fixed baseline;
+// capability-aware runtimes should implement ExperimentalConnectionFactory.
+type OpenOptions struct{ ExperimentalAPI bool }
+
+type ExperimentalConnectionFactory interface {
+	OpenWithOptions(context.Context, string, OpenOptions) (Connection, error)
+}
+
 type EndpointPort interface {
 	List() ([]endpoint.Endpoint, error)
 	Show(string) (endpoint.Endpoint, error)
@@ -113,6 +123,10 @@ type ReceiptPort interface {
 	Mutation(context.Context, string, string, any) (any, error)
 }
 
+type ReadReceiptPort interface {
+	Read(context.Context, string, string, any) (any, error)
+}
+
 type Ports struct {
 	Connections    ConnectionFactory
 	Endpoints      EndpointPort
@@ -123,6 +137,7 @@ type Ports struct {
 	Artifacts      ArtifactPort
 	RPC            RPCPort
 	Receipts       ReceiptPort
+	ReadReceipts   ReadReceiptPort
 	DoctorOptions  doctor.Options
 }
 
@@ -167,10 +182,20 @@ func notOwned(command string) error {
 }
 
 func (e *Executor) open(ctx context.Context, selector string) (Connection, Codex, error) {
+	return e.openWithOptions(ctx, selector, OpenOptions{})
+}
+
+func (e *Executor) openWithOptions(ctx context.Context, selector string, options OpenOptions) (Connection, Codex, error) {
 	if e.ports.Connections == nil {
 		return nil, nil, missing("connection")
 	}
-	c, err := e.ports.Connections.Open(ctx, selector)
+	var c Connection
+	var err error
+	if factory, ok := e.ports.Connections.(ExperimentalConnectionFactory); ok {
+		c, err = factory.OpenWithOptions(ctx, selector, options)
+	} else {
+		c, err = e.ports.Connections.Open(ctx, selector)
+	}
 	if err != nil {
 		return nil, nil, mapError(err, "unknown")
 	}
@@ -183,7 +208,7 @@ func (e *Executor) open(ctx context.Context, selector string) (Connection, Codex
 	return c, c.Codex(), nil
 }
 
-func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
+func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.ExecutionResult, execErr error) {
 	if len(inv.Position) == 0 {
 		return cli.ExecutionResult{}, usage("missing thread subcommand")
 	}
@@ -191,14 +216,27 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 		return cli.ExecutionResult{}, err
 	}
 	mutating := inv.Position[0] == "start" || inv.Position[0] == "resume" || inv.Position[0] == "fork"
+	if has(inv, "name") && strings.TrimSpace(inv.Option("name")) == "" {
+		return cli.ExecutionResult{}, usage("--name requires a non-empty value")
+	}
 	if mutating && e.ports.Receipts == nil {
 		return cli.ExecutionResult{}, missing("receipt journal")
 	}
-	conn, api, err := e.open(ctx, inv.Resolved.Endpoint)
+	needsExperimental := inv.Position[0] == "fork" && inv.Option("before-turn") != ""
+	conn, api, err := e.openWithOptions(ctx, inv.Resolved.Endpoint, OpenOptions{ExperimentalAPI: needsExperimental})
 	if err != nil {
 		return cli.ExecutionResult{}, err
 	}
-	defer conn.Close()
+	if has(inv, "name") {
+		if _, ok := api.(ThreadNameSetter); !ok {
+			return cli.ExecutionResult{}, missing("thread/name/set adapter")
+		}
+	}
+	defer func() {
+		if closeErr := conn.Close(); closeErr != nil && execErr == nil {
+			result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+		}
+	}()
 	sub := inv.Position[0]
 	var data any
 	var kind string
@@ -293,7 +331,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (cli.Executio
 	return e.result(ctx, kind, data, cursor, warnings, mutating, inv.Resolved.Endpoint)
 }
 
-func (e *Executor) search(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
+func (e *Executor) search(ctx context.Context, inv cli.Invocation) (result cli.ExecutionResult, execErr error) {
 	if len(inv.Position) < 1 || strings.TrimSpace(inv.Position[0]) == "" {
 		return cli.ExecutionResult{}, usage("search requires a query")
 	}
@@ -304,11 +342,18 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (cli.Executio
 	if err := validatePageOptions(inv, pageMax); err != nil {
 		return cli.ExecutionResult{}, err
 	}
-	conn, api, err := e.open(ctx, inv.Resolved.Endpoint)
+	if e.ports.ReadReceipts == nil && e.ports.Receipts == nil {
+		return cli.ExecutionResult{}, missing("read receipt journal")
+	}
+	conn, api, err := e.openWithOptions(ctx, inv.Resolved.Endpoint, OpenOptions{ExperimentalAPI: true})
 	if err != nil {
 		return cli.ExecutionResult{}, err
 	}
-	defer conn.Close()
+	defer func() {
+		if closeErr := conn.Close(); closeErr != nil && execErr == nil {
+			result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+		}
+	}()
 	options := codexapi.SearchOptions{SearchTerm: inv.Position[0], Cursor: inv.Option("cursor"), Limit: optionInt(inv, "limit"), SourceKinds: options(inv, "source"), Archived: boolOption(inv, "archived")}
 	if thread := inv.Option("thread"); thread != "" {
 		scoped, ok := api.(ScopedSearcher)
@@ -321,7 +366,11 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (cli.Executio
 		}
 		data, cursor := responseDataArray(r.Raw), r.NextCursor
 		warnings := append([]string(nil), conn.Warnings()...)
-		return e.collectionResult(ctx, "search", "message", data, cursor, warnings, false, inv.Resolved.Endpoint)
+		receipt, receiptErr := e.searchReceipt(ctx, inv.Resolved.Endpoint, "message", data, cursor)
+		if receiptErr != nil {
+			return cli.ExecutionResult{}, receiptErr
+		}
+		return e.collectionResultWithReceipt(ctx, "search", "message", data, cursor, warnings, inv.Resolved.Endpoint, receipt)
 	}
 	r, callErr := api.Search(ctx, options)
 	if callErr != nil {
@@ -329,7 +378,39 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (cli.Executio
 	}
 	data, cursor := responseDataArray(r.Raw), r.NextCursor
 	warnings := append([]string(nil), conn.Warnings()...)
-	return e.collectionResult(ctx, "search", "thread", data, cursor, warnings, false, inv.Resolved.Endpoint)
+	receipt, receiptErr := e.searchReceipt(ctx, inv.Resolved.Endpoint, "thread", data, cursor)
+	if receiptErr != nil {
+		return cli.ExecutionResult{}, receiptErr
+	}
+	return e.collectionResultWithReceipt(ctx, "search", "thread", data, cursor, warnings, inv.Resolved.Endpoint, receipt)
+}
+
+func (e *Executor) searchReceipt(ctx context.Context, endpointID, resultKind string, data any, cursor string) (any, error) {
+	metadata := map[string]any{"resultKind": resultKind, "experimental": true, "cursor": cursor}
+	if items, ok := data.([]any); ok {
+		metadata["count"] = len(items)
+	}
+	if e.ports.ReadReceipts != nil {
+		receipt, err := e.ports.ReadReceipts.Read(ctx, "search", endpointID, metadata)
+		if err != nil {
+			return nil, mapError(err, "unknown")
+		}
+		if receipt == nil {
+			return nil, &cli.Error{Code: "internal_error", Message: "search read receipt was not persisted", Effect: "unknown", Exit: cli.ExitInternal}
+		}
+		return receipt, nil
+	}
+	if e.ports.Receipts != nil {
+		receipt, err := e.ports.Receipts.Mutation(ctx, "search", endpointID, metadata)
+		if err != nil {
+			return nil, mapError(err, "unknown")
+		}
+		if receipt == nil {
+			return nil, &cli.Error{Code: "internal_error", Message: "search read receipt was not persisted", Effect: "unknown", Exit: cli.ExitInternal}
+		}
+		return receipt, nil
+	}
+	return nil, missing("read receipt journal")
 }
 
 func (e *Executor) endpoint(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
@@ -443,7 +524,7 @@ func (e *Executor) storage(ctx context.Context, inv cli.Invocation) (cli.Executi
 		}
 		v, err := e.ports.Storage.Maintain(ctx, journal.MaintenanceOptions{Before: before, DryRun: has(inv, "dry-run")})
 		if err != nil {
-			return cli.ExecutionResult{}, mapError(err, "unknown")
+			return cli.ExecutionResult{}, e.partialMutationError(ctx, "storage", "local", v, err)
 		}
 		return e.storageResult(ctx, "maintain", v, true, "local")
 	case "vacuum":
@@ -455,6 +536,15 @@ func (e *Executor) storage(ctx context.Context, inv cli.Invocation) (cli.Executi
 	default:
 		return cli.ExecutionResult{}, usage("unsupported storage subcommand: " + sub)
 	}
+}
+
+func (e *Executor) partialMutationError(ctx context.Context, operation, endpointID string, partial any, cause error) error {
+	if e.ports.Receipts != nil {
+		if receipt, err := e.ports.Receipts.Mutation(ctx, operation, endpointID, partial); err == nil && receipt != nil {
+			return &cli.Error{Code: "internal_error", Message: cause.Error(), Effect: "accepted", Details: map[string]any{"partialReceipt": receipt, "partial": partial}, Exit: cli.ExitInternal}
+		}
+	}
+	return mapError(cause, "unknown")
 }
 
 func (e *Executor) doctor(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
@@ -472,7 +562,7 @@ func (e *Executor) doctor(ctx context.Context, inv cli.Invocation) (cli.Executio
 	return e.result(ctx, "doctor", r, "", nil, fix, "local")
 }
 
-func (e *Executor) rpc(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
+func (e *Executor) rpc(ctx context.Context, inv cli.Invocation) (result cli.ExecutionResult, execErr error) {
 	if len(inv.Position) < 1 || strings.TrimSpace(inv.Position[0]) == "" {
 		return cli.ExecutionResult{}, usage("rpc requires a method")
 	}
@@ -486,11 +576,15 @@ func (e *Executor) rpc(ctx context.Context, inv cli.Invocation) (cli.ExecutionRe
 	if err != nil {
 		return cli.ExecutionResult{}, err
 	}
-	conn, _, err := e.open(ctx, inv.Resolved.Endpoint)
+	conn, _, err := e.openWithOptions(ctx, inv.Resolved.Endpoint, OpenOptions{ExperimentalAPI: rpcmeta.Evaluate(inv.Position[0], params).Experimental})
 	if err != nil {
 		return cli.ExecutionResult{}, err
 	}
-	defer conn.Close()
+	defer func() {
+		if closeErr := conn.Close(); closeErr != nil && execErr == nil {
+			result, execErr = cli.ExecutionResult{}, cleanupError(closeErr)
+		}
+	}()
 	var output rawrpc.OutputOptions
 	if (has(inv, "output") || has(inv, "force")) && e.ports.Artifacts == nil {
 		return cli.ExecutionResult{}, missing("artifact")
@@ -519,7 +613,11 @@ func (e *Executor) rpc(ctx context.Context, inv cli.Invocation) (cli.ExecutionRe
 	if r.Artifact != nil {
 		data["artifact"] = r.Artifact
 	}
-	return e.result(ctx, "rpc", data, "", nil, true, inv.Resolved.Endpoint)
+	receiptData := map[string]any{"method": r.Method, "id": r.ID, "effects": r.Effects, "experimental": r.Experimental, "networkRead": r.NetworkRead, "retrySafety": r.RetrySafety, "effectState": r.EffectState}
+	if r.Artifact != nil {
+		receiptData["artifact"] = r.Artifact
+	}
+	return e.resultEnvelope(ctx, "rpc", "rpc", "result", data, "", nil, true, inv.Resolved.Endpoint, "", nil, receiptData)
 }
 
 func (e *Executor) params(ctx context.Context, inv cli.Invocation) (json.RawMessage, rawrpc.ParamsSource, error) {
@@ -579,18 +677,22 @@ func (e *Executor) params(ctx context.Context, inv cli.Invocation) (json.RawMess
 }
 
 func (e *Executor) result(ctx context.Context, kind string, data any, cursor string, warnings []string, mutation bool, endpointID string) (cli.ExecutionResult, error) {
-	return e.resultEnvelope(ctx, kind, kind, "result", data, cursor, warnings, mutation, endpointID, "")
+	return e.resultEnvelope(ctx, kind, kind, "result", data, cursor, warnings, mutation, endpointID, "", nil, nil)
 }
 
 func (e *Executor) collectionResult(ctx context.Context, eventKind, resultKind string, data any, cursor string, warnings []string, mutation bool, endpointID string) (cli.ExecutionResult, error) {
-	return e.resultEnvelope(ctx, eventKind, resultKind, "data", data, cursor, warnings, mutation, endpointID, "")
+	return e.resultEnvelope(ctx, eventKind, resultKind, "data", data, cursor, warnings, mutation, endpointID, "", nil, nil)
+}
+
+func (e *Executor) collectionResultWithReceipt(ctx context.Context, eventKind, resultKind string, data any, cursor string, warnings []string, endpointID string, receipt any) (cli.ExecutionResult, error) {
+	return e.resultEnvelope(ctx, eventKind, resultKind, "data", data, cursor, warnings, false, endpointID, "", receipt, nil)
 }
 
 func (e *Executor) storageResult(ctx context.Context, subcommand string, data any, mutation bool, endpointID string) (cli.ExecutionResult, error) {
-	return e.resultEnvelope(ctx, "storage", "storage", "result", data, "", nil, mutation, endpointID, subcommand)
+	return e.resultEnvelope(ctx, "storage", "storage", "result", data, "", nil, mutation, endpointID, subcommand, nil, nil)
 }
 
-func (e *Executor) resultEnvelope(ctx context.Context, eventKind, resultKind, field string, data any, cursor string, warnings []string, mutation bool, endpointID, subcommand string) (cli.ExecutionResult, error) {
+func (e *Executor) resultEnvelope(ctx context.Context, eventKind, resultKind, field string, data any, cursor string, warnings []string, mutation bool, endpointID, subcommand string, providedReceipt, receiptInput any) (cli.ExecutionResult, error) {
 	payload := map[string]any{"resultKind": resultKind, field: data}
 	if subcommand != "" {
 		payload["subcommand"] = subcommand
@@ -601,7 +703,28 @@ func (e *Executor) resultEnvelope(ctx context.Context, eventKind, resultKind, fi
 	if cursor != "" {
 		payload["nextCursor"] = cursor
 	}
+	var receipt any = providedReceipt
+	if mutation {
+		if e.ports.Receipts == nil {
+			return cli.ExecutionResult{}, missing("receipt journal")
+		}
+		var err error
+		input := data
+		if receiptInput != nil {
+			input = receiptInput
+		}
+		receipt, err = e.ports.Receipts.Mutation(ctx, eventKind, endpointID, input)
+		if err != nil {
+			return cli.ExecutionResult{}, mapError(err, "unknown")
+		}
+		if receipt == nil {
+			return cli.ExecutionResult{}, &cli.Error{Code: "internal_error", Message: "receipt journal returned no receipt", Effect: "unknown", Exit: cli.ExitInternal}
+		}
+	}
 	eventMachine := map[string]any{"event": eventKind + ".completed", "terminal": true, "ok": true, "data": payload}
+	if operationID := receiptOperationID(receipt); operationID != "" {
+		eventMachine["operationId"] = operationID
+	}
 	if len(warnings) != 0 {
 		// warnings is a lifecycle envelope field. Keeping it out of data is
 		// important because App preserves this top-level location verbatim.
@@ -609,17 +732,7 @@ func (e *Executor) resultEnvelope(ctx context.Context, eventKind, resultKind, fi
 	}
 	event := cli.OutputEvent{Machine: eventMachine, Human: eventKind}
 	result := cli.ExecutionResult{Events: []cli.OutputEvent{event}, Exit: cli.ExitSuccess}
-	if mutation {
-		if e.ports.Receipts == nil {
-			return cli.ExecutionResult{}, missing("receipt journal")
-		}
-		receipt, err := e.ports.Receipts.Mutation(ctx, eventKind, endpointID, data)
-		if err != nil {
-			return cli.ExecutionResult{}, mapError(err, "unknown")
-		}
-		if receipt == nil {
-			return cli.ExecutionResult{}, &cli.Error{Code: "internal_error", Message: "receipt journal returned no receipt", Effect: "unknown", Exit: cli.ExitInternal}
-		}
+	if receipt != nil {
 		result.Receipt = receipt
 	}
 	return result, nil
@@ -649,6 +762,22 @@ func responseThreadArray(raw json.RawMessage) any {
 		}
 	}
 	return []any{}
+}
+
+func receiptOperationID(receipt any) string {
+	if receipt == nil {
+		return ""
+	}
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		return ""
+	}
+	var object map[string]any
+	if json.Unmarshal(encoded, &object) != nil {
+		return ""
+	}
+	value, _ := object["operationId"].(string)
+	return value
 }
 
 func warningObjects(warnings []string) []map[string]any {
@@ -802,6 +931,9 @@ func mapError(err error, effect string) error {
 		}
 		return ce
 	}
+	if errors.Is(err, connection.ErrUnsupported) {
+		return &cli.Error{Code: "unsupported_server_version", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
+	}
 	var re *rawrpc.Error
 	if errors.As(err, &re) {
 		stable := re.Stable()
@@ -819,6 +951,10 @@ func mapError(err error, effect string) error {
 		return &cli.Error{Code: "wait_interrupted", Message: err.Error(), Effect: effect, Exit: cli.ExitIncomplete}
 	}
 	return &cli.Error{Code: "internal_error", Message: err.Error(), Effect: effect, Details: map[string]any{"cause": err.Error()}, Exit: cli.ExitInternal}
+}
+
+func cleanupError(err error) error {
+	return &cli.Error{Code: "cleanup_incomplete", Message: "connection cleanup failed: " + err.Error(), Effect: "accepted", Details: map[string]any{"error": err.Error()}, Exit: cli.ExitInternal}
 }
 
 func nonempty(a, b string) string {
@@ -851,6 +987,6 @@ func (r ReaderInput) ReadStdin(ctx context.Context, max int64) ([]byte, error) {
 // making the executor construct or locate it.
 type ArtifactStoreOutput struct{ Store *artifact.Store }
 
-func (a ArtifactStoreOutput) RPCOutput(context.Context, cli.Invocation) (rawrpc.OutputOptions, error) {
-	return rawrpc.OutputOptions{Store: a.Store}, nil
+func (a ArtifactStoreOutput) RPCOutput(_ context.Context, inv cli.Invocation) (rawrpc.OutputOptions, error) {
+	return rawrpc.OutputOptions{Store: a.Store, Path: inv.Option("output"), Force: has(inv, "force")}, nil
 }

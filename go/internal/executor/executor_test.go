@@ -74,6 +74,16 @@ type fakeConnections struct {
 	conn    *fakeConnection
 }
 
+type optionsConnections struct {
+	*fakeConnections
+	options []OpenOptions
+}
+
+func (f *optionsConnections) OpenWithOptions(ctx context.Context, selector string, options OpenOptions) (Connection, error) {
+	f.options = append(f.options, options)
+	return f.fakeConnections.Open(ctx, selector)
+}
+
 func (f *fakeConnections) Open(context.Context, string) (Connection, error) {
 	f.opened++
 	return f.conn, nil
@@ -232,8 +242,8 @@ func TestOwnedCommandsUseOnlyInjectedPorts(t *testing.T) {
 	if endpoints.item.Alias != "dev" || mektup.ValidateID(endpoints.item.ID, mektup.EndpointIDPrefix) != nil {
 		t.Fatalf("endpoint alias/id were not mapped independently: %+v", endpoints.item)
 	}
-	if receipts.count != 8 {
-		t.Fatalf("mutation receipt count=%d, want 8", receipts.count)
+	if receipts.count != 10 {
+		t.Fatalf("receipt count=%d, want 10 including two search read receipts", receipts.count)
 	}
 }
 
@@ -298,7 +308,7 @@ func TestThreadMutationProjectionNeverCarriesTranscriptBodies(t *testing.T) {
 
 func TestLifecycleWarningsRemainAtEnvelopeLevel(t *testing.T) {
 	var out, errOut bytes.Buffer
-	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}})
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}, Receipts: &fakeReceipts{}})
 	a := &cli.App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, Executor: e}
 	if code := a.Run([]string{"--json", "search", "needle"}); code != int(cli.ExitSuccess) {
 		t.Fatalf("code=%d stderr=%q", code, errOut.String())
@@ -450,7 +460,7 @@ func TestUnownedCommandsAreExplicitlyNotSent(t *testing.T) {
 }
 
 func TestDomainErrorsMapToStableCLIErrors(t *testing.T) {
-	e := New(Ports{Connections: failingConnections{err: errors.New("dial failed")}})
+	e := New(Ports{Connections: failingConnections{err: errors.New("dial failed")}, Receipts: &fakeReceipts{}})
 	_, err := e.Execute(context.Background(), invocation("search", "needle"))
 	var ce *cli.Error
 	if !errors.As(err, &ce) || ce.Code != "internal_error" || ce.Effect != "unknown" {
@@ -481,9 +491,35 @@ func TestPinnedDomainErrorsKeepStableExitClasses(t *testing.T) {
 	}
 }
 
+func TestExperimentalInitializationIsRequestSpecific(t *testing.T) {
+	connections := &optionsConnections{fakeConnections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{scoped: true}}}}
+	receipts := &fakeReceipts{}
+	e := New(Ports{Connections: connections, Receipts: receipts, RPC: &fakeRPC{}, Input: fakeInput{stdin: []byte(`{}`)}})
+	if _, err := e.Execute(context.Background(), invocation("thread", "list")); err != nil {
+		t.Fatal(err)
+	}
+	search := invocation("search", "needle")
+	if _, err := e.Execute(context.Background(), search); err != nil {
+		t.Fatal(err)
+	}
+	fork := invocation("thread", "fork", "thr_1")
+	fork.Options["before-turn"] = []string{"turn_1"}
+	if _, err := e.Execute(context.Background(), fork); err != nil {
+		t.Fatal(err)
+	}
+	rpc := invocation("rpc", "server/diagnostics")
+	rpc.Options["params"] = []string{"{}"}
+	if _, err := e.Execute(context.Background(), rpc); err != nil {
+		t.Fatal(err)
+	}
+	if len(connections.options) != 4 || connections.options[0].ExperimentalAPI || !connections.options[1].ExperimentalAPI || !connections.options[2].ExperimentalAPI || !connections.options[3].ExperimentalAPI {
+		t.Fatalf("request-specific options=%+v", connections.options)
+	}
+}
+
 func TestExecutorRechecksPageAndCursorBounds(t *testing.T) {
 	connections := &fakeConnections{conn: &fakeConnection{api: fakeCodex{scoped: true}}}
-	e := New(Ports{Connections: connections})
+	e := New(Ports{Connections: connections, Receipts: &fakeReceipts{}})
 	tooMany := invocation("search", "needle")
 	tooMany.Options["limit"] = []string{"101"}
 	if _, err := e.Execute(context.Background(), tooMany); err == nil {
