@@ -2,10 +2,18 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 )
+
+type executorFunc func(context.Context, Invocation) (ExecutionResult, error)
+
+func (f executorFunc) Execute(ctx context.Context, inv Invocation) (ExecutionResult, error) {
+	return f(ctx, inv)
+}
 
 func runTest(t *testing.T, args ...string) (int, string, string) {
 	t.Helper()
@@ -27,10 +35,19 @@ func TestSkillAndDocsAgentsAreByteEquivalent(t *testing.T) {
 }
 
 func TestOfflineSurfacesDoNotNeedState(t *testing.T) {
-	for _, args := range [][]string{{"--state-dir", "/definitely/not/created", "--skill"}, {"--config", "/definitely/not/created", "docs", "agents"}, {"version", "--json"}, {"completion", "bash"}} {
+	for _, args := range [][]string{{"--skill"}, {"docs", "agents"}, {"version", "--json"}, {"completion", "bash"}} {
 		code, _, stderr := runTest(t, args...)
 		if code != int(ExitSuccess) || stderr != "" {
 			t.Fatalf("%v: code=%d stderr=%q", args, code, stderr)
+		}
+	}
+}
+
+func TestOfflineSurfacesRejectOperationalOverrides(t *testing.T) {
+	for _, args := range [][]string{{"--state-dir", "/tmp/state", "--skill"}, {"--config", "/tmp/config", "docs", "agents"}, {"--endpoint", "remote", "docs", "commands"}, {"--audit", "docs", "receipts"}, {"--debug", "version"}} {
+		code, _, _ := runTest(t, args...)
+		if code != int(ExitUsage) {
+			t.Fatalf("%v: got exit %d", args, code)
 		}
 	}
 }
@@ -119,5 +136,71 @@ func TestDocsCommandsJSONIsOneMachineLine(t *testing.T) {
 	}
 	if document.Schema != CommandSchema {
 		t.Fatalf("schema=%q", document.Schema)
+	}
+}
+
+func TestExecutorResultStreamsProvidedOutputAndReceipt(t *testing.T) {
+	var out, errOut bytes.Buffer
+	var got Invocation
+	a := &App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}}
+	a.Executor = executorFunc(func(_ context.Context, inv Invocation) (ExecutionResult, error) {
+		got = inv
+		return ExecutionResult{Events: []OutputEvent{{Machine: map[string]any{"schema": EventSchema, "event": "read.completed", "terminal": true, "ok": true}}}, Receipt: map[string]any{"schema": "mektup/receipt/v1", "state": "accepted"}}, nil
+	})
+	if code := a.Run([]string{"inspect", "target"}); code != int(ExitSuccess) {
+		t.Fatalf("code=%d stderr=%q", code, errOut.String())
+	}
+	if got.Resolved.Endpoint == "" || got.Resolved.Config == "" || got.Resolved.StateDir == "" {
+		t.Fatalf("globals were not resolved: %#v", got.Resolved)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected event and receipt, got %q", out.String())
+	}
+}
+
+func TestEmptyExecutorResultFailsInternal(t *testing.T) {
+	var out, errOut bytes.Buffer
+	a := &App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{}, Executor: executorFunc(func(context.Context, Invocation) (ExecutionResult, error) { return ExecutionResult{}, nil })}
+	if code := a.Run([]string{"inspect", "target"}); code != int(ExitInternal) || !strings.Contains(errOut.String(), "no human output") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+}
+
+func TestResolvedEnvironmentAndFlagPrecedence(t *testing.T) {
+	var got Invocation
+	var out bytes.Buffer
+	a := &App{In: strings.NewReader(""), Out: &out, Err: &bytes.Buffer{}, Env: []string{
+		"MEKTUP_OUTPUT=json", "MEKTUP_ENDPOINT=env-endpoint", "MEKTUP_CONFIG=env-config", "MEKTUP_STATE_DIR=env-state",
+	}, Executor: executorFunc(func(_ context.Context, inv Invocation) (ExecutionResult, error) {
+		got = inv
+		return ExecutionResult{Events: []OutputEvent{{Machine: map[string]any{"ok": true}, Human: "inspection complete"}}}, nil
+	})}
+	if code := a.Run([]string{"--human", "--endpoint", "flag-endpoint", "inspect", "target"}); code != int(ExitSuccess) {
+		t.Fatalf("code=%d", code)
+	}
+	if got.Resolved.Output != PresentationHuman || got.Resolved.Endpoint != "flag-endpoint" || got.Resolved.Config != "env-config" || got.Resolved.StateDir != "env-state" {
+		t.Fatalf("unexpected precedence: %#v", got.Resolved)
+	}
+}
+
+func TestUUIDv7GeneratorAndEntropyFailure(t *testing.T) {
+	id, err := defaultID("evt_")
+	if err != nil || !strings.HasPrefix(id, "evt_") {
+		t.Fatalf("id=%q err=%v", id, err)
+	}
+	uuid := strings.TrimPrefix(id, "evt_")
+	parts := strings.Split(uuid, "-")
+	if len(parts) != 5 || len(parts[2]) < 1 || parts[2][0] != '7' || len(parts[3]) < 1 || (parts[3][0] != '8' && parts[3][0] != '9' && parts[3][0] != 'a' && parts[3][0] != 'b') {
+		t.Fatalf("not UUIDv7: %q", id)
+	}
+
+	var out, errOut bytes.Buffer
+	a := &App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, ID: func(string) (string, error) { return "", errors.New("entropy unavailable") }}
+	if code := a.Run([]string{"send", "target", "message"}); code != int(ExitInternal) {
+		t.Fatalf("entropy failure code=%d", code)
+	}
+	if strings.Contains(out.String(), "00000000-0000-4000-8000") {
+		t.Fatalf("fixed UUID fallback leaked: %q", out.String())
 	}
 }

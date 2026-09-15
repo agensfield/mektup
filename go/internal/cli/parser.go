@@ -4,7 +4,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 type optionSpec struct {
@@ -162,6 +164,9 @@ func validateInvocation(a *App, inv Invocation) *Error {
 		if params > 1 {
 			return usageError("rpc accepts exactly one params source")
 		}
+		if err := validateOptionSyntax(inv); err != nil {
+			return err
+		}
 		return nil
 	}
 
@@ -169,6 +174,9 @@ func validateInvocation(a *App, inv Invocation) *Error {
 	case "send":
 		if len(inv.Position) < 1 || len(inv.Position) > 2 {
 			return usageError("usage: mektup send <target> [message|--stdin|--file <path>]")
+		}
+		if inv.Position[0] == "" {
+			return &Error{Code: "invalid_target", Message: "target must not be empty", Exit: ExitUsage}
 		}
 		if err := validateBodySource(a, inv, 1); err != nil {
 			return err
@@ -186,6 +194,9 @@ func validateInvocation(a *App, inv Invocation) *Error {
 		if len(inv.Position) < 1 || len(inv.Position) > 2 {
 			return usageError("usage: mektup reply <message-or-receipt-id> [message|--stdin|--file <path>]")
 		}
+		if inv.Position[0] == "" {
+			return usageError("message-or-receipt-id must not be empty")
+		}
 		if err := validateBodySource(a, inv, 1); err != nil {
 			return err
 		}
@@ -202,13 +213,22 @@ func validateInvocation(a *App, inv Invocation) *Error {
 		if len(inv.Position) != 1 {
 			return usageError("usage: mektup wait <receipt-or-message-id>")
 		}
+		if inv.Position[0] == "" {
+			return usageError("receipt-or-message-id must not be empty")
+		}
 	case "inspect":
 		if len(inv.Position) != 1 {
 			return usageError("usage: mektup inspect <target>")
 		}
+		if inv.Position[0] == "" {
+			return &Error{Code: "invalid_target", Message: "target must not be empty", Exit: ExitUsage}
+		}
 	case "search":
 		if len(inv.Position) != 1 {
 			return usageError("usage: mektup search <query>")
+		}
+		if inv.Position[0] == "" {
+			return usageError("query must not be empty")
 		}
 		if has(inv, "thread") && (has(inv, "archived") || has(inv, "source")) {
 			return usageError("--archived and --source are invalid with --thread")
@@ -220,12 +240,27 @@ func validateInvocation(a *App, inv Invocation) *Error {
 	default:
 		return usageError("unknown command: " + inv.Command)
 	}
+	if err := validateOptionSyntax(inv); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateGlobals(inv Invocation) *Error {
+	for _, option := range []string{"endpoint", "config", "state-dir"} {
+		if has(inv, option) && strings.TrimSpace(inv.Option(option)) == "" {
+			return usageError("--" + option + " requires a non-empty value")
+		}
+	}
 	return nil
 }
 
 func validateBodySource(a *App, inv Invocation, messageIndex int) *Error {
 	sources := 0
 	if len(inv.Position) > messageIndex {
+		if inv.Position[messageIndex] == "" {
+			return usageError("message body must not be empty")
+		}
 		sources++
 	}
 	if has(inv, "stdin") {
@@ -242,6 +277,56 @@ func validateBodySource(a *App, inv Invocation, messageIndex int) *Error {
 	}
 	if has(inv, "file") && inv.Option("file") == "" {
 		return usageError("--file requires a path")
+	}
+	return nil
+}
+
+func validateOptionSyntax(inv Invocation) *Error {
+	for _, option := range []string{"delivery-timeout", "wait-timeout", "timeout"} {
+		if has(inv, option) {
+			value := inv.Option(option)
+			parsed, err := time.ParseDuration(value)
+			if err != nil || parsed < 0 {
+				return usageError("--" + option + " requires a valid duration")
+			}
+		}
+	}
+	for _, option := range []string{"limit", "receipts"} {
+		if has(inv, option) {
+			value := inv.Option(option)
+			n, err := strconv.Atoi(value)
+			if err != nil || n < 0 {
+				return usageError("--" + option + " requires a non-negative integer")
+			}
+		}
+	}
+	if has(inv, "status") && inv.Option("status") != "success" && inv.Option("status") != "error" {
+		return usageError("--status must be success or error")
+	}
+	if has(inv, "sort") && inv.Option("sort") != "updated" && inv.Option("sort") != "created" && inv.Option("sort") != "recent" {
+		return usageError("--sort must be updated, created, or recent")
+	}
+	if has(inv, "order") && inv.Option("order") != "asc" && inv.Option("order") != "desc" {
+		return usageError("--order must be asc or desc")
+	}
+	if has(inv, "view") && inv.Option("view") != "summary" && inv.Option("view") != "full" {
+		return usageError("--view must be summary or full")
+	}
+	if has(inv, "herdr") && inv.Option("herdr") != "auto" && inv.Option("herdr") != "disabled" {
+		return usageError("--herdr must be auto or disabled")
+	}
+	if has(inv, "resolve-as") && inv.Option("resolve-as") != "accepted" && inv.Option("resolve-as") != "not-delivered" {
+		return usageError("--resolve-as must be accepted or not-delivered")
+	}
+	if value := inv.Option("output"); value == "" && has(inv, "output") {
+		return usageError("--output requires a path")
+	}
+	for _, option := range []string{"source", "allow-effect"} {
+		for _, value := range inv.Options[option] {
+			if strings.TrimSpace(value) == "" {
+				return usageError("--" + option + " values must not be empty")
+			}
+		}
 	}
 	return nil
 }
@@ -268,6 +353,12 @@ func validateNested(inv Invocation) *Error {
 	allowed := allowedOptions(key)
 	if len(inv.Position) < positionalMinimum(key) || len(inv.Position) > positionalMaximum(key) {
 		return usageError("invalid positional arguments for " + key)
+	}
+	switch key {
+	case "thread read", "thread turns", "thread items", "thread resume", "thread fork", "receipt show", "receipt reconcile", "receipt resolve", "endpoint show", "endpoint remove":
+		if len(inv.Position) > 1 && inv.Position[1] == "" {
+			return usageError("target or receipt identifier must not be empty")
+		}
 	}
 	for option := range inv.Options {
 		if option == "help" || option == "json" || option == "human" || option == "debug" || option == "audit" || option == "endpoint" || option == "config" || option == "state-dir" {
@@ -303,6 +394,9 @@ func validateNested(inv Invocation) *Error {
 		if inv.Option("reason") == "" || inv.Option("evidence") == "" {
 			return usageError("receipt resolve requires --reason and --evidence")
 		}
+	}
+	if err := validateOptionSyntax(inv); err != nil {
+		return err
 	}
 	return nil
 }

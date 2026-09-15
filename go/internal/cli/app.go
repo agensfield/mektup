@@ -52,6 +52,17 @@ type BuildInfo struct {
 	TestedCodexServers []string
 }
 
+// These variables are the release ldflag seam. They intentionally live in
+// internal/cli, where the release configuration can set them without having
+// to know the tiny cmd package's implementation details.
+var (
+	buildVersion         = "dev"
+	buildCommit          = "unknown"
+	buildContractVersion = ContractVersion
+	buildTestedCodex     = "0.154.0"
+	buildInstallKind     = "source"
+)
+
 var DefaultBuildInfo = BuildInfo{
 	Version:            "dev",
 	Commit:             "unknown",
@@ -60,17 +71,54 @@ var DefaultBuildInfo = BuildInfo{
 	TestedCodexServers: []string{"0.154.0"},
 }
 
+// BuildInfoFromBuildVars returns metadata after release ldflags have been
+// applied. Tested versions are comma-separated in buildTestedCodex.
+func BuildInfoFromBuildVars() BuildInfo {
+	servers := make([]string, 0)
+	for _, server := range strings.Split(buildTestedCodex, ",") {
+		if server = strings.TrimSpace(server); server != "" {
+			servers = append(servers, server)
+		}
+	}
+	if len(servers) == 0 {
+		servers = append(servers, DefaultBuildInfo.TestedCodexServers...)
+	}
+	return BuildInfo{Version: buildVersion, Commit: buildCommit, InstallKind: buildInstallKind, ContractVersion: buildContractVersion, TestedCodexServers: servers}
+}
+
+// IDGenerator is injectable for deterministic tests and for a future shared
+// wire ID implementation. It must return an error when entropy is unavailable.
+type IDGenerator func(prefix string) (string, error)
+
+// OutputEvent is one domain result in the executor-to-CLI presentation seam.
+// Machine is encoded as one compact JSONL object; Human is used only by human
+// presentation.
+type OutputEvent struct {
+	Machine any
+	Human   string
+}
+
+// ExecutionResult is a successful or terminal operational result. A result
+// with no event, human text, or receipt is not a success: it is treated as an
+// internal executor contract violation.
+type ExecutionResult struct {
+	Events  []OutputEvent
+	Human   string
+	Receipt any
+	Exit    ExitCode
+}
+
 // Executor is the seam for the transport/journal implementation. It must
-// return a typed Error when work fails. The CLI never turns a nil result into
-// an optimistic success on behalf of an executor.
+// return a typed Error when work fails or a non-empty ExecutionResult when it
+// succeeds. The CLI never turns a nil/empty result into an optimistic success.
 type Executor interface {
-	Execute(context.Context, Invocation) (any, error)
+	Execute(context.Context, Invocation) (ExecutionResult, error)
 }
 
 type defaultExecutor struct{}
 
-func (defaultExecutor) Execute(context.Context, Invocation) (any, error) {
-	return nil, &Error{Code: "internal_error", Message: "operational command is not implemented", Exit: ExitInternal}
+func (defaultExecutor) Execute(context.Context, Invocation) (ExecutionResult, error) {
+	return ExecutionResult{}, &Error{Code: "internal_error", Message: "operational command is not implemented", Exit: ExitInternal}
 }
 
 // App is the embeddable CLI application.
@@ -81,9 +129,12 @@ type App struct {
 	Env      []string
 	Build    BuildInfo
 	Executor Executor
+	ID       IDGenerator
 }
 
-func New() *App { return &App{In: os.Stdin, Out: os.Stdout, Err: os.Stderr, Build: DefaultBuildInfo} }
+func New() *App {
+	return &App{In: os.Stdin, Out: os.Stdout, Err: os.Stderr, Build: BuildInfoFromBuildVars(), ID: defaultID}
+}
 
 // Error is a stable Mektup error suitable for JSONL terminal output.
 type Error struct {
@@ -113,6 +164,7 @@ type Invocation struct {
 	Position []string
 	Options  map[string][]string
 	Global   Globals
+	Resolved ResolvedGlobals
 }
 
 type Globals struct {
@@ -124,6 +176,16 @@ type Globals struct {
 	Debug    bool
 	Audit    bool
 	Help     bool
+}
+
+// ResolvedGlobals records effective configuration without reading or writing
+// config/state files. Flags win over dedicated environment variables, then
+// built-in defaults are used.
+type ResolvedGlobals struct {
+	Output   Presentation
+	Endpoint string
+	Config   string
+	StateDir string
 }
 
 func (i Invocation) Option(name string) string {
@@ -153,6 +215,49 @@ func DetectPresentation(explicitJSON, explicitHuman bool, env map[string]string)
 		return PresentationJSON, nil
 	}
 	return PresentationHuman, nil
+}
+
+func resolvePresentation(explicitJSON, explicitHuman bool, env map[string]string) (Presentation, error) {
+	if explicitJSON || explicitHuman {
+		return DetectPresentation(explicitJSON, explicitHuman, env)
+	}
+	if output := strings.ToLower(strings.TrimSpace(env["MEKTUP_OUTPUT"])); output != "" && output != "auto" {
+		switch output {
+		case string(PresentationJSON):
+			return PresentationJSON, nil
+		case string(PresentationHuman):
+			return PresentationHuman, nil
+		default:
+			return "", usageError("MEKTUP_OUTPUT must be json, human, or auto")
+		}
+	}
+	return DetectPresentation(false, false, env)
+}
+
+func resolveGlobals(inv Invocation, env map[string]string) (Invocation, *Error) {
+	config, state := defaultStatePaths(env)
+	endpoint := "local"
+	if inv.Global.Endpoint != "" {
+		endpoint = inv.Global.Endpoint
+	} else if value := strings.TrimSpace(env["MEKTUP_ENDPOINT"]); value != "" {
+		endpoint = value
+	}
+	if inv.Global.Config != "" {
+		config = inv.Global.Config
+	} else if value := strings.TrimSpace(env["MEKTUP_CONFIG"]); value != "" {
+		config = value
+	}
+	if inv.Global.StateDir != "" {
+		state = inv.Global.StateDir
+	} else if value := strings.TrimSpace(env["MEKTUP_STATE_DIR"]); value != "" {
+		state = value
+	}
+	output, err := resolvePresentation(inv.Global.JSON, inv.Global.Human, env)
+	if err != nil {
+		return inv, normalizeError(err)
+	}
+	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, Config: config, StateDir: state}
+	return inv, nil
 }
 
 func (a *App) env() map[string]string {
@@ -202,26 +307,37 @@ func (a *App) Run(args []string) int {
 	if a.Executor == nil {
 		a.Executor = defaultExecutor{}
 	}
+	if a.ID == nil {
+		a.ID = defaultID
+	}
 
 	env := a.env()
 	preJSON, preHuman := scanPresentation(args)
-	presentation, presentationErr := DetectPresentation(preJSON, preHuman, env)
 	parsed, parseErr := Parse(args)
+	presentation, presentationErr := resolvePresentation(preJSON, preHuman, env)
 	if presentationErr != nil {
 		return a.finish(presentation, Invocation{}, presentationErr)
 	}
 	if parseErr != nil {
 		return a.finish(presentation, parsed, parseErr)
 	}
+	if globalErr := validateGlobals(parsed); globalErr != nil {
+		return a.finish(presentation, parsed, globalErr)
+	}
 	if parsed.Global.JSON || parsed.Global.Human {
-		presentation, presentationErr = DetectPresentation(parsed.Global.JSON, parsed.Global.Human, env)
+		presentation, presentationErr = resolvePresentation(parsed.Global.JSON, parsed.Global.Human, env)
 		if presentationErr != nil {
 			return a.finish(presentation, parsed, presentationErr)
 		}
 	}
+	resolved, resolveErr := resolveGlobals(parsed, env)
+	if resolveErr != nil {
+		return a.finish(presentation, parsed, resolveErr)
+	}
+	parsed = resolved
 
 	if has(parsed, "skill") {
-		if parsed.Command != "--skill" || len(parsed.Position) != 0 || !onlyOptions(parsed, "skill", "json", "human", "debug", "audit", "endpoint", "config", "state-dir") {
+		if parsed.Command != "--skill" || len(parsed.Position) != 0 || !onlyOptions(parsed, "skill", "json", "human") {
 			return a.finish(presentation, parsed, usageError("use mektup --skill without operational arguments"))
 		}
 		return a.writeGuide()
@@ -238,12 +354,12 @@ func (a *App) Run(args []string) int {
 	}
 	switch parsed.Command {
 	case "version":
-		if len(parsed.Position) != 0 || !onlyOptions(parsed, "json", "human", "debug", "audit", "endpoint", "config", "state-dir") {
+		if len(parsed.Position) != 0 || !onlyOptions(parsed, "json", "human") {
 			return a.finish(presentation, parsed, usageError("usage: mektup version [--json]"))
 		}
 		return a.version(presentation)
 	case "completion":
-		if len(parsed.Position) != 1 || !onlyOptions(parsed, "json", "human", "debug", "audit", "endpoint", "config", "state-dir") {
+		if len(parsed.Position) != 1 || !onlyOptions(parsed, "json", "human") {
 			return a.finish(presentation, parsed, usageError("usage: mektup completion <zsh|bash|fish>"))
 		}
 		return a.completion(presentation, parsed.Position[0])
@@ -254,9 +370,9 @@ func (a *App) Run(args []string) int {
 	if err := validateInvocation(a, parsed); err != nil {
 		return a.finish(presentation, parsed, err)
 	}
-	_, err := a.Executor.Execute(context.Background(), parsed)
+	result, err := a.Executor.Execute(context.Background(), parsed)
 	if err == nil {
-		return a.finish(presentation, parsed, &Error{Code: "internal_error", Message: "operational command returned no result", Exit: ExitInternal})
+		return a.writeExecutionResult(presentation, parsed, result)
 	}
 	return a.finish(presentation, parsed, normalizeError(err))
 }
@@ -300,7 +416,7 @@ func (a *App) docs(p Presentation, inv Invocation) int {
 	if len(inv.Position) != 1 {
 		return a.finish(p, inv, usageError("usage: mektup docs agents|commands|envelopes|receipts [--json]"))
 	}
-	if !onlyOptions(inv, "json", "human", "debug", "audit", "endpoint", "config", "state-dir") {
+	if !onlyOptions(inv, "json", "human") {
 		return a.finish(p, inv, usageError("docs accepts only a documentation topic and presentation options"))
 	}
 	switch inv.Position[0] {
@@ -356,17 +472,83 @@ func (a *App) finish(p Presentation, inv Invocation, err error) int {
 	return int(e.Exit)
 }
 
+func (a *App) writeExecutionResult(p Presentation, inv Invocation, result ExecutionResult) int {
+	if result.Exit == 0 {
+		result.Exit = ExitSuccess
+	}
+	if p == PresentationJSON {
+		hasOutput := result.Receipt != nil
+		for _, event := range result.Events {
+			if event.Machine != nil {
+				hasOutput = true
+				if status := a.writeJSON(event.Machine); status != int(ExitSuccess) {
+					return status
+				}
+			}
+		}
+		if result.Receipt != nil {
+			if status := a.writeJSON(result.Receipt); status != int(ExitSuccess) {
+				return status
+			}
+		}
+		if !hasOutput {
+			return a.finish(p, inv, &Error{Code: "internal_error", Message: "operational command returned no machine output", Exit: ExitInternal})
+		}
+		return int(result.Exit)
+	}
+
+	hasOutput := strings.TrimSpace(result.Human) != ""
+	if result.Human != "" {
+		if _, err := io.WriteString(a.Out, ensureFinalNewline(result.Human)); err != nil {
+			return int(ExitInternal)
+		}
+	}
+	for _, event := range result.Events {
+		if strings.TrimSpace(event.Human) != "" {
+			hasOutput = true
+			if _, err := io.WriteString(a.Out, ensureFinalNewline(event.Human)); err != nil {
+				return int(ExitInternal)
+			}
+		}
+	}
+	if result.Receipt != nil {
+		hasOutput = true
+		if status := a.writeJSON(result.Receipt); status != int(ExitSuccess) {
+			return status
+		}
+	}
+	if !hasOutput {
+		return a.finish(p, inv, &Error{Code: "internal_error", Message: "operational command returned no human output", Exit: ExitInternal})
+	}
+	return int(result.Exit)
+}
+
 func (a *App) writeEvent(inv Invocation, e *Error) int {
 	operation := "operation.failed"
 	if e.Code == "invalid_arguments" {
 		operation = "operation.rejected"
 	}
+	eventID, eventErr := a.ID("evt_")
+	operationID, operationErr := a.ID("op_")
+	if eventErr != nil || operationErr != nil {
+		fallback := map[string]any{
+			"schema": EventSchema, "event": operation, "sequence": 1,
+			"timestamp": time.Now().UTC().Format(time.RFC3339Nano), "terminal": true, "ok": false,
+			"warnings": []any{}, "data": map[string]any{"error": map[string]any{
+				"code": "internal_error", "message": "unable to allocate operation identity", "retryable": false,
+			}},
+		}
+		if status := a.writeJSON(eventWithCommand(fallback, inv)); status != int(ExitSuccess) {
+			return status
+		}
+		return int(ExitInternal)
+	}
 	event := map[string]any{
 		"schema":      EventSchema,
 		"event":       operation,
-		"eventId":     newID("evt_"),
+		"eventId":     eventID,
 		"sequence":    1,
-		"operationId": newID("op_"),
+		"operationId": operationID,
 		"timestamp":   time.Now().UTC().Format(time.RFC3339Nano),
 		"terminal":    true,
 		"ok":          false,
@@ -430,15 +612,23 @@ func exitForError(code string) ExitCode {
 // tests without requiring them to duplicate process-level policy.
 func ExitCodeForError(code string) ExitCode { return exitForError(code) }
 
-func newID(prefix string) string {
+func defaultID(prefix string) (string, error) {
 	var bytes [16]byte
-	if _, err := rand.Read(bytes[:]); err != nil {
-		return prefix + "00000000-0000-4000-8000-000000000000"
+	// UUIDv7 stores Unix milliseconds in the first 48 bits and random data in
+	// the remaining bits. Never substitute a fixed ID when entropy fails.
+	millis := uint64(time.Now().UnixMilli()) & ((uint64(1) << 48) - 1)
+	bytes[0] = byte(millis >> 40)
+	bytes[1] = byte(millis >> 32)
+	bytes[2] = byte(millis >> 24)
+	bytes[3] = byte(millis >> 16)
+	bytes[4] = byte(millis >> 8)
+	bytes[5] = byte(millis)
+	if _, err := rand.Read(bytes[6:]); err != nil {
+		return "", fmt.Errorf("uuidv7 entropy unavailable: %w", err)
 	}
-	// UUID-shaped randomness is sufficient for CLI operation identity here.
-	bytes[6] = (bytes[6] & 0x0f) | 0x40
+	bytes[6] = (bytes[6] & 0x0f) | 0x70
 	bytes[8] = (bytes[8] & 0x3f) | 0x80
-	return prefix + fmt.Sprintf("%s-%s-%s-%s-%s", hex.EncodeToString(bytes[0:4]), hex.EncodeToString(bytes[4:6]), hex.EncodeToString(bytes[6:8]), hex.EncodeToString(bytes[8:10]), hex.EncodeToString(bytes[10:16]))
+	return prefix + fmt.Sprintf("%s-%s-%s-%s-%s", hex.EncodeToString(bytes[0:4]), hex.EncodeToString(bytes[4:6]), hex.EncodeToString(bytes[6:8]), hex.EncodeToString(bytes[8:10]), hex.EncodeToString(bytes[10:16])), nil
 }
 
 func ensureFinalNewline(s string) string {
