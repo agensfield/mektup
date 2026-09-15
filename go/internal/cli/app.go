@@ -406,10 +406,16 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 			if status != int(ExitSuccess) {
 				return status
 			}
-			return a.finish(presentation, parsed, normalizeError(streamErr))
+			if emitted && !state.terminal {
+				return a.writeStreamingFailure(presentation, parsed, state, streamErr)
+			}
+			return int(normalizeError(streamErr).Exit)
 		}
 		if !emitted {
 			return a.finish(presentation, parsed, &Error{Code: "internal_error", Message: "streaming executor returned no output", Effect: "unknown", Exit: ExitInternal})
+		}
+		if !state.terminal {
+			return a.writeStreamingFailure(presentation, parsed, state, &Error{Code: "internal_error", Message: "streaming executor ended without a terminal event", Effect: "unknown", Exit: ExitInternal})
 		}
 		return status
 	}
@@ -529,6 +535,9 @@ func (a *App) writeExecutionResultState(p Presentation, inv Invocation, result E
 		if err != nil || n != len(data) {
 			return int(ExitInternal)
 		}
+		if state != nil {
+			state.terminal = true
+		}
 		return int(result.Exit)
 	}
 	if p == PresentationJSON {
@@ -567,7 +576,31 @@ func (a *App) writeExecutionResultState(p Presentation, inv Invocation, result E
 	if !hasOutput {
 		return a.finish(p, inv, &Error{Code: "internal_error", Message: "operational command returned no human output", Exit: ExitInternal})
 	}
+	if state != nil {
+		if result.Receipt != nil {
+			state.lastReceipt = result.Receipt
+		}
+		if resultHasTerminal(result) {
+			state.terminal = true
+		}
+	}
 	return int(result.Exit)
+}
+
+func resultHasTerminal(result ExecutionResult) bool {
+	for _, event := range result.Events {
+		encoded, err := json.Marshal(event.Machine)
+		if err != nil {
+			continue
+		}
+		var object map[string]any
+		if json.Unmarshal(encoded, &object) == nil {
+			if terminal, ok := object["terminal"].(bool); ok && terminal {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // lifecycleEvents makes the executor boundary safe even while the domain
@@ -581,6 +614,7 @@ type streamLifecycleState struct {
 	operationID  string
 	nextSequence int
 	terminal     bool
+	lastReceipt  any
 }
 
 func (a *App) lifecycleEventsState(inv Invocation, result ExecutionResult, state *streamLifecycleState) ([]map[string]any, error) {
@@ -685,6 +719,7 @@ func (a *App) lifecycleEventsState(inv Invocation, result ExecutionResult, state
 	if result.Receipt != nil {
 		data := last["data"].(map[string]any)
 		data["receipt"] = result.Receipt
+		localState.lastReceipt = result.Receipt
 		if !result.Streaming {
 			last["terminal"] = true
 		}
@@ -702,6 +737,23 @@ func (a *App) lifecycleEventsState(inv Invocation, result ExecutionResult, state
 		localState.terminal = true
 	}
 	return events, nil
+}
+
+func (a *App) writeStreamingFailure(p Presentation, inv Invocation, state *streamLifecycleState, err error) int {
+	if p != PresentationJSON || state == nil || state.terminal {
+		return int(normalizeError(err).Exit)
+	}
+	e := normalizeError(err)
+	details := e.Details
+	if details == nil {
+		details = map[string]any{}
+	}
+	data := map[string]any{"error": map[string]any{"code": e.Code, "message": e.Message, "retryable": e.Retryable, "effectState": e.Effect, "details": details}}
+	if state.lastReceipt != nil {
+		data["receipt"] = state.lastReceipt
+	}
+	result := ExecutionResult{Events: []OutputEvent{{Machine: map[string]any{"schema": EventSchema, "event": "operation.failed", "terminal": true, "ok": false, "operationId": state.operationID, "data": data}}}, Exit: e.Exit, Streaming: true}
+	return a.writeExecutionResultState(p, inv, result, state)
 }
 
 func validUUIDv7ID(value, prefix string) bool {

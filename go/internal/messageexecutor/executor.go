@@ -603,14 +603,17 @@ func (e *Executor) messagingResult(kind string, accepted mektup.Receipt, wait *s
 	final := accepted
 	exit := cli.ExitSuccess
 	if wait != nil {
-		final = wait.Receipt
+		if wait.Receipt.ReceiptID != "" {
+			final = wait.Receipt
+		}
 		name := "reply.accepted"
+		validReplyEvidence := wait.Receipt.ReceiptID != "" && (wait.State == mektup.StateReplyAccepted || wait.State == mektup.StateReplyObserved)
 		if wait.State == mektup.StateReplyOutcomeUnknown {
 			name = "reply.unknown"
-		} else if wait.Incomplete {
+		} else if wait.Incomplete || !validReplyEvidence || (callErr != nil && wait.ReplyStatus != string(mektup.ReplyError)) {
 			name = "wait.incomplete"
 		}
-		ok := !wait.Incomplete && wait.State != mektup.StateReplyOutcomeUnknown && wait.ReplyStatus != string(mektup.ReplyError)
+		ok := validReplyEvidence && !wait.Incomplete && wait.State != mektup.StateReplyOutcomeUnknown && wait.ReplyStatus != string(mektup.ReplyError) && callErr == nil
 		terminal := lifecycle(name, final, true, ok)
 		if callErr != nil {
 			attachError(terminal, callErr)
@@ -676,6 +679,12 @@ func humanContent(content receipts.ContentResult) string {
 func waitExit(wait *service.WaitResult, err error) cli.ExitCode {
 	if wait.State == mektup.StateReplyOutcomeUnknown {
 		return cli.ExitUnknown
+	}
+	if wait.Receipt.ReceiptID == "" {
+		if err != nil {
+			return errorExit(err)
+		}
+		return cli.ExitIncomplete
 	}
 	if wait.Incomplete {
 		return cli.ExitIncomplete

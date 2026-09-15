@@ -176,6 +176,11 @@ func (s *Service) reply(ctx context.Context, resolver OriginalResolver, req Repl
 	if claim.Joined || claim.State == mektup.StateReplyAccepted || claim.State == mektup.StateReplyObserved {
 		out := ReplyResult{Receipt: receiptFor(op, e, claim.State, "")}
 		if claim.State == mektup.StateReplyAccepted || claim.State == mektup.StateReplyObserved {
+			if onAccepted != nil {
+				if callbackErr := onAccepted(out); callbackErr != nil {
+					return out, callbackErr
+				}
+			}
 			if req.Wait {
 				wait, waitErr := s.Wait(ctx, WaitRequest{Reference: replyID, Timeout: req.WaitTimeout})
 				out.Wait = &wait
