@@ -636,6 +636,9 @@ func (c *Client) call(ctx context.Context, request RPCRequest) (*RPCResult, erro
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, &CallError{Err: err, Canceled: true, Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
+	}
 	key, err := requestIDKey(request.ID)
 	if err != nil {
 		return nil, &CallError{Err: err, Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
