@@ -36,7 +36,7 @@ func TestStorageCheckIsReadOnlyAndStatusIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.DatabaseBytes != int64(len(before)) || status.SchemaVersion != 4 || status.JournalMode != "wal" {
+	if status.DatabaseBytes != int64(len(before)) || status.SchemaVersion != currentSchemaVersion || status.JournalMode != "wal" {
 		t.Fatalf("unexpected status %#v", status)
 	}
 	afterInfo, err := os.Stat(path)

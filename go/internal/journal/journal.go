@@ -43,6 +43,8 @@ const (
 
 type EvidenceState string
 
+const currentSchemaVersion = 5
+
 func (s EvidenceState) Valid() bool {
 	switch s {
 	case StateNotSent, StatePrepared, StateDispatchStarted, StateReplyClaimed,
@@ -188,33 +190,46 @@ func (j *Journal) init(ctx context.Context) error {
 	if err = tx.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
-	if version > 4 {
+	if version > currentSchemaVersion {
 		return fmt.Errorf("journal: unsupported schema version %d", version)
 	}
 	if version == 0 {
 		if _, err = tx.ExecContext(ctx, schemaV1); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
 		}
-		if _, err = tx.ExecContext(ctx, "PRAGMA user_version=4"); err != nil {
+		if _, err = tx.ExecContext(ctx, "PRAGMA user_version=5"); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
+		}
+		if err = validateV5Schema(ctx, tx); err != nil {
+			return err
 		}
 	} else if version == 1 {
 		if err = migrateV1ToV4(ctx, tx, j.leaseDuration); err != nil {
+			return err
+		}
+		if err = migrateV4ToV5(ctx, tx); err != nil {
 			return err
 		}
 	} else if version == 2 {
 		if err = migrateV2ToV4(ctx, tx); err != nil {
 			return err
 		}
+		if err = migrateV4ToV5(ctx, tx); err != nil {
+			return err
+		}
 	} else if version == 3 {
 		if err = migrateV3ToV4(ctx, tx); err != nil {
 			return err
 		}
-	} else if version == 4 {
-		if err = ensureSupplementalTables(ctx, tx); err != nil {
+		if err = migrateV4ToV5(ctx, tx); err != nil {
 			return err
 		}
-		if err = validateV4Schema(ctx, tx); err != nil {
+	} else if version == 4 {
+		if err = migrateV4ToV5(ctx, tx); err != nil {
+			return err
+		}
+	} else if version == currentSchemaVersion {
+		if err = validateV5Schema(ctx, tx); err != nil {
 			return err
 		}
 	}
@@ -320,6 +335,10 @@ CREATE TABLE IF NOT EXISTS receipts (
  state TEXT NOT NULL,
  created_at INTEGER NOT NULL,
  updated_at INTEGER NOT NULL,
+ source_endpoint_id TEXT NOT NULL DEFAULT '',
+ source_thread_id TEXT NOT NULL DEFAULT '',
+ target_endpoint_id TEXT NOT NULL DEFAULT '',
+ target_thread_id TEXT NOT NULL DEFAULT '',
  document TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS receipts_operation ON receipts(operation_id);
@@ -327,6 +346,7 @@ CREATE INDEX IF NOT EXISTS receipts_message ON receipts(message_id);
 CREATE TABLE IF NOT EXISTS blockers (
  method TEXT NOT NULL,
  correlation_id TEXT NOT NULL,
+ generation TEXT NOT NULL DEFAULT '',
  first_seen INTEGER NOT NULL,
  last_seen INTEGER NOT NULL,
  resolved_at INTEGER,
@@ -336,7 +356,7 @@ CREATE TABLE IF NOT EXISTS blockers (
  item_id TEXT NOT NULL DEFAULT '',
  operation_id TEXT NOT NULL DEFAULT '',
  message_id TEXT NOT NULL DEFAULT '',
- PRIMARY KEY(method, correlation_id)
+ PRIMARY KEY(endpoint_id, generation, method, correlation_id)
 );
 CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen);
 `
@@ -350,16 +370,20 @@ func migrateV1ToV4(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration)
 		`ALTER TABLE operations ADD COLUMN custody_route TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE operations ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE reply_claims ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
+		`CREATE TABLE IF NOT EXISTS reply_winners (original_id TEXT PRIMARY KEY, reply_id TEXT NOT NULL, committed_at INTEGER NOT NULL, commit_seq INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS observations (reply_id TEXT PRIMARY KEY, native_item_id TEXT NOT NULL, observed_at INTEGER NOT NULL, digest TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, operation_id TEXT, reply_id TEXT, state TEXT NOT NULL, at INTEGER NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS events_operation ON events(operation_id, seq)`,
 		`CREATE TABLE IF NOT EXISTS manual_resolutions (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, evidence_ref TEXT NOT NULL, presentation TEXT NOT NULL DEFAULT '', resolved_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS operation_acceptances (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS reply_acceptances (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS receipts (receipt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, message_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, document TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS receipts (receipt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, message_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source_endpoint_id TEXT NOT NULL DEFAULT '', source_thread_id TEXT NOT NULL DEFAULT '', target_endpoint_id TEXT NOT NULL DEFAULT '', target_thread_id TEXT NOT NULL DEFAULT '', document TEXT NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS receipts_operation ON receipts(operation_id)`,
 		`CREATE INDEX IF NOT EXISTS receipts_message ON receipts(message_id)`,
-		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(method, correlation_id))`,
+		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, generation TEXT NOT NULL DEFAULT '', first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(endpoint_id, generation, method, correlation_id))`,
 		`CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen)`,
-		`PRAGMA user_version=4`,
+		`PRAGMA user_version=5`,
 	}
 	for _, stmt := range stmts {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
@@ -402,10 +426,10 @@ func migrateV2ToV4(ctx context.Context, tx *sql.Tx) error {
 		`CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS operation_acceptances (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS reply_acceptances (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS receipts (receipt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, message_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, document TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS receipts (receipt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, message_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source_endpoint_id TEXT NOT NULL DEFAULT '', source_thread_id TEXT NOT NULL DEFAULT '', target_endpoint_id TEXT NOT NULL DEFAULT '', target_thread_id TEXT NOT NULL DEFAULT '', document TEXT NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS receipts_operation ON receipts(operation_id)`,
 		`CREATE INDEX IF NOT EXISTS receipts_message ON receipts(message_id)`,
-		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(method, correlation_id))`,
+		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, generation TEXT NOT NULL DEFAULT '', first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(endpoint_id, generation, method, correlation_id))`,
 		`CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen)`,
 		`PRAGMA user_version=4`,
 	} {
@@ -421,42 +445,9 @@ func ensureV4Tables(ctx context.Context, tx *sql.Tx) error {
 		`CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TEXT NOT NULL, created_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS operation_acceptances (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS reply_acceptances (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, evidence_ref TEXT NOT NULL, recorded_at INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS receipts (receipt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, message_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, document TEXT NOT NULL)`,
-		`CREATE INDEX IF NOT EXISTS receipts_operation ON receipts(operation_id)`,
-		`CREATE INDEX IF NOT EXISTS receipts_message ON receipts(message_id)`,
-		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(method, correlation_id))`,
-		`CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen)`,
 		`PRAGMA user_version=4`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("journal migration: %w", err)
-		}
-	}
-	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(manual_resolutions)")
-	if err != nil {
-		return fmt.Errorf("journal migration: %w", err)
-	}
-	hasPresentation := false
-	for rows.Next() {
-		var cid int
-		var name, kind string
-		var notNull, pk int
-		var defaultValue any
-		if err := rows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
-			rows.Close()
-			return fmt.Errorf("journal migration: %w", err)
-		}
-		if name == "presentation" {
-			hasPresentation = true
-		}
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("journal migration: %w", err)
-	}
-	rows.Close()
-	if !hasPresentation {
-		if _, err := tx.ExecContext(ctx, "ALTER TABLE manual_resolutions ADD COLUMN presentation TEXT NOT NULL DEFAULT ''"); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
 		}
 	}
@@ -468,14 +459,82 @@ func ensureV4Tables(ctx context.Context, tx *sql.Tx) error {
 // missing acceptance table would turn corruption into a successful open.
 func ensureSupplementalTables(ctx context.Context, tx *sql.Tx) error {
 	for _, stmt := range []string{
-		`CREATE TABLE IF NOT EXISTS receipts (receipt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, message_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, document TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS receipts (receipt_id TEXT PRIMARY KEY, operation_id TEXT NOT NULL, message_id TEXT NOT NULL, state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, source_endpoint_id TEXT NOT NULL DEFAULT '', source_thread_id TEXT NOT NULL DEFAULT '', target_endpoint_id TEXT NOT NULL DEFAULT '', target_thread_id TEXT NOT NULL DEFAULT '', document TEXT NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS receipts_operation ON receipts(operation_id)`,
 		`CREATE INDEX IF NOT EXISTS receipts_message ON receipts(message_id)`,
-		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(method, correlation_id))`,
+		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, generation TEXT NOT NULL DEFAULT '', first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(endpoint_id, generation, method, correlation_id))`,
 		`CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
+		}
+	}
+	blockerRows, err := tx.QueryContext(ctx, "PRAGMA table_info(blockers)")
+	if err != nil {
+		return fmt.Errorf("journal migration: %w", err)
+	}
+	hasGeneration := false
+	for blockerRows.Next() {
+		var cid int
+		var name, kind string
+		var notNull, pk int
+		var defaultValue any
+		if err := blockerRows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			blockerRows.Close()
+			return fmt.Errorf("journal migration: %w", err)
+		}
+		if name == "generation" {
+			hasGeneration = true
+		}
+	}
+	if err := blockerRows.Err(); err != nil {
+		blockerRows.Close()
+		return fmt.Errorf("journal migration: %w", err)
+	}
+	blockerRows.Close()
+	if !hasGeneration {
+		if _, err := tx.ExecContext(ctx, `CREATE TABLE blockers_v5 (method TEXT NOT NULL, correlation_id TEXT NOT NULL, generation TEXT NOT NULL DEFAULT '', first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(endpoint_id, generation, method, correlation_id))`); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO blockers_v5(method,correlation_id,generation,first_seen,last_seen,resolved_at,endpoint_id,thread_id,turn_id,item_id,operation_id,message_id) SELECT method,correlation_id,'',first_seen,last_seen,resolved_at,endpoint_id,thread_id,turn_id,item_id,operation_id,message_id FROM blockers`); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `DROP TABLE blockers`); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE blockers_v5 RENAME TO blockers`); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen)`); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+	}
+	receiptRows, err := tx.QueryContext(ctx, "PRAGMA table_info(receipts)")
+	if err != nil {
+		return fmt.Errorf("journal migration: %w", err)
+	}
+	receiptColumns := make(map[string]bool)
+	for receiptRows.Next() {
+		var cid int
+		var name, kind string
+		var notNull, pk int
+		var defaultValue any
+		if err := receiptRows.Scan(&cid, &name, &kind, &notNull, &defaultValue, &pk); err != nil {
+			receiptRows.Close()
+			return fmt.Errorf("journal migration: %w", err)
+		}
+		receiptColumns[name] = true
+	}
+	if err := receiptRows.Err(); err != nil {
+		receiptRows.Close()
+		return fmt.Errorf("journal migration: %w", err)
+	}
+	receiptRows.Close()
+	for _, column := range []string{"source_endpoint_id", "source_thread_id", "target_endpoint_id", "target_thread_id"} {
+		if !receiptColumns[column] {
+			if _, err := tx.ExecContext(ctx, "ALTER TABLE receipts ADD COLUMN "+column+" TEXT NOT NULL DEFAULT ''"); err != nil {
+				return fmt.Errorf("journal migration: %w", err)
+			}
 		}
 	}
 	rows, err := tx.QueryContext(ctx, "PRAGMA table_info(manual_resolutions)")
@@ -516,6 +575,22 @@ func migrateV3ToV4(ctx context.Context, tx *sql.Tx) error {
 	return repairV3PositiveReplies(ctx, tx)
 }
 
+func migrateV4ToV5(ctx context.Context, tx *sql.Tx) error {
+	// Validate the approved v4 custody foundation before creating the receipt
+	// delta. A damaged v4 database must fail closed, never be repaired by this
+	// migration merely because a new table is absent.
+	if err := validateV4Schema(ctx, tx); err != nil {
+		return err
+	}
+	if err := ensureSupplementalTables(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version=5"); err != nil {
+		return fmt.Errorf("journal migration: %w", err)
+	}
+	return nil
+}
+
 func validateV4Schema(ctx context.Context, tx *sql.Tx) error {
 	required := []string{"meta", "store_id_aliases", "operations", "attempts", "reply_claims", "reply_winners", "observations", "events", "manual_resolutions", "operation_acceptances", "reply_acceptances"}
 	for _, name := range required {
@@ -525,6 +600,38 @@ func validateV4Schema(ctx context.Context, tx *sql.Tx) error {
 		}
 		if n != 1 {
 			return fmt.Errorf("%w: required v4 table %s is missing", ErrCorrupt, name)
+		}
+	}
+	return nil
+}
+
+func validateV5Schema(ctx context.Context, tx *sql.Tx) error {
+	if err := validateV4Schema(ctx, tx); err != nil {
+		return err
+	}
+	for _, name := range []string{"receipts", "blockers"} {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", name).Scan(&count); err != nil {
+			return fmt.Errorf("journal schema validation: %w", err)
+		}
+		if count != 1 {
+			return fmt.Errorf("%w: required v5 table %s is missing", ErrCorrupt, name)
+		}
+	}
+	var presentation int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('manual_resolutions') WHERE name='presentation'").Scan(&presentation); err != nil {
+		return fmt.Errorf("journal schema validation: %w", err)
+	}
+	if presentation != 1 {
+		return fmt.Errorf("%w: required v5 manual-resolution presentation column is missing", ErrCorrupt)
+	}
+	for _, column := range []string{"source_endpoint_id", "source_thread_id", "target_endpoint_id", "target_thread_id"} {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('receipts') WHERE name=?", column).Scan(&count); err != nil {
+			return fmt.Errorf("journal schema validation: %w", err)
+		}
+		if count != 1 {
+			return fmt.Errorf("%w: required v5 receipt column %s is missing", ErrCorrupt, column)
 		}
 	}
 	return nil

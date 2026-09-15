@@ -31,11 +31,11 @@ func TestReceiptAndResolvedBlockerRetentionIsBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if maintenance.Actions[1].Eligible != 2 || maintenance.Actions[1].Changed != 2 {
+	if maintenance.Actions[1].Eligible != 1 || maintenance.Actions[1].Changed != 1 {
 		t.Fatalf("retention receipt = %#v", maintenance)
 	}
-	if _, err := j.Receipt(context.Background(), receipt.ReceiptID); err != ErrNotFound {
-		t.Fatalf("receipt after retention = %v", err)
+	if _, err := j.Receipt(context.Background(), receipt.ReceiptID); err != nil {
+		t.Fatalf("protected receipt after retention = %v", err)
 	}
 	blockers, err := j.ListBlockers(context.Background(), BlockerQuery{Limit: 1})
 	if err != nil {

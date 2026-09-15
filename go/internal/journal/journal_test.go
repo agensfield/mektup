@@ -663,7 +663,7 @@ func TestForeignKeyAndMigrationAreTransactional(t *testing.T) {
 	if err := j.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
+	if version != currentSchemaVersion {
 		t.Fatalf("schema version %d", version)
 	}
 }
@@ -718,7 +718,7 @@ PRAGMA user_version=1;`
 	if err := j.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
+	if version != currentSchemaVersion {
 		t.Fatalf("migrated version %d", version)
 	}
 	var columns int
@@ -755,7 +755,7 @@ func TestV3PartialUpgradeIsCompletedIdempotently(t *testing.T) {
 	if err := j2.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
+	if version != currentSchemaVersion {
 		t.Fatalf("partial migration version %d", version)
 	}
 	for _, table := range []string{"store_id_aliases", "operation_acceptances", "reply_acceptances"} {
@@ -778,7 +778,7 @@ func TestV3PartialUpgradeIsCompletedIdempotently(t *testing.T) {
 	if err := j3.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 4 {
+	if version != currentSchemaVersion {
 		t.Fatalf("idempotent migration version %d", version)
 	}
 }

@@ -199,7 +199,7 @@ func (j *Journal) StorageStatus(ctx context.Context) (StorageStatus, error) {
 	}
 	status.RetentionEligible += replies
 	var receipts, blockers int64
-	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM receipts WHERE `+retentionReceiptPredicate, retentionReceiptArgs(status.RetentionCutoff.UnixNano())...).Scan(&receipts); err != nil {
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM receipts r WHERE `+retentionReceiptPredicate, retentionReceiptArgs(status.RetentionCutoff.UnixNano())...).Scan(&receipts); err != nil {
 		return status, classifyStorageError(err)
 	}
 	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM blockers WHERE resolved_at IS NOT NULL AND resolved_at <= ?`, status.RetentionCutoff.UnixNano()).Scan(&blockers); err != nil {
@@ -242,10 +242,13 @@ const retentionReplyPredicate = `c.state IN (?,?) AND c.updated_at <= ? AND EXIS
 	SELECT 1 FROM operations o WHERE o.message_id = c.original_id AND ` + retentionOperationPredicate + `
 )`
 
-const retentionReceiptPredicate = `state IN (?,?,?,?,?,?) AND updated_at <= ?`
+const retentionReceiptPredicate = `r.state IN (?,?,?,?,?,?) AND r.updated_at <= ? AND EXISTS (
+	SELECT 1 FROM operations o WHERE o.operation_id = r.operation_id AND ` + retentionOperationPredicate + `
+)`
 
 func retentionReceiptArgs(cutoff int64) []any {
-	return []any{string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), string(StateReplyAccepted), string(StateReplyObserved), cutoff}
+	args := []any{string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), string(StateReplyAccepted), string(StateReplyObserved), cutoff}
+	return append(args, retentionOperationArgs(cutoff)...)
 }
 
 func retentionReplyArgs(cutoff int64) []any {
@@ -317,16 +320,32 @@ func validateReadOnlySchema(ctx context.Context, db *sql.DB) error {
 	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		return classifyStorageError(err)
 	}
-	if version != 4 {
+	if version != currentSchemaVersion {
 		return fmt.Errorf("%w: unsupported schema version %d", ErrStorageCorrupt, version)
 	}
-	for _, name := range []string{"meta", "store_id_aliases", "operations", "attempts", "reply_claims", "reply_winners", "observations", "events", "manual_resolutions", "operation_acceptances", "reply_acceptances"} {
+	for _, name := range []string{"meta", "store_id_aliases", "operations", "attempts", "reply_claims", "reply_winners", "observations", "events", "manual_resolutions", "operation_acceptances", "reply_acceptances", "receipts", "blockers"} {
 		var count int
 		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", name).Scan(&count); err != nil {
 			return classifyStorageError(err)
 		}
 		if count != 1 {
-			return fmt.Errorf("%w: required v4 table %s is missing", ErrStorageCorrupt, name)
+			return fmt.Errorf("%w: required v5 table %s is missing", ErrStorageCorrupt, name)
+		}
+	}
+	var presentation int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('manual_resolutions') WHERE name='presentation'").Scan(&presentation); err != nil {
+		return classifyStorageError(err)
+	}
+	if presentation != 1 {
+		return fmt.Errorf("%w: required v5 manual-resolution presentation column is missing", ErrStorageCorrupt)
+	}
+	for _, column := range []string{"source_endpoint_id", "source_thread_id", "target_endpoint_id", "target_thread_id"} {
+		var count int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('receipts') WHERE name=?", column).Scan(&count); err != nil {
+			return classifyStorageError(err)
+		}
+		if count != 1 {
+			return fmt.Errorf("%w: required v5 receipt column %s is missing", ErrStorageCorrupt, column)
 		}
 	}
 	return nil
@@ -375,7 +394,7 @@ func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) 
 	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims c WHERE `+retentionReplyPredicate, retentionReplyArgs(cutoff.UnixNano())...).Scan(&eligibleReplies); err != nil {
 		return receipt, classifyStorageError(err)
 	}
-	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM receipts WHERE `+retentionReceiptPredicate, retentionReceiptArgs(cutoff.UnixNano())...).Scan(&eligibleReceipts); err != nil {
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM receipts r WHERE `+retentionReceiptPredicate, retentionReceiptArgs(cutoff.UnixNano())...).Scan(&eligibleReceipts); err != nil {
 		return receipt, classifyStorageError(err)
 	}
 	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM blockers WHERE resolved_at IS NOT NULL AND resolved_at <= ?`, cutoff.UnixNano()).Scan(&eligibleBlockers); err != nil {
@@ -415,6 +434,19 @@ func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) 
 		if _, err := tx.Exec(`INSERT INTO mektup_prune_replies SELECT c.reply_id FROM reply_claims c WHERE `+retentionReplyPredicate, replyArgs...); err != nil {
 			return err
 		}
+		if _, err := tx.Exec(`CREATE TEMP TABLE mektup_prune_receipts(receipt_id TEXT PRIMARY KEY)`); err != nil {
+			return err
+		}
+		receiptArgs := retentionReceiptArgs(cutoff.UnixNano())
+		if _, err := tx.Exec(`INSERT INTO mektup_prune_receipts SELECT r.receipt_id FROM receipts r WHERE `+retentionReceiptPredicate, receiptArgs...); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`CREATE TEMP TABLE mektup_prune_blockers(endpoint_id TEXT, generation TEXT, method TEXT, correlation_id TEXT, PRIMARY KEY(endpoint_id, generation, method, correlation_id))`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`INSERT INTO mektup_prune_blockers SELECT endpoint_id,generation,method,correlation_id FROM blockers WHERE resolved_at IS NOT NULL AND resolved_at <= ?`, cutoff.UnixNano()); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(`DELETE FROM events WHERE operation_id IN (SELECT operation_id FROM mektup_prune_operations)`); err != nil {
 			return err
 		}
@@ -436,18 +468,24 @@ func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) 
 		}
 		n, _ = res.RowsAffected()
 		pruned += n
-		res, err = tx.Exec(`DELETE FROM receipts WHERE `+retentionReceiptPredicate, retentionReceiptArgs(cutoff.UnixNano())...)
+		res, err = tx.Exec(`DELETE FROM receipts WHERE receipt_id IN (SELECT receipt_id FROM mektup_prune_receipts)`)
 		if err != nil {
 			return err
 		}
 		n, _ = res.RowsAffected()
 		pruned += n
-		res, err = tx.Exec(`DELETE FROM blockers WHERE resolved_at IS NOT NULL AND resolved_at <= ?`, cutoff.UnixNano())
+		res, err = tx.Exec(`DELETE FROM blockers WHERE (endpoint_id,generation,method,correlation_id) IN (SELECT endpoint_id,generation,method,correlation_id FROM mektup_prune_blockers)`)
 		if err != nil {
 			return err
 		}
 		n, _ = res.RowsAffected()
 		pruned += n
+		if _, err := tx.Exec(`DROP TABLE mektup_prune_receipts`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DROP TABLE mektup_prune_blockers`); err != nil {
+			return err
+		}
 		_, err = tx.Exec(`DROP TABLE mektup_prune_replies`)
 		if err != nil {
 			return err
