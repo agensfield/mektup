@@ -61,6 +61,27 @@ func TestStreamingExecutorEmitsAcceptanceBeforeWaitTerminal(t *testing.T) {
 	if first["operationId"] != second["operationId"] {
 		t.Fatalf("operation IDs diverged: %v vs %v", first["operationId"], second["operationId"])
 	}
+	if first["sequence"] != float64(1) || second["sequence"] != float64(2) {
+		t.Fatalf("stream sequence reset: first=%v second=%v", first["sequence"], second["sequence"])
+	}
+}
+
+type failFirstWriter struct{ writes int }
+
+func (w *failFirstWriter) Write([]byte) (int, error) {
+	w.writes++
+	if w.writes == 1 {
+		return 0, errors.New("broken output")
+	}
+	return 1, nil
+}
+
+func TestStreamingOutputFailureIsSticky(t *testing.T) {
+	writer := &failFirstWriter{}
+	app := &App{Out: writer, Err: &bytes.Buffer{}, Executor: streamingExecutor{operationID: "op_04999999-9999-7999-8999-999999999999"}}
+	if code := app.Run([]string{"send", "target", "hello", "--json"}); code == int(ExitSuccess) || writer.writes != 1 {
+		t.Fatalf("stream output failure was swallowed: code=%d writes=%d", code, writer.writes)
+	}
 }
 
 func runTest(t *testing.T, args ...string) (int, string, string) {

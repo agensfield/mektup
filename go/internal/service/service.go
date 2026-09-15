@@ -306,6 +306,23 @@ type SendResult struct {
 }
 
 func (s *Service) Send(ctx context.Context, req SendRequest) (SendResult, error) {
+	return s.send(ctx, req, nil)
+}
+
+// AcceptanceCallback is invoked only after the accepted evidence has been
+// durably recorded (and any persistent-target cleanup has completed), but
+// before an optional correlated wait begins. Returning an error stops the
+// staged operation before entering the wait; the accepted receipt remains the
+// caller's evidence and is never replayed by this seam.
+type AcceptanceCallback func(SendResult) error
+
+// SendWithAcceptance exposes the durable-acceptance boundary without making
+// callers duplicate delivery, retry, fencing, or cleanup orchestration.
+func (s *Service) SendWithAcceptance(ctx context.Context, req SendRequest, onAccepted AcceptanceCallback) (SendResult, error) {
+	return s.send(ctx, req, onAccepted)
+}
+
+func (s *Service) send(ctx context.Context, req SendRequest, onAccepted AcceptanceCallback) (SendResult, error) {
 	if err := s.validate(); err != nil {
 		return SendResult{}, err
 	}
@@ -467,6 +484,11 @@ func (s *Service) Send(ctx context.Context, req SendRequest) (SendResult, error)
 	}
 	receipt := receiptFor(op, envelope, mektup.StateAccepted, result.TurnID)
 	out := SendResult{Receipt: receipt}
+	if onAccepted != nil {
+		if callbackErr := onAccepted(out); callbackErr != nil {
+			return out, callbackErr
+		}
+	}
 	if req.Wait {
 		wait, waitErr := s.Wait(ctx, WaitRequest{Reference: messageID, Timeout: req.WaitTimeout})
 		out.Wait = &wait

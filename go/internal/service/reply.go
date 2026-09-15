@@ -50,6 +50,19 @@ type ReplyResult struct {
 }
 
 func (s *Service) Reply(ctx context.Context, resolver OriginalResolver, req ReplyRequest) (ReplyResult, error) {
+	return s.reply(ctx, resolver, req, nil)
+}
+
+// ReplyWithAcceptance exposes the durable reply acceptance boundary before an
+// optional correlated child-reply wait. It reuses the ordinary fenced claim,
+// delivery, heartbeat, commit, and cleanup path.
+type ReplyAcceptanceCallback func(ReplyResult) error
+
+func (s *Service) ReplyWithAcceptance(ctx context.Context, resolver OriginalResolver, req ReplyRequest, onAccepted ReplyAcceptanceCallback) (ReplyResult, error) {
+	return s.reply(ctx, resolver, req, onAccepted)
+}
+
+func (s *Service) reply(ctx context.Context, resolver OriginalResolver, req ReplyRequest, onAccepted ReplyAcceptanceCallback) (ReplyResult, error) {
 	if err := s.validate(); err != nil {
 		return ReplyResult{}, err
 	}
@@ -342,6 +355,11 @@ replyAccepted:
 		}
 	}
 	out := ReplyResult{Receipt: receiptFor(op, e, mektup.StateReplyAccepted, delivery.TurnID)}
+	if onAccepted != nil {
+		if callbackErr := onAccepted(out); callbackErr != nil {
+			return out, callbackErr
+		}
+	}
 	if req.Wait {
 		wait, waitErr := s.Wait(ctx, WaitRequest{Reference: replyID, Timeout: req.WaitTimeout})
 		out.Wait = &wait

@@ -392,12 +392,24 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 	}
 	if streaming, ok := a.Executor.(StreamingExecutor); ok {
 		status := int(ExitSuccess)
+		emitted := false
+		state := &streamLifecycleState{}
 		streamErr := streaming.ExecuteStream(ctx, parsed, func(result ExecutionResult) error {
-			status = a.writeExecutionResult(presentation, parsed, result)
+			emitted = true
+			status = a.writeExecutionResultState(presentation, parsed, result, state)
+			if status != int(ExitSuccess) {
+				return errors.New("streaming execution output failed")
+			}
 			return nil
 		})
 		if streamErr != nil {
+			if status != int(ExitSuccess) {
+				return status
+			}
 			return a.finish(presentation, parsed, normalizeError(streamErr))
+		}
+		if !emitted {
+			return a.finish(presentation, parsed, &Error{Code: "internal_error", Message: "streaming executor returned no output", Effect: "unknown", Exit: ExitInternal})
 		}
 		return status
 	}
@@ -504,17 +516,23 @@ func (a *App) finish(p Presentation, inv Invocation, err error) int {
 }
 
 func (a *App) writeExecutionResult(p Presentation, inv Invocation, result ExecutionResult) int {
+	return a.writeExecutionResultState(p, inv, result, nil)
+}
+
+func (a *App) writeExecutionResultState(p Presentation, inv Invocation, result ExecutionResult, state *streamLifecycleState) int {
 	if result.Exit == 0 {
 		result.Exit = ExitSuccess
 	}
-	if p == PresentationJSON {
-		if len(result.RawJSON) > 0 {
-			if _, err := a.Out.Write(append(append([]byte(nil), result.RawJSON...), '\n')); err != nil {
-				return int(ExitInternal)
-			}
-			return int(result.Exit)
+	if len(result.RawJSON) > 0 {
+		data := append(append([]byte(nil), result.RawJSON...), '\n')
+		n, err := a.Out.Write(data)
+		if err != nil || n != len(data) {
+			return int(ExitInternal)
 		}
-		events, err := a.lifecycleEvents(inv, result)
+		return int(result.Exit)
+	}
+	if p == PresentationJSON {
+		events, err := a.lifecycleEventsState(inv, result, state)
 		if err != nil {
 			return a.internalFailure(err.Error())
 		}
@@ -556,6 +574,20 @@ func (a *App) writeExecutionResult(p Presentation, inv Invocation, result Execut
 // packages are being integrated. A receipt is data on the terminal lifecycle
 // event, never a second bare JSON line after that event.
 func (a *App) lifecycleEvents(inv Invocation, result ExecutionResult) ([]map[string]any, error) {
+	return a.lifecycleEventsState(inv, result, nil)
+}
+
+type streamLifecycleState struct {
+	operationID  string
+	nextSequence int
+	terminal     bool
+}
+
+func (a *App) lifecycleEventsState(inv Invocation, result ExecutionResult, state *streamLifecycleState) ([]map[string]any, error) {
+	localState := state
+	if localState == nil {
+		localState = &streamLifecycleState{}
+	}
 	if len(result.Events) == 0 && result.Receipt == nil {
 		return nil, errors.New("operational command returned no machine output")
 	}
@@ -581,7 +613,7 @@ func (a *App) lifecycleEvents(inv Invocation, result ExecutionResult) ([]map[str
 	if len(events) == 0 {
 		return nil, errors.New("operational command returned no machine output")
 	}
-	operationID := ""
+	operationID := localState.operationID
 	for _, event := range events {
 		if supplied, ok := event["operationId"].(string); ok && supplied != "" {
 			if !validUUIDv7ID(supplied, "op_") {
@@ -603,6 +635,11 @@ func (a *App) lifecycleEvents(inv Invocation, result ExecutionResult) ([]map[str
 			return nil, fmt.Errorf("generated operationId is not a UUIDv7: %q", operationID)
 		}
 	}
+	localState.operationID = operationID
+	if localState.terminal {
+		return nil, errors.New("streaming executor emitted output after a terminal event")
+	}
+	startSequence := localState.nextSequence
 	for index, event := range events {
 		if schema, ok := event["schema"].(string); ok && schema != "" && schema != EventSchema {
 			return nil, fmt.Errorf("executor event schema %q is not %s", schema, EventSchema)
@@ -627,7 +664,7 @@ func (a *App) lifecycleEvents(inv Invocation, result ExecutionResult) ([]map[str
 		if _, ok := event["timestamp"].(string); !ok || event["timestamp"] == "" {
 			event["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
 		}
-		event["sequence"] = index + 1
+		event["sequence"] = startSequence + index + 1
 		if _, ok := event["terminal"].(bool); !ok {
 			event["terminal"] = false
 		}
@@ -659,6 +696,10 @@ func (a *App) lifecycleEvents(inv Invocation, result ExecutionResult) ([]map[str
 		if terminal, _ := last["terminal"].(bool); !terminal {
 			last["terminal"] = true
 		}
+	}
+	localState.nextSequence += len(events)
+	if terminal, _ := last["terminal"].(bool); terminal {
+		localState.terminal = true
 	}
 	return events, nil
 }

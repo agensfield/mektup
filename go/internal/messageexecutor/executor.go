@@ -27,6 +27,11 @@ type MessagingService interface {
 	Wait(context.Context, service.WaitRequest) (service.WaitResult, error)
 }
 
+type AcceptanceMessagingService interface {
+	SendWithAcceptance(context.Context, service.SendRequest, service.AcceptanceCallback) (service.SendResult, error)
+	ReplyWithAcceptance(context.Context, service.OriginalResolver, service.ReplyRequest, service.ReplyAcceptanceCallback) (service.ReplyResult, error)
+}
+
 type ServiceFactory func(context.Context, cli.Invocation) (MessagingService, error)
 type OriginalResolverFactory func(context.Context, cli.Invocation) (service.OriginalResolver, error)
 type InputPort interface {
@@ -69,6 +74,7 @@ type Executor struct{ ports Ports }
 func New(ports Ports) *Executor { return &Executor{ports: ports} }
 
 var _ cli.Executor = (*Executor)(nil)
+var _ cli.StreamingExecutor = (*Executor)(nil)
 var _ ReceiptStore = (*receipts.Store)(nil)
 
 func (e *Executor) Execute(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
@@ -88,6 +94,130 @@ func (e *Executor) Execute(ctx context.Context, inv cli.Invocation) (cli.Executi
 	}
 }
 
+// ExecuteStream is the staged CLI boundary for send/reply --wait. Concrete
+// services that implement AcceptanceMessagingService call the emit function
+// after durable acceptance and before entering their correlated wait. The
+// compatibility path remains buffered for injected legacy services that have
+// no acceptance callback, while the production service uses the staged path.
+func (e *Executor) ExecuteStream(ctx context.Context, inv cli.Invocation, emit func(cli.ExecutionResult) error) error {
+	if emit == nil {
+		return cliErr("internal_error", "streaming output callback is required", "unknown", cli.ExitInternal)
+	}
+	switch inv.Command {
+	case "send":
+		svc, request, err := e.sendInvocation(ctx, inv)
+		if err != nil {
+			return err
+		}
+		stream, ok := svc.(AcceptanceMessagingService)
+		if request.Wait && !ok {
+			return cliErr("internal_error", "send --wait requires the durable acceptance stream", "unknown", cli.ExitInternal)
+		}
+		if !request.Wait {
+			result, callErr := svc.Send(ctx, request)
+			output, resultErr := e.messagingResult("send", result.Receipt, result.Wait, callErr)
+			if resultErr != nil {
+				return resultErr
+			}
+			output.Streaming = true
+			return emit(output)
+		}
+		return e.streamSend(ctx, stream, request, emit)
+	case "reply":
+		svc, original, request, err := e.replyInvocation(ctx, inv)
+		if err != nil {
+			return err
+		}
+		stream, ok := svc.(AcceptanceMessagingService)
+		if request.Wait && !ok {
+			return cliErr("internal_error", "reply --wait requires the durable acceptance stream", "unknown", cli.ExitInternal)
+		}
+		if !request.Wait {
+			result, callErr := svc.Reply(ctx, original, request)
+			output, resultErr := e.messagingResult("reply", result.Receipt, result.Wait, callErr)
+			if resultErr != nil {
+				return resultErr
+			}
+			output.Streaming = true
+			return emit(output)
+		}
+		return e.streamReply(ctx, stream, original, request, emit)
+	default:
+		result, err := e.Execute(ctx, inv)
+		if err != nil {
+			return err
+		}
+		result.Streaming = true
+		return emit(result)
+	}
+}
+
+func (e *Executor) streamSend(ctx context.Context, svc AcceptanceMessagingService, request service.SendRequest, emit func(cli.ExecutionResult) error) error {
+	var callbackErr error
+	var acceptedReceipt mektup.Receipt
+	result, callErr := svc.SendWithAcceptance(ctx, request, func(accepted service.SendResult) error {
+		acceptedReceipt = accepted.Receipt
+		output := acceptedResult("send", accepted.Receipt)
+		callbackErr = emit(output)
+		return callbackErr
+	})
+	if callbackErr != nil {
+		return callbackErr
+	}
+	output, resultErr := e.terminalResult("send", result.Receipt, result.Wait, callErr)
+	if resultErr != nil {
+		if acceptedReceipt.ReceiptID != "" {
+			return emit(terminalErrorResult("send", acceptedReceipt, resultErr))
+		}
+		return resultErr
+	}
+	return emit(output)
+}
+
+func (e *Executor) streamReply(ctx context.Context, svc AcceptanceMessagingService, original service.OriginalResolver, request service.ReplyRequest, emit func(cli.ExecutionResult) error) error {
+	var callbackErr error
+	var acceptedReceipt mektup.Receipt
+	result, callErr := svc.ReplyWithAcceptance(ctx, original, request, func(accepted service.ReplyResult) error {
+		acceptedReceipt = accepted.Receipt
+		output := acceptedResult("reply", accepted.Receipt)
+		callbackErr = emit(output)
+		return callbackErr
+	})
+	if callbackErr != nil {
+		return callbackErr
+	}
+	output, resultErr := e.terminalResult("reply", result.Receipt, result.Wait, callErr)
+	if resultErr != nil {
+		if acceptedReceipt.ReceiptID != "" {
+			return emit(terminalErrorResult("reply", acceptedReceipt, resultErr))
+		}
+		return resultErr
+	}
+	return emit(output)
+}
+
+func acceptedResult(kind string, receipt mektup.Receipt) cli.ExecutionResult {
+	return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: lifecycle(kind+".accepted", receipt, false, true)}}, Receipt: receipt, Streaming: true}
+}
+
+func terminalErrorResult(kind string, receipt mektup.Receipt, err error) cli.ExecutionResult {
+	event := lifecycle(kind+".accepted", receipt, true, false)
+	attachError(event, err)
+	return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: event}}, Receipt: receipt, Exit: errorExit(err), Streaming: true}
+}
+
+func (e *Executor) terminalResult(kind string, receipt mektup.Receipt, wait *service.WaitResult, callErr error) (cli.ExecutionResult, error) {
+	result, err := e.messagingResult(kind, receipt, wait, callErr)
+	if err != nil {
+		return cli.ExecutionResult{}, err
+	}
+	if wait != nil && len(result.Events) > 1 {
+		result.Events = result.Events[len(result.Events)-1:]
+	}
+	result.Streaming = true
+	return result, nil
+}
+
 func (e *Executor) service(ctx context.Context, inv cli.Invocation) (MessagingService, error) {
 	if e == nil || e.ports.Service == nil {
 		return nil, cliErr("internal_error", "messaging service factory is required", "not_sent", cli.ExitInternal)
@@ -103,24 +233,7 @@ func (e *Executor) service(ctx context.Context, inv cli.Invocation) (MessagingSe
 }
 
 func (e *Executor) send(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
-	if len(inv.Position) < 1 {
-		return cli.ExecutionResult{}, cliErr("invalid_arguments", "send target is required", "not_sent", cli.ExitUsage)
-	}
-	body, err := e.body(ctx, inv, 1)
-	if err != nil {
-		return cli.ExecutionResult{}, err
-	}
-	request := service.SendRequest{Target: inv.Position[0], Body: body, Raw: has(inv, "raw"), RequestReply: has(inv, "request-reply"), Wait: has(inv, "wait"), Source: inv.Option("reply-to")}
-	request.DeliveryTimeout, err = duration(inv, "delivery-timeout")
-	if err != nil {
-		return cli.ExecutionResult{}, err
-	}
-	request.DisableDeliveryTimeout = inv.Option("delivery-timeout") == "0"
-	request.WaitTimeout, err = duration(inv, "wait-timeout")
-	if err != nil {
-		return cli.ExecutionResult{}, err
-	}
-	svc, err := e.service(ctx, inv)
+	svc, request, err := e.sendInvocation(ctx, inv)
 	if err != nil {
 		return cli.ExecutionResult{}, err
 	}
@@ -128,13 +241,47 @@ func (e *Executor) send(ctx context.Context, inv cli.Invocation) (cli.ExecutionR
 	return e.messagingResult("send", result.Receipt, result.Wait, callErr)
 }
 
-func (e *Executor) reply(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
+func (e *Executor) sendInvocation(ctx context.Context, inv cli.Invocation) (MessagingService, service.SendRequest, error) {
 	if len(inv.Position) < 1 {
-		return cli.ExecutionResult{}, cliErr("invalid_arguments", "reply reference is required", "not_sent", cli.ExitUsage)
+		return nil, service.SendRequest{}, cliErr("invalid_arguments", "send target is required", "not_sent", cli.ExitUsage)
 	}
 	body, err := e.body(ctx, inv, 1)
 	if err != nil {
+		return nil, service.SendRequest{}, err
+	}
+	request := service.SendRequest{Target: inv.Position[0], Body: body, Raw: has(inv, "raw"), RequestReply: has(inv, "request-reply"), Wait: has(inv, "wait"), Source: inv.Option("reply-to")}
+	request.DeliveryTimeout, err = duration(inv, "delivery-timeout")
+	if err != nil {
+		return nil, service.SendRequest{}, err
+	}
+	request.DisableDeliveryTimeout = inv.Option("delivery-timeout") == "0"
+	request.WaitTimeout, err = duration(inv, "wait-timeout")
+	if err != nil {
+		return nil, service.SendRequest{}, err
+	}
+	svc, err := e.service(ctx, inv)
+	if err != nil {
+		return nil, service.SendRequest{}, err
+	}
+	return svc, request, nil
+}
+
+func (e *Executor) reply(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
+	svc, original, request, err := e.replyInvocation(ctx, inv)
+	if err != nil {
 		return cli.ExecutionResult{}, err
+	}
+	result, callErr := svc.Reply(ctx, original, request)
+	return e.messagingResult("reply", result.Receipt, result.Wait, callErr)
+}
+
+func (e *Executor) replyInvocation(ctx context.Context, inv cli.Invocation) (MessagingService, service.OriginalResolver, service.ReplyRequest, error) {
+	if len(inv.Position) < 1 {
+		return nil, nil, service.ReplyRequest{}, cliErr("invalid_arguments", "reply reference is required", "not_sent", cli.ExitUsage)
+	}
+	body, err := e.body(ctx, inv, 1)
+	if err != nil {
+		return nil, nil, service.ReplyRequest{}, err
 	}
 	status := mektup.ReplySuccess
 	if inv.Option("status") == "error" {
@@ -143,46 +290,45 @@ func (e *Executor) reply(ctx context.Context, inv cli.Invocation) (cli.Execution
 	request := service.ReplyRequest{Reference: inv.Position[0], Body: body, Status: status, ErrorCode: inv.Option("error-code"), Source: inv.Option("reply-to"), Wait: has(inv, "wait")}
 	request.DeliveryTimeout, err = duration(inv, "delivery-timeout")
 	if err != nil {
-		return cli.ExecutionResult{}, err
+		return nil, nil, service.ReplyRequest{}, err
 	}
 	request.DisableDeliveryTimeout = inv.Option("delivery-timeout") == "0"
 	request.WaitTimeout, err = duration(inv, "wait-timeout")
 	if err != nil {
-		return cli.ExecutionResult{}, err
+		return nil, nil, service.ReplyRequest{}, err
 	}
 	svc, err := e.service(ctx, inv)
 	if err != nil {
-		return cli.ExecutionResult{}, err
+		return nil, nil, service.ReplyRequest{}, err
 	}
 	if e.ports.Original == nil {
 		if inv.Option("receipt-file") == "" || e.ports.ImportResolver == nil {
 			if inv.Option("receipt-file") != "" {
-				return cli.ExecutionResult{}, cliErr("route_unavailable", "receipt-file requires an injected untrusted receipt resolver", "not_sent", cli.ExitRejected)
+				return nil, nil, service.ReplyRequest{}, cliErr("route_unavailable", "receipt-file requires an injected untrusted receipt resolver", "not_sent", cli.ExitRejected)
 			}
-			return cli.ExecutionResult{}, cliErr("message_not_found", "original message resolver factory is required", "not_sent", cli.ExitInternal)
+			return nil, nil, service.ReplyRequest{}, cliErr("message_not_found", "original message resolver factory is required", "not_sent", cli.ExitInternal)
 		}
 	}
 	var original service.OriginalResolver
 	if inv.Option("receipt-file") != "" {
 		if e.ports.ImportResolver == nil {
-			return cli.ExecutionResult{}, cliErr("route_unavailable", "receipt-file requires an injected untrusted receipt resolver", "not_sent", cli.ExitRejected)
+			return nil, nil, service.ReplyRequest{}, cliErr("route_unavailable", "receipt-file requires an injected untrusted receipt resolver", "not_sent", cli.ExitRejected)
 		}
 		imported, importErr := e.importReceipt(ctx, inv)
 		if importErr != nil {
-			return cli.ExecutionResult{}, importErr
+			return nil, nil, service.ReplyRequest{}, importErr
 		}
 		original, err = e.ports.ImportResolver.ResolveOriginal(ctx, inv, imported)
 	} else {
 		original, err = e.ports.Original(ctx, inv)
 	}
 	if err != nil {
-		return cli.ExecutionResult{}, mapError(err)
+		return nil, nil, service.ReplyRequest{}, mapError(err)
 	}
 	if original == nil {
-		return cli.ExecutionResult{}, cliErr("message_not_found", "original message resolver factory returned nil", "not_sent", cli.ExitInternal)
+		return nil, nil, service.ReplyRequest{}, cliErr("message_not_found", "original message resolver factory returned nil", "not_sent", cli.ExitInternal)
 	}
-	result, callErr := svc.Reply(ctx, original, request)
-	return e.messagingResult("reply", result.Receipt, result.Wait, callErr)
+	return svc, original, request, nil
 }
 
 func (e *Executor) wait(ctx context.Context, inv cli.Invocation) (cli.ExecutionResult, error) {
@@ -487,7 +633,11 @@ func attachError(event map[string]any, err error) {
 	}
 	mapped := mapError(err)
 	if ce, ok := mapped.(*cli.Error); ok {
-		data["error"] = map[string]any{"code": ce.Code, "message": ce.Message, "effectState": ce.Effect, "details": ce.Details}
+		details := ce.Details
+		if details == nil {
+			details = map[string]any{}
+		}
+		data["error"] = map[string]any{"code": ce.Code, "message": ce.Message, "retryable": ce.Retryable, "effectState": ce.Effect, "details": details}
 	}
 }
 
@@ -566,7 +716,11 @@ func mapError(err error) error {
 	}
 	var se *service.Error
 	if errors.As(err, &se) {
-		return &cli.Error{Code: string(se.Code), Message: se.Message, Effect: serviceEffect(se.Code), Exit: serviceExit(se.Code), Details: se.Details}
+		details := se.Details
+		if details == nil {
+			details = map[string]any{}
+		}
+		return &cli.Error{Code: string(se.Code), Message: se.Message, Retryable: se.Retryable, Effect: serviceEffect(se.Code), Exit: serviceExit(se.Code), Details: details}
 	}
 	if errors.Is(err, receipts.ErrNotFound) || errors.Is(err, journal.ErrNotFound) {
 		return cliErr("message_not_found", "receipt was not found", "rejected", cli.ExitRejected)
@@ -616,8 +770,10 @@ func serviceEffect(code mektup.ErrorCode) string {
 		return "not_sent"
 	case mektup.ErrDeliveryRejected, mektup.ErrReplyRouteUnavailable, mektup.ErrReplyNotRequested, mektup.ErrMessageNotFound, mektup.ErrMessageIdentityConflict, mektup.ErrMessageNotAddressedThread, mektup.ErrContentUnavailable:
 		return "rejected"
-	case mektup.ErrDeliveryTemporarilyUnavailable, mektup.ErrOutcomeUnknown, mektup.ErrReplyOutcomeUnknown, mektup.ErrStorageBusy:
+	case mektup.ErrOutcomeUnknown, mektup.ErrReplyOutcomeUnknown, mektup.ErrStorageBusy:
 		return "unknown"
+	case mektup.ErrDeliveryTemporarilyUnavailable:
+		return "rejected"
 	case mektup.ErrWaitIncomplete, mektup.ErrWaitInterrupted:
 		return "unknown"
 	default:
@@ -627,11 +783,11 @@ func serviceEffect(code mektup.ErrorCode) string {
 
 func serviceExit(code mektup.ErrorCode) cli.ExitCode {
 	switch code {
-	case mektup.ErrInvalidArguments, mektup.ErrInvalidTarget, mektup.ErrResolverUnavailable, mektup.ErrTargetAmbiguous, mektup.ErrRouteUnavailable, mektup.ErrEndpointUnavailable, mektup.ErrUnsupportedServerVersion, mektup.ErrInputTooLarge, mektup.ErrReplyRouteRequired, mektup.ErrInvalidRawWait, mektup.ErrInvalidRawReplyRequest, mektup.ErrEffectAcknowledgmentRequired:
+	case mektup.ErrInvalidArguments, mektup.ErrInvalidTarget, mektup.ErrInputTooLarge, mektup.ErrReplyRouteRequired, mektup.ErrInvalidRawWait, mektup.ErrInvalidRawReplyRequest, mektup.ErrEffectAcknowledgmentRequired:
 		return cli.ExitUsage
-	case mektup.ErrDeliveryRejected, mektup.ErrReplyRouteUnavailable, mektup.ErrReplyNotRequested, mektup.ErrMessageNotFound, mektup.ErrMessageIdentityConflict, mektup.ErrMessageNotAddressedThread, mektup.ErrContentUnavailable:
+	case mektup.ErrResolverUnavailable, mektup.ErrTargetAmbiguous, mektup.ErrRouteUnavailable, mektup.ErrEndpointUnavailable, mektup.ErrUnsupportedServerVersion, mektup.ErrDeliveryRejected, mektup.ErrDeliveryTemporarilyUnavailable, mektup.ErrReplyRouteUnavailable, mektup.ErrReplyNotRequested, mektup.ErrMessageNotFound, mektup.ErrMessageIdentityConflict, mektup.ErrMessageNotAddressedThread, mektup.ErrContentUnavailable:
 		return cli.ExitRejected
-	case mektup.ErrDeliveryTemporarilyUnavailable, mektup.ErrOutcomeUnknown, mektup.ErrReplyOutcomeUnknown, mektup.ErrStorageBusy:
+	case mektup.ErrOutcomeUnknown, mektup.ErrReplyOutcomeUnknown, mektup.ErrStorageBusy:
 		return cli.ExitUnknown
 	case mektup.ErrWaitIncomplete:
 		return cli.ExitIncomplete

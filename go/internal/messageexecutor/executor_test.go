@@ -39,6 +39,35 @@ type fakeService struct {
 	replyErr  error
 }
 
+type stagedService struct {
+	accepted chan struct{}
+	release  chan struct{}
+	receipt  mektup.Receipt
+}
+
+func (s *stagedService) Send(context.Context, service.SendRequest) (service.SendResult, error) {
+	return service.SendResult{Receipt: s.receipt}, nil
+}
+func (s *stagedService) Reply(context.Context, service.OriginalResolver, service.ReplyRequest) (service.ReplyResult, error) {
+	return service.ReplyResult{Receipt: s.receipt}, nil
+}
+func (s *stagedService) Wait(context.Context, service.WaitRequest) (service.WaitResult, error) {
+	return service.WaitResult{Receipt: s.receipt}, nil
+}
+func (s *stagedService) SendWithAcceptance(_ context.Context, _ service.SendRequest, onAccepted service.AcceptanceCallback) (service.SendResult, error) {
+	if err := onAccepted(service.SendResult{Receipt: s.receipt}); err != nil {
+		return service.SendResult{Receipt: s.receipt}, err
+	}
+	close(s.accepted)
+	<-s.release
+	terminal := s.receipt
+	terminal.State = mektup.StateReplyAccepted
+	return service.SendResult{Receipt: s.receipt, Wait: &service.WaitResult{Receipt: terminal, State: terminal.State}}, nil
+}
+func (s *stagedService) ReplyWithAcceptance(context.Context, service.OriginalResolver, service.ReplyRequest, service.ReplyAcceptanceCallback) (service.ReplyResult, error) {
+	return service.ReplyResult{}, errors.New("unused")
+}
+
 func (s *fakeService) Send(_ context.Context, req service.SendRequest) (service.SendResult, error) {
 	s.sendCalls++
 	s.last = req
@@ -46,6 +75,24 @@ func (s *fakeService) Send(_ context.Context, req service.SendRequest) (service.
 }
 func (s *fakeService) Reply(context.Context, service.OriginalResolver, service.ReplyRequest) (service.ReplyResult, error) {
 	return s.reply, s.replyErr
+}
+func (s *fakeService) SendWithAcceptance(ctx context.Context, req service.SendRequest, onAccepted service.AcceptanceCallback) (service.SendResult, error) {
+	result, err := s.Send(ctx, req)
+	if onAccepted != nil && result.Receipt.ReceiptID != "" {
+		if callbackErr := onAccepted(service.SendResult{Receipt: result.Receipt}); callbackErr != nil {
+			return result, callbackErr
+		}
+	}
+	return result, err
+}
+func (s *fakeService) ReplyWithAcceptance(ctx context.Context, resolver service.OriginalResolver, req service.ReplyRequest, onAccepted service.ReplyAcceptanceCallback) (service.ReplyResult, error) {
+	result, err := s.Reply(ctx, resolver, req)
+	if onAccepted != nil && result.Receipt.ReceiptID != "" {
+		if callbackErr := onAccepted(service.ReplyResult{Receipt: result.Receipt}); callbackErr != nil {
+			return result, callbackErr
+		}
+	}
+	return result, err
 }
 func (s *fakeService) Wait(context.Context, service.WaitRequest) (service.WaitResult, error) {
 	return s.wait, s.waitErr
@@ -175,6 +222,27 @@ func TestJoinedReplyClaimDoesNotAdvertiseAcceptance(t *testing.T) {
 	}
 }
 
+func TestStagedServiceEmitsAcceptanceBeforeWaitReturns(t *testing.T) {
+	receipt := testReceipt(mektup.StateAccepted)
+	svc := &stagedService{accepted: make(chan struct{}), release: make(chan struct{}), receipt: receipt}
+	exec := New(Ports{Service: func(context.Context, cli.Invocation) (MessagingService, error) { return svc, nil }})
+	var out, errOut bytes.Buffer
+	app := &cli.App{Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, Executor: exec}
+	done := make(chan int, 1)
+	go func() { done <- app.Run([]string{"send", "target", "hello", "--wait"}) }()
+	<-svc.accepted
+	if !strings.Contains(out.String(), `"event":"send.accepted"`) || strings.Contains(out.String(), `"event":"reply.accepted"`) {
+		t.Fatalf("acceptance was not observable before wait: %s", out.String())
+	}
+	close(svc.release)
+	if code := <-done; code != int(cli.ExitSuccess) {
+		t.Fatalf("staged send exit=%d stderr=%q", code, errOut.String())
+	}
+	if lines := strings.Split(strings.TrimSpace(out.String()), "\n"); len(lines) != 2 {
+		t.Fatalf("staged send lines=%d output=%q", len(lines), out.String())
+	}
+}
+
 func TestAcceptedReceiptIsPreservedWhenPostAcceptanceErrorReturns(t *testing.T) {
 	accepted := testReceipt(mektup.StateAccepted)
 	svc := &fakeService{send: service.SendResult{Receipt: accepted}, sendErr: &service.Error{Code: mektup.ErrInternal, Message: "receipt projection failed"}}
@@ -183,6 +251,28 @@ func TestAcceptedReceiptIsPreservedWhenPostAcceptanceErrorReturns(t *testing.T) 
 	gotReceipt, _ := result.Receipt.(mektup.Receipt)
 	if err != nil || gotReceipt.ReceiptID != accepted.ReceiptID || result.Exit != cli.ExitInternal || len(result.Events) != 1 {
 		t.Fatalf("accepted error evidence lost: result=%#v err=%v", result, err)
+	}
+}
+
+func TestAttachedReceiptErrorUsesCanonicalWireShape(t *testing.T) {
+	accepted := testReceipt(mektup.StateAccepted)
+	svc := &fakeService{send: service.SendResult{Receipt: accepted}, sendErr: &service.Error{Code: mektup.ErrInternal, Message: "cleanup"}}
+	exec := New(Ports{Service: func(context.Context, cli.Invocation) (MessagingService, error) { return svc, nil }})
+	var out, errOut bytes.Buffer
+	app := &cli.App{Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, Executor: exec}
+	if code := app.Run([]string{"send", "target", "body"}); code != int(cli.ExitInternal) {
+		t.Fatalf("exit=%d stderr=%q", code, errOut.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &event); err != nil {
+		t.Fatal(err)
+	}
+	errObject := event["data"].(map[string]any)["error"].(map[string]any)
+	if _, ok := errObject["retryable"].(bool); !ok {
+		t.Fatalf("retryable missing: %#v", errObject)
+	}
+	if _, ok := errObject["details"].(map[string]any); !ok {
+		t.Fatalf("details is not an object: %#v", errObject)
 	}
 }
 
@@ -235,6 +325,20 @@ func TestPortableReceiptOutputIsDirectlyImportable(t *testing.T) {
 	}
 }
 
+func TestPortableReceiptHumanPresentationRemainsPortable(t *testing.T) {
+	store := &fakeReceipts{receipt: testReceipt(mektup.StateAccepted)}
+	exec := New(Ports{Receipts: store})
+	var out, errOut bytes.Buffer
+	app := &cli.App{Out: &out, Err: &errOut, Executor: exec}
+	if code := app.Run([]string{"receipt", "show", store.receipt.ReceiptID, "--portable", "--human"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("exit=%d stderr=%q", code, errOut.String())
+	}
+	var imported mektup.Receipt
+	if err := json.Unmarshal(out.Bytes(), &imported); err != nil || imported.Schema != mektup.ReceiptSchema {
+		t.Fatalf("portable human output=%q err=%v", out.String(), err)
+	}
+}
+
 func TestHumanReceiptListAndContentHaveOutput(t *testing.T) {
 	store := &fakeReceipts{receipt: testReceipt(mektup.StateAccepted)}
 	exec := New(Ports{Receipts: store, History: func(context.Context, cli.Invocation, mektup.Receipt) (receipts.HistoryPort, error) {
@@ -266,6 +370,16 @@ func TestRawWaitIsRejectedByDomainMapping(t *testing.T) {
 	var ce *cli.Error
 	if !errors.As(err, &ce) || ce.Code != string(mektup.ErrInvalidRawWait) {
 		t.Fatalf("raw wait error=%v", err)
+	}
+}
+
+func TestUnsupportedServerVersionIsRejected(t *testing.T) {
+	svc := &fakeService{sendErr: &service.Error{Code: mektup.ErrUnsupportedServerVersion, Message: "unsupported"}}
+	exec := New(Ports{Service: func(context.Context, cli.Invocation) (MessagingService, error) { return svc, nil }})
+	var out, errOut bytes.Buffer
+	app := &cli.App{Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, Executor: exec}
+	if code := app.Run([]string{"send", "target", "hello"}); code != int(cli.ExitRejected) {
+		t.Fatalf("unsupported server exit=%d output=%s", code, out.String())
 	}
 }
 
