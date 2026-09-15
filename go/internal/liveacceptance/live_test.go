@@ -2,14 +2,17 @@ package liveacceptance
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/agensfield/mektup/go/appserver"
 	"github.com/agensfield/mektup/go/internal/codexapi"
 	"github.com/agensfield/mektup/go/internal/compat"
 	"github.com/agensfield/mektup/go/internal/connection"
 	"github.com/agensfield/mektup/go/internal/endpoint"
+	"github.com/agensfield/mektup/go/internal/rawrpc"
 )
 
 func TestCentralDaemonReadOnlyTwoClients(t *testing.T) {
@@ -71,5 +74,26 @@ func TestCentralDaemonReadOnlyTwoClients(t *testing.T) {
 		if read.Thread.ID != threadID {
 			t.Fatalf("client %d read thread %q, want %q", i+1, read.Thread.ID, threadID)
 		}
+
+		raw, err := rawrpc.Execute(ctx, connection.NewRPCAdapter(client), rawrpc.Request{
+			Method:       "thread/read",
+			Params:       json.RawMessage(`{"threadId":` + mustJSONString(t, threadID) + `}`),
+			ParamsSource: rawrpc.ParamsInline,
+		})
+		if err != nil {
+			t.Fatalf("client %d raw stable read: %v", i+1, err)
+		}
+		if len(raw.Raw) == 0 || raw.WriteEvidence.Phase != appserver.WriteComplete || raw.WriteEvidence.Generation != client.Generation() {
+			t.Fatalf("client %d raw evidence = %+v", i+1, raw)
+		}
 	}
+}
+
+func mustJSONString(t *testing.T, value string) string {
+	t.Helper()
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
 }
