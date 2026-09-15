@@ -342,11 +342,33 @@ func (r ControlRequest) Validate() error {
 		}
 		if r.Operation == "claim" {
 			var result struct {
-				FencingToken string `json:"fencingToken"`
-				Lease        Lease  `json:"lease"`
+				Disposition  string          `json:"disposition"`
+				State        string          `json:"state"`
+				FencingToken string          `json:"fencingToken"`
+				Lease        *Lease          `json:"lease"`
+				Status       string          `json:"status"`
+				Winner       json.RawMessage `json:"winner"`
 			}
-			if err := json.Unmarshal(r.Result, &result); err != nil || result.FencingToken == "" || !result.Lease.valid() {
-				return fmt.Errorf("%w: claim result requires fencingToken and lease", ErrControlValidation)
+			if err := json.Unmarshal(r.Result, &result); err != nil || result.Disposition == "" || !mektup.EvidenceState(result.State).Valid() {
+				return fmt.Errorf("%w: claim result requires disposition and valid state", ErrControlValidation)
+			}
+			switch result.Disposition {
+			case "claimed":
+				if result.FencingToken == "" || result.Lease == nil || !result.Lease.valid() {
+					return fmt.Errorf("%w: claimed result requires fencingToken and lease", ErrControlValidation)
+				}
+			case "existing":
+				if result.FencingToken != "" || result.Lease != nil {
+					return fmt.Errorf("%w: existing result forbids fencingToken and lease", ErrControlValidation)
+				}
+				if len(result.Winner) > 0 && string(result.Winner) != "null" {
+					var winner map[string]any
+					if err := json.Unmarshal(result.Winner, &winner); err != nil || winner == nil {
+						return fmt.Errorf("%w: existing result winner must be an object", ErrControlValidation)
+					}
+				}
+			default:
+				return fmt.Errorf("%w: unsupported claim result disposition %q", ErrControlValidation, result.Disposition)
 			}
 		}
 		return nil

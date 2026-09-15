@@ -1,4 +1,4 @@
-# Mektup agent guide (contract 1.0.1)
+# Mektup agent guide (contract 1.0.2)
 
 Mektup delivers messages to Codex threads and preserves evidence. Use ordinary
 `mektup send <target> <message>` for one-way delivery. Use
@@ -18,6 +18,11 @@ Exactly one message body source is allowed: one positional string, `--stdin`,
 or `--file <path>`. `--raw` is unwrapped one-way delivery and cannot be used
 with `--wait` or `--request-reply`. Mektup never silently queues or retries an
 outcome whose effect is unknown. Search is discovery, not delivery evidence.
+
+Reply custody claim results are an authority union: `claimed` includes the
+current fencing token and lease for the one caller allowed to submit the body;
+`existing` is tokenless and may include status or winner metadata only. An
+existing result never transfers authority and must not trigger body resubmission.
 
 Run `mektup docs commands --json` for version-matched command metadata and
 `mektup version --json` for build and tested Codex metadata. Embedded docs work

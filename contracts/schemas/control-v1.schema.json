@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agensfield.dev/mektup/contracts/control-v1.schema.json",
   "title": "Mektup custody control document v1",
-  "description": "Metadata-only stdin protocol for the fenced reply custody receiver. A claim request cannot choose a fencing token or current lease; the receiver issues both in its claim result. Heartbeat, commit, and abandon requests must present the issued values. Receipt identity is optional because operation plus original/reply message identity is the custody authority. This protocol never carries a local path, executable path, shell fragment, or reply body.",
+  "description": "Mektup specification revision 1.0.2 metadata-only stdin protocol for the fenced reply custody receiver. A claim request cannot choose a fencing token or current lease; a claim result uses an explicit claimed|existing union. Heartbeat, commit, and abandon requests must present the issued values. Receipt identity is optional because operation plus original/reply message identity is the custody authority. This protocol never carries a local path, executable path, shell fragment, or reply body.",
   "type": "object",
   "required": ["schema", "kind", "operation", "operationId", "replyMessageId", "originalMessageId", "custody", "replyDestination"],
   "properties": {
@@ -59,7 +59,27 @@
     },
     "attemptOwner": { "type": "string", "minLength": 1 },
     "requestedAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
-    "result": { "type": "object" }
+    "result": {
+      "type": "object",
+      "properties": {
+        "disposition": { "enum": ["claimed", "existing"] },
+        "state": { "$ref": "common-v1.schema.json#/$defs/state" },
+        "fencingToken": { "type": "string", "minLength": 1 },
+        "lease": {
+          "type": "object",
+          "required": ["expiresAt"],
+          "properties": {
+            "acquiredAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+            "expiresAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+            "heartbeatAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" }
+          },
+          "additionalProperties": true
+        },
+        "status": { "type": "string", "minLength": 1 },
+        "winner": { "type": "object" }
+      },
+      "additionalProperties": true
+    }
   },
   "allOf": [
     {
@@ -131,12 +151,20 @@
       "then": {
         "properties": {
           "result": {
-            "type": "object",
-            "required": ["fencingToken", "lease"],
-            "properties": {
-              "fencingToken": { "type": "string", "minLength": 1 },
-              "lease": { "type": "object" }
-            }
+            "required": ["disposition"],
+            "allOf": [
+              {
+                "if": { "properties": { "disposition": { "const": "claimed" } } },
+                "then": { "required": ["state", "fencingToken", "lease"] }
+              },
+              {
+                "if": { "properties": { "disposition": { "const": "existing" } } },
+                "then": {
+                  "required": ["state"],
+                  "not": { "anyOf": [{ "required": ["fencingToken"] }, { "required": ["lease"] }] }
+                }
+              }
+            ]
           }
         }
       }

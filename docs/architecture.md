@@ -74,8 +74,11 @@ For a reply:
 
 1. Establish the original request and custody relationship before the outbound
    request is sent.
-2. Claim the reply ID, original ID, route, status, digest, size, attempt owner,
-   fencing token, and finite lease before body submission.
+2. Claim the reply ID, original ID, route, status, digest, size, and attempt
+   owner before body submission. A new owner receives `disposition: claimed`
+   with the fencing token and finite lease; a matching active or terminal
+   attempt returns tokenless `disposition: existing` metadata and cannot submit
+   or resubmit the body.
 3. Keep the claim alive independently while the body operation blocks.
 4. After the pinned destination accepts the body, atomically commit
    `reply_accepted`, close the claim, and select the first reply when none has

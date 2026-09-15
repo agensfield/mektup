@@ -19,7 +19,7 @@ import (
 )
 
 const (
-	ContractVersion = "1.0.1"
+	ContractVersion = "1.0.2"
 	EventSchema     = "mektup/event/v1"
 	CommandSchema   = "mektup/command-contract/v1"
 )

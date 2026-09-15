@@ -1,6 +1,6 @@
 {
   "schema": "mektup/contracts/v1/manifest",
-  "contractVersion": "1.0.1",
+  "contractVersion": "1.0.2",
   "fixtures": [
     { "kind": "envelope-metadata", "schema": "Mektup/1", "path": "envelope-agent-request.json" },
     { "kind": "envelope-rendered", "schema": "Mektup/1", "path": "envelope-agent-request.txt" },
@@ -13,9 +13,11 @@
     { "kind": "error", "schema": "mektup/error/v1", "path": "error-outcome-unknown.json" },
     { "kind": "control", "schema": "mektup/control/v1", "path": "control-claim.json" },
     { "kind": "control", "schema": "mektup/control/v1", "path": "control-claim-result.json" },
+    { "kind": "control", "schema": "mektup/control/v1", "path": "control-claim-existing-result.json" },
     { "kind": "control", "schema": "mektup/control/v1", "path": "control-commit.json" },
     { "kind": "control", "schema": "mektup/control/v1", "path": "control-status-without-receipt.json" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-with-token.invalid.json", "expected": "invalid" },
+    { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-claim-existing-with-token.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-commit-without-token.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-heartbeat-without-lease.invalid.json", "expected": "invalid" },
     { "kind": "control-negative", "schema": "mektup/control/v1", "path": "control-abandon-without-token.invalid.json", "expected": "invalid" }

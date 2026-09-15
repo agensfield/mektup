@@ -47,13 +47,24 @@ func TestControlV1Fixtures(t *testing.T) {
 		})
 	}
 
-	result := []byte(`{"schema":"mektup/control/v1","kind":"result","operation":"claim","operationId":"op_0198f0e0-0000-7000-8000-00000000000c","replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007","originalMessageId":"msg_0198f0e0-0000-7000-8000-000000000003","custody":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","storeId":"store_0198f0e0-0000-7000-8000-000000000002"},"replyDestination":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","threadId":"thread-local-001","uri":"codex://local/thread/thread-local-001"},"result":{"state":"reply_dispatch_claimed","fencingToken":"fence-01","lease":{"acquiredAt":"2026-09-15T03:00:01.900000Z","expiresAt":"2026-09-15T03:00:31.900000Z"}}}`)
+	result := []byte(`{"schema":"mektup/control/v1","kind":"result","operation":"claim","operationId":"op_0198f0e0-0000-7000-8000-00000000000c","replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007","originalMessageId":"msg_0198f0e0-0000-7000-8000-000000000003","custody":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","storeId":"store_0198f0e0-0000-7000-8000-000000000002"},"replyDestination":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","threadId":"thread-local-001","uri":"codex://local/thread/thread-local-001"},"result":{"disposition":"claimed","state":"reply_dispatch_claimed","fencingToken":"fence-01","lease":{"acquiredAt":"2026-09-15T03:00:01.900000Z","expiresAt":"2026-09-15T03:00:31.900000Z"}}}`)
 	parsed, err := ValidateControlRequest(result)
 	if err != nil {
 		t.Fatalf("claim result rejected: %v", err)
 	}
 	if string(parsed.Result) == "" {
 		t.Fatal("claim result was silently dropped")
+	}
+}
+
+func TestControlClaimExistingResultIsTokenless(t *testing.T) {
+	result := []byte(`{"schema":"mektup/control/v1","kind":"result","operation":"claim","operationId":"op_0198f0e0-0000-7000-8000-000000000013","replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007","originalMessageId":"msg_0198f0e0-0000-7000-8000-000000000003","custody":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","storeId":"store_0198f0e0-0000-7000-8000-000000000002"},"replyDestination":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","threadId":"thread-local-001"},"result":{"disposition":"existing","state":"reply_accepted","status":"accepted","winner":{"replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007"}}}`)
+	if _, err := ValidateControlRequest(result); err != nil {
+		t.Fatalf("existing claim result rejected: %v", err)
+	}
+	withToken := []byte(`{"schema":"mektup/control/v1","kind":"result","operation":"claim","operationId":"op_0198f0e0-0000-7000-8000-000000000013","replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007","originalMessageId":"msg_0198f0e0-0000-7000-8000-000000000003","custody":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","storeId":"store_0198f0e0-0000-7000-8000-000000000002"},"replyDestination":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","threadId":"thread-local-001"},"result":{"disposition":"existing","state":"reply_accepted","fencingToken":"owner-token"}}`)
+	if _, err := ValidateControlRequest(withToken); !errors.Is(err, ErrControlValidation) {
+		t.Fatalf("existing claim result with token accepted: %v", err)
 	}
 }
 

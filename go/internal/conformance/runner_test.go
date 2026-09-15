@@ -17,7 +17,7 @@ func TestRunFromRepositoryAndEmitDeterministicEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(summary.Fixtures) != 17 || len(summary.Scenarios) != 102 {
+	if len(summary.Fixtures) != 19 || len(summary.Scenarios) != 104 {
 		t.Fatalf("unexpected coverage: fixtures=%d scenarios=%d", len(summary.Fixtures), len(summary.Scenarios))
 	}
 	var first, second bytes.Buffer
@@ -174,7 +174,7 @@ func TestManifestAndScenarioDecodeUnknownAdditiveFields(t *testing.T) {
 	if err := json.Unmarshal(augmented, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Schema != "mektup/conformance/v1/scenarios" || len(decoded.Scenarios) != 102 {
+	if decoded.Schema != "mektup/conformance/v1/scenarios" || decoded.SpecVersion != "1.0.2" || len(decoded.Scenarios) != 104 {
 		t.Fatalf("additive scenario field changed stable content: %#v", decoded.Schema)
 	}
 }

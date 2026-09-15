@@ -1,6 +1,7 @@
 {
   "schema": "mektup/conformance/v1/scenarios",
   "version": "1.0.0",
+  "specVersion": "1.0.2",
   "source": "acceptance-v1.md",
   "profiles": {
     "plain_accept": {
@@ -72,7 +73,9 @@
     { "id": "reply.portable-successor", "matrix": "reply", "profile": "reply_wait_success", "observable": ["metadata wait works with configured authority", "explicit content lookup verifies IDs and digest"] },
     { "id": "reply.accepted-but-item-suppressed", "matrix": "reply", "profile": "reply_wait_success", "observable": ["reply_accepted is retained", "reply_observed is not emitted without native item evidence"] },
     { "id": "reply.receiver-loses-result-commit", "matrix": "reply", "profile": "reply_unknown", "observable": ["fenced claim expires", "waiter receives reply_outcome_unknown", "automatic resend is forbidden"] },
-    { "id": "reply.two-receivers-same-reply-id", "matrix": "reply", "profile": "reply_wait_success", "observable": ["one transactional claim and body submission", "same-content attempt joins", "conflicting digest or route rejects"] },
+    { "id": "reply.two-receivers-same-reply-id", "matrix": "reply", "profile": "reply_wait_success", "observable": ["one receiver gets claimed authority and submits the body", "matching caller receives tokenless existing", "conflicting digest or route rejects"] },
+    { "id": "reply.duplicate-after-terminal", "matrix": "reply", "profile": "reply_wait_success", "observable": ["tokenless existing reports status and winner metadata", "body is not resubmitted"] },
+    { "id": "reply.claim-result-schema", "matrix": "reply", "profile": "reply_wait_success", "observable": ["claimed requires state, fencingToken, and lease", "existing requires state and forbids fencingToken and lease", "every emitted result validates"] },
 
     { "id": "transport.before-connection-write", "matrix": "transport", "profile": "usage_rejected", "observable": ["not_sent", "retry may be safe"] },
     { "id": "transport.prepared-process-dies", "matrix": "transport", "profile": "not_sent_recovered", "observable": ["recovery maps orphaned prepared attempt to not_sent", "message identity is retained"] },

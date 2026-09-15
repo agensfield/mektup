@@ -88,11 +88,12 @@ type manifestFixture struct {
 }
 
 type scenariosDocument struct {
-	Schema    string             `json:"schema"`
-	Version   string             `json:"version"`
-	Source    string             `json:"source"`
-	Profiles  map[string]profile `json:"profiles"`
-	Scenarios []scenario         `json:"scenarios"`
+	Schema      string             `json:"schema"`
+	Version     string             `json:"version"`
+	SpecVersion string             `json:"specVersion"`
+	Source      string             `json:"source"`
+	Profiles    map[string]profile `json:"profiles"`
+	Scenarios   []scenario         `json:"scenarios"`
 }
 
 type profile struct {
@@ -116,6 +117,7 @@ type scenario struct {
 type transitionsDocument struct {
 	Schema      string       `json:"schema"`
 	Contract    string       `json:"contract"`
+	SpecVersion string       `json:"specVersion"`
 	States      []string     `json:"states"`
 	Transitions []transition `json:"transitions"`
 	Forbidden   []forbidden  `json:"forbiddenTransitions"`
@@ -653,7 +655,8 @@ func validateControlFixture(data []byte) error {
 		}
 	}
 	if kind == "result" {
-		if _, ok := value["result"].(map[string]any); !ok {
+		result, ok := value["result"].(map[string]any)
+		if !ok {
 			return errors.New("control result requires result")
 		}
 		if _, ok := value["fencingToken"]; ok {
@@ -661,6 +664,47 @@ func validateControlFixture(data []byte) error {
 		}
 		if _, ok := value["lease"]; ok {
 			return errors.New("control result cannot carry top-level lease")
+		}
+		if op == "claim" {
+			disposition, ok := result["disposition"].(string)
+			if !ok || (disposition != "claimed" && disposition != "existing") {
+				return errors.New("claim result requires claimed or existing disposition")
+			}
+			state, ok := result["state"].(string)
+			if !ok || !mektup.EvidenceState(state).Valid() {
+				return errors.New("claim result requires valid state")
+			}
+			switch disposition {
+			case "claimed":
+				token, ok := result["fencingToken"].(string)
+				if !ok || token == "" {
+					return errors.New("claimed result requires fencingToken")
+				}
+				lease, ok := result["lease"].(map[string]any)
+				if !ok {
+					return errors.New("claimed result requires lease")
+				}
+				if expires, ok := lease["expiresAt"].(string); !ok || expires == "" {
+					return errors.New("claimed result requires lease expiry")
+				}
+			case "existing":
+				if _, ok := result["fencingToken"]; ok {
+					return errors.New("existing result forbids fencingToken")
+				}
+				if _, ok := result["lease"]; ok {
+					return errors.New("existing result forbids lease")
+				}
+				if status, present := result["status"]; present {
+					if text, ok := status.(string); !ok || text == "" {
+						return errors.New("existing result status must be a nonempty string")
+					}
+				}
+				if winner, present := result["winner"]; present {
+					if _, ok := winner.(map[string]any); !ok {
+						return errors.New("existing result winner must be an object")
+					}
+				}
+			}
 		}
 	}
 	if kind == "request" && (op == "claim" || op == "heartbeat" || op == "commit" || op == "abandon") {
@@ -682,8 +726,11 @@ func validateControlFixture(data []byte) error {
 }
 
 func validateScenarioDocuments(s scenariosDocument, t transitionsDocument) error {
-	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
+	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.2" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
 		return errors.New("scenarios document metadata is incomplete")
+	}
+	if t.SpecVersion != "1.0.2" {
+		return errors.New("transitions document spec revision is not 1.0.2")
 	}
 	states := map[string]bool{"none": true}
 	for _, state := range t.States {

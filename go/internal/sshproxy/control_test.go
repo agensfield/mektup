@@ -73,7 +73,7 @@ func TestInvokeControlUsesFixedArgvAndMetadataStdin(t *testing.T) {
 		}
 		result := request
 		result.Kind = "result"
-		result.Result = json.RawMessage(`{"fencingToken":"fence","lease":{"expiresAt":"2026-09-15T03:00:31.900000Z"}}`)
+		result.Result = json.RawMessage(`{"disposition":"claimed","state":"reply_dispatch_claimed","fencingToken":"fence","lease":{"expiresAt":"2026-09-15T03:00:31.900000Z"}}`)
 		resultBytes, _ := json.Marshal(result)
 		_, _ = p.stdoutW.Write(resultBytes)
 		_ = p.stdoutW.Close()
@@ -117,7 +117,7 @@ func TestInvokeControlRejectsSwappedResponseIdentity(t *testing.T) {
 		result := request
 		result.Kind = "result"
 		result.OperationID = "op_0198f0e0-0000-7000-8000-00000000000e"
-		result.Result = json.RawMessage(`{"fencingToken":"fence","lease":{"expiresAt":"2026-09-15T03:00:31.900000Z"}}`)
+		result.Result = json.RawMessage(`{"disposition":"claimed","state":"reply_dispatch_claimed","fencingToken":"fence","lease":{"expiresAt":"2026-09-15T03:00:31.900000Z"}}`)
 		response, _ := json.Marshal(result)
 		_, _ = p.stdoutW.Write(response)
 		_ = p.stdoutW.Close()
