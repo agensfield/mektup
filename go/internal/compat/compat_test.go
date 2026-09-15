@@ -22,6 +22,10 @@ func TestClassify(t *testing.T) {
 		{"floor prerelease", "codex_cli_rs/0.142.0-rc.1", "0.142.0-rc.1", Unsupported, ""},
 		{"older", "codex_cli_rs/0.141.9", "0.141.9", Unsupported, ""},
 		{"unparseable", "codex_cli_rs/dev-build", "dev-build", Unknown, WarningUnknown},
+		{"abbreviated tested", "codex_cli_rs/0.154", "0.154", Unknown, WarningUnknown},
+		{"abbreviated floor", "codex_cli_rs/0.142", "0.142", Unknown, WarningUnknown},
+		{"abbreviated major", "codex_cli_rs/0", "0", Unknown, WarningUnknown},
+		{"invalid leading zero", "codex_cli_rs/0.154.00", "0.154.00", Unknown, WarningUnknown},
 		{"unrecognized shape", "codex-app-server 0.154.0", "", Unknown, WarningUnknown},
 	}
 	for _, test := range tests {

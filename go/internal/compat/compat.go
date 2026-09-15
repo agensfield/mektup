@@ -4,6 +4,7 @@ package compat
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"golang.org/x/mod/semver"
@@ -32,6 +33,11 @@ const (
 
 var ErrMissingUserAgent = errors.New("initialize response has no nonempty userAgent string")
 
+// x/mod/semver deliberately accepts shorthand such as v1 and v1.2. App-server
+// compatibility evidence requires the complete SemVer core emitted by a real
+// release before it can be compared with a tested version or support floor.
+var completeSemver = regexp.MustCompile(`^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$`)
+
 // Result preserves the authoritative handshake value and its classification.
 type Result struct {
 	UserAgent string
@@ -58,6 +64,13 @@ func Classify(userAgent string) (Result, error) {
 		return result, nil
 	}
 	result.Product = product
+	originalVersion := rawVersion
+	if !completeSemver.MatchString(originalVersion) {
+		result.Version = originalVersion
+		result.Class = Unknown
+		result.Warning = WarningUnknown
+		return result, nil
+	}
 	if !strings.HasPrefix(rawVersion, "v") {
 		rawVersion = "v" + rawVersion
 	}
