@@ -1,4 +1,4 @@
-# Mektup agent guide (contract 1.0.2)
+# Mektup agent guide (contract 1.0.3)
 
 Mektup delivers messages to Codex threads and preserves evidence. Use ordinary
 `mektup send <target> <message>` for one-way delivery. Use
@@ -23,6 +23,12 @@ Reply custody claim results are an authority union: `claimed` includes the
 current fencing token and lease for the one caller allowed to submit the body;
 `existing` is tokenless and may include status or winner metadata only. An
 existing result never transfers authority and must not trigger body resubmission.
+
+The control registry is owner-private and remains under the default machine-user
+state root. `--state-dir` and `MEKTUP_STATE_DIR` select an operation journal but
+do not relocate the registry or fork built-in endpoint identity. Receiver
+membership requires the stable endpoint, URI alias, decoded thread, and durable
+journal relationship to agree exactly.
 
 Run `mektup docs commands --json` for version-matched command metadata and
 `mektup version --json` for build and tested Codex metadata. Embedded docs work

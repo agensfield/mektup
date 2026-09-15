@@ -89,6 +89,13 @@ For a reply:
 
 The journal stores metadata and digests, never message or reply bodies.
 
+Control custody registration is owner-private and fixed under the default
+machine-user state root. An operation-selected `--state-dir` can identify a
+local journal for reply custody, but cannot relocate the control registry or
+fork built-in endpoint identity. Receiver membership requires the stable
+endpoint ID, decoded URI alias/thread, and durable journal relationship to
+agree exactly; remote control input cannot create or rewrite those mappings.
+
 ### Endpoint and custody registries
 
 A stable endpoint ID identifies one Codex app-server route. A custody store ID

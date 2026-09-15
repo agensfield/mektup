@@ -1,7 +1,7 @@
 {
   "schema": "mektup/conformance/v1/scenarios",
   "version": "1.0.0",
-  "specVersion": "1.0.2",
+  "specVersion": "1.0.3",
   "source": "acceptance-v1.md",
   "profiles": {
     "plain_accept": {
@@ -119,6 +119,12 @@
     { "id": "endpoint.distinct-codex-homes", "matrix": "endpoint", "profile": "read_complete", "observable": ["distinct homes receive distinct built-in-local IDs"] },
     { "id": "endpoint.cross-host-route-preflight", "matrix": "endpoint", "profile": "usage_rejected", "observable": ["missing reverse mapping fails before send", "succeeds after exact stable IDs are mapped"] },
     { "id": "endpoint.custom-state-dir-store", "matrix": "endpoint", "profile": "read_complete", "observable": ["opaque custody store ID is registered", "path is never portable"] },
+    { "id": "endpoint.builtin-home-stable-across-state-dirs", "matrix": "endpoint", "profile": "read_complete", "observable": ["same Codex home/socket keeps one built-in-local endpoint ID", "default and custom operation state do not fork endpoint identity"] },
+    { "id": "endpoint.control-registry-fixed-state-root", "matrix": "endpoint", "profile": "read_complete", "observable": ["control-registry.json remains under the default XDG state root", "--state-dir and MEKTUP_STATE_DIR do not relocate registry authority"] },
+    { "id": "endpoint.custom-state-requires-local-journal", "matrix": "endpoint", "profile": "read_complete", "observable": ["reply-requesting use registers only a locally opened and identity-verified journal", "ordinary state reads do not mutate registry"] },
+    { "id": "endpoint.registry-owner-private-canonical", "matrix": "endpoint", "profile": "usage_rejected", "observable": ["missing/moved/corrupt/duplicate/mismatched or unsafe registry fails closed", "registry maps opaque store identity to one canonical local state directory", "remote input cannot create or rewrite mappings"] },
+    { "id": "endpoint.control-destination-membership-exact", "matrix": "endpoint", "profile": "usage_rejected", "observable": ["endpoint ID, URI alias, decoded thread, and durable journal relationship agree exactly", "missing or ambiguous aliases fail before receiver effect"] },
+    { "id": "endpoint.remote-control-cannot-rewrite-mapping", "matrix": "endpoint", "profile": "usage_rejected", "observable": ["remote control fields cannot add or rewrite endpoint, alias, route, store, or filesystem mappings", "unregistered authority fails before receiver effect"] },
     { "id": "endpoint.split-reply-and-custody", "matrix": "endpoint", "profile": "plain_accept", "observable": ["body route and custody route are independently validated"] },
     { "id": "endpoint.human-reply-to", "matrix": "endpoint", "profile": "usage_rejected", "observable": ["human correlated send establishes both routes or fails closed"] },
     { "id": "endpoint.ssh-system-config", "matrix": "endpoint", "profile": "read_complete", "observable": ["OpenSSH config/verification/agent/ProxyJump remain authoritative"] },

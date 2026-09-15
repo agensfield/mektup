@@ -734,11 +734,11 @@ func validateControlFixture(data []byte) error {
 }
 
 func validateScenarioDocuments(s scenariosDocument, t transitionsDocument) error {
-	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.2" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
+	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.3" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
 		return errors.New("scenarios document metadata is incomplete")
 	}
-	if t.SpecVersion != "1.0.2" {
-		return errors.New("transitions document spec revision is not 1.0.2")
+	if t.SpecVersion != "1.0.3" {
+		return errors.New("transitions document spec revision is not 1.0.3")
 	}
 	states := map[string]bool{"none": true}
 	for _, state := range t.States {
