@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -57,7 +58,11 @@ func TestConfigAtomicPrivateAndDuplicateRules(t *testing.T) {
 	if err := store.Add(endpoint); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Add(Endpoint{Alias: "remote", ID: "ep_other", Route: route}); !errors.Is(err, ErrDuplicateAlias) {
+	otherID, err := NewEndpointID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(Endpoint{Alias: "remote", ID: otherID, Route: route}); !errors.Is(err, ErrDuplicateAlias) {
 		t.Fatalf("duplicate alias error = %v", err)
 	}
 	got, err := store.Show("remote")
@@ -131,6 +136,20 @@ func TestBuiltinLocalStablePerCanonicalHome(t *testing.T) {
 	}
 }
 
+func TestEndpointIDsAreUUIDv7AndValidationIsStrict(t *testing.T) {
+	id, err := NewEndpointID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validEndpointID(id) || id[17] != '7' {
+		t.Fatalf("generated endpoint ID is not UUIDv7: %q", id)
+	}
+	route, _ := SSHRoute("example.org")
+	if err := (Endpoint{ID: "ep_not-a-uuid", Alias: "x", Route: route, Herdr: HerdrDisabled}).Validate(); err == nil {
+		t.Fatal("arbitrary endpoint ID accepted")
+	}
+}
+
 func TestEndpointPrecedenceAndSourceIndependence(t *testing.T) {
 	if got := SelectEndpoint("flag", "env", "config", "default"); got != "flag" {
 		t.Fatal(got)
@@ -161,12 +180,46 @@ func TestEndpointPrecedenceAndSourceIndependence(t *testing.T) {
 		t.Fatal(err)
 	}
 	target, _ := ParseTarget("codex://remote/thread/thread-b")
-	dest, err := store.ResolveDestination(target, "local", filepath.Join(root, "codex-a"), nil)
+	dest, err := store.ResolveDestination(context.Background(), target, "local", filepath.Join(root, "codex-a"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if source.Endpoint.ID == dest.Endpoint.ID || source.ThreadID == dest.ThreadID {
 		t.Fatalf("source and destination were conflated: source=%#v dest=%#v", source, dest)
+	}
+	conflict, _ := ParseTarget("codex://local/thread/other-thread")
+	if _, err := store.ResolveSource(SourceOptions{CurrentThreadID: "thread-a", ReplyTo: conflict.String(), CodexHome: filepath.Join(root, "codex-a")}); !errors.Is(err, ErrSourceConflict) {
+		t.Fatalf("conflicting reply-to error = %v", err)
+	}
+}
+
+func TestConcurrentEndpointAddsDoNotLoseUpdates(t *testing.T) {
+	root := t.TempDir()
+	store := NewStore(filepath.Join(root, "config.json"), filepath.Join(root, "state"))
+	route, _ := SSHRoute("example.org")
+	const total = 12
+	var group sync.WaitGroup
+	results := make(chan error, total)
+	for i := 0; i < total; i++ {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			results <- store.Add(Endpoint{Alias: "endpoint-" + string(rune('a'+index)), Route: route})
+		}(i)
+	}
+	group.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	items, err := store.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != total+1 {
+		t.Fatalf("concurrent list has %d endpoints, want %d: %#v", len(items), total+1, items)
 	}
 }
 
@@ -189,7 +242,7 @@ func herdrJSON(agentName, pane, workspace, tab, thread, status string) []byte {
 	item := map[string]any{
 		"agent": "codex", "name": agentName, "pane_id": pane,
 		"workspace_id": workspace, "tab_id": tab, "agent_status": status,
-		"agent_session": map[string]any{"value": thread},
+		"agent_session": map[string]any{"kind": "id", "source": "herdr:codex", "value": thread},
 	}
 	return mustJSON(map[string]any{"id": "x", "result": map[string]any{"agent": item, "agents": []any{item}}})
 }
@@ -204,7 +257,7 @@ func mustJSON(value any) []byte {
 
 func TestHerdrResolverPinsIdentityAndRejectsChangedOccupant(t *testing.T) {
 	list := mustJSON(map[string]any{"result": map[string]any{"agents": []any{
-		map[string]any{"agent": "codex", "name": "agent name", "pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "agent_status": "idle", "agent_session": map[string]any{"value": "thread-one"}},
+		map[string]any{"agent": "codex", "name": "agent name", "pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "agent_status": "idle", "agent_session": map[string]any{"kind": "id", "source": "herdr:codex", "value": "thread-one"}},
 	}}})
 	get := herdrJSON("agent name", "w3:p1", "w3", "w3:t1", "thread-one", "idle")
 	runner := &fakeRunner{responses: [][]byte{list, get}}
@@ -237,19 +290,61 @@ func TestHerdrResolverFailsClosedOnZeroMultipleAndStale(t *testing.T) {
 		t.Fatalf("zero error = %v", err)
 	}
 	duplicate := mustJSON(map[string]any{"result": map[string]any{"agents": []any{
-		map[string]any{"name": "x", "pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "agent_status": "idle", "agent_session": map[string]any{"value": "a"}},
-		map[string]any{"name": "x", "pane_id": "w3:p2", "workspace_id": "w3", "tab_id": "w3:t1", "agent_status": "idle", "agent_session": map[string]any{"value": "b"}},
+		map[string]any{"agent": "codex", "name": "x", "pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "agent_status": "idle", "agent_session": map[string]any{"kind": "id", "source": "herdr:codex", "value": "a"}},
+		map[string]any{"agent": "codex", "name": "x", "pane_id": "w3:p2", "workspace_id": "w3", "tab_id": "w3:t1", "agent_status": "idle", "agent_session": map[string]any{"kind": "id", "source": "herdr:codex", "value": "b"}},
 	}}})
 	_, err = NewHerdrResolver(&fakeRunner{responses: [][]byte{duplicate}}).Resolve(context.Background(), target)
 	if !errors.Is(err, ErrResolverAmbiguous) {
 		t.Fatalf("multiple error = %v", err)
 	}
 	stale := mustJSON(map[string]any{"result": map[string]any{"agents": []any{
-		map[string]any{"name": "x", "pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "agent_status": "stale", "agent_session": map[string]any{"value": "a"}},
+		map[string]any{"agent": "codex", "name": "x", "pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "agent_status": "stale", "agent_session": map[string]any{"kind": "id", "source": "herdr:codex", "value": "a"}},
 	}}})
 	_, err = NewHerdrResolver(&fakeRunner{responses: [][]byte{stale}}).Resolve(context.Background(), target)
 	if !errors.Is(err, ErrResolverStale) {
 		t.Fatalf("stale error = %v", err)
+	}
+}
+
+func TestHerdrResolverRequiresCodexSession(t *testing.T) {
+	invalid := mustJSON(map[string]any{"result": map[string]any{"agents": []any{
+		map[string]any{"agent": "codex", "name": "x", "pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "agent_status": "idle", "agent_session": map[string]any{"kind": "id", "source": "other", "value": "thread"}},
+	}}})
+	_, err := NewHerdrResolver(&fakeRunner{responses: [][]byte{invalid}}).Resolve(context.Background(), Target{Kind: TargetAgent, Name: "x"})
+	if !errors.Is(err, ErrResolverStale) {
+		t.Fatalf("non-Codex session error = %v", err)
+	}
+}
+
+func TestSSHHerdrUsesEndpointSpecificRunnerAndContext(t *testing.T) {
+	list := mustJSON(map[string]any{"result": map[string]any{"agents": []any{
+		map[string]any{"agent": "codex", "name": "remote", "pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "w1:t1", "agent_status": "idle", "agent_session": map[string]any{"kind": "id", "source": "herdr:codex", "value": "thread"}},
+	}}})
+	get := herdrJSON("remote", "w1:p1", "w1", "w1:t1", "thread", "idle")
+	route, err := SSHRoute("remote.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, _ := NewEndpointID()
+	endpoint := Endpoint{ID: id, Alias: "remote", Route: route, Herdr: HerdrAuto}
+	var calls [][]string
+	var gotEndpoint Endpoint
+	resolver := NewHerdrResolver(nil)
+	resolver.EndpointRunner = EndpointCommandRunnerFunc(func(_ context.Context, got Endpoint, argv []string) ([]byte, error) {
+		gotEndpoint = got
+		calls = append(calls, argv)
+		if len(calls) == 1 {
+			return list, nil
+		}
+		return get, nil
+	})
+	target := Target{Kind: TargetAgent, Name: "remote"}
+	resolved, err := resolver.ResolveEndpoint(context.Background(), endpoint, target)
+	if err != nil || resolved.ThreadID != "thread" || gotEndpoint.ID != endpoint.ID {
+		t.Fatalf("remote resolution = %#v, err=%v endpoint=%#v", resolved, err, gotEndpoint)
+	}
+	if !reflect.DeepEqual(calls, [][]string{{"herdr", "agent", "list"}, {"herdr", "agent", "get", "w1:p1"}}) {
+		t.Fatalf("remote argv = %#v", calls)
 	}
 }
 

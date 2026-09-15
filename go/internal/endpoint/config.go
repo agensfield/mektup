@@ -64,6 +64,9 @@ func (s EndpointStore) Load() (Config, error) {
 	if err := validateConfig(cfg); err != nil {
 		return Config{}, err
 	}
+	for i := range cfg.Endpoints {
+		cfg.Endpoints[i] = cfg.Endpoints[i].Normalized()
+	}
 	return cfg, nil
 }
 
@@ -73,7 +76,9 @@ func validateConfig(cfg Config) error {
 	}
 	seenAlias := make(map[string]struct{}, len(cfg.Endpoints))
 	seenID := make(map[string]struct{}, len(cfg.Endpoints))
-	for _, endpoint := range cfg.Endpoints {
+	for i := range cfg.Endpoints {
+		endpoint := cfg.Endpoints[i].Normalized()
+		cfg.Endpoints[i] = endpoint
 		if endpoint.Builtin {
 			return fmt.Errorf("%w: built-in endpoint cannot be configured", ErrConfigCorrupt)
 		}
@@ -107,6 +112,9 @@ func (s EndpointStore) Save(cfg Config) error {
 	}
 	if cfg.Version == 0 {
 		cfg.Version = configVersion
+	}
+	for i := range cfg.Endpoints {
+		cfg.Endpoints[i] = cfg.Endpoints[i].Normalized()
 	}
 	if err := validateConfig(cfg); err != nil {
 		return err
@@ -170,7 +178,7 @@ func NewEndpointID() (string, error) {
 		b[i] = byte(ms)
 		ms >>= 8
 	}
-	b[6] = (b[6] & 0x0f) | 0x40
+	b[6] = (b[6] & 0x0f) | 0x70
 	b[8] = (b[8] & 0x3f) | 0x80
 	return "ep_" + hex.EncodeToString(b[:4]) + "-" + hex.EncodeToString(b[4:6]) + "-" + hex.EncodeToString(b[6:8]) + "-" + hex.EncodeToString(b[8:10]) + "-" + hex.EncodeToString(b[10:]), nil
 }
@@ -193,23 +201,33 @@ func (s EndpointStore) Add(endpoint Endpoint) error {
 			return err
 		}
 	}
+	endpoint = endpoint.Normalized()
 	if err := endpoint.Validate(); err != nil {
 		return err
 	}
-	cfg, err := s.Load()
-	if err != nil {
-		return err
-	}
-	for _, item := range cfg.Endpoints {
-		if item.Alias == endpoint.Alias {
-			return fmt.Errorf("%w: %s", ErrDuplicateAlias, endpoint.Alias)
+	return withExclusiveLock(s.configLockPath(), func() error {
+		cfg, err := s.Load()
+		if err != nil {
+			return err
 		}
-		if item.ID == endpoint.ID {
-			return fmt.Errorf("%w: %s", ErrDuplicateEndpointID, endpoint.ID)
+		for _, item := range cfg.Endpoints {
+			if item.Alias == endpoint.Alias {
+				return fmt.Errorf("%w: %s", ErrDuplicateAlias, endpoint.Alias)
+			}
+			if item.ID == endpoint.ID {
+				return fmt.Errorf("%w: %s", ErrDuplicateEndpointID, endpoint.ID)
+			}
 		}
+		cfg.Endpoints = append(cfg.Endpoints, endpoint)
+		return s.Save(cfg)
+	})
+}
+
+func (s EndpointStore) configLockPath() string {
+	if s.ConfigPath == "" {
+		return "endpoint-config.lock"
 	}
-	cfg.Endpoints = append(cfg.Endpoints, endpoint)
-	return s.Save(cfg)
+	return s.ConfigPath + ".lock"
 }
 
 func (s EndpointStore) List() ([]Endpoint, error) {
@@ -260,28 +278,30 @@ func (s EndpointStore) Remove(selector string) error {
 	} else if ok {
 		return ErrBuiltinImmutable
 	}
-	cfg, err := s.Load()
-	if err != nil {
-		return err
-	}
-	index := -1
-	for i, endpoint := range cfg.Endpoints {
-		if endpoint.Alias == selector || endpoint.ID == selector {
-			if endpoint.Builtin {
-				return ErrBuiltinImmutable
-			}
-			index = i
-			break
+	return withExclusiveLock(s.configLockPath(), func() error {
+		cfg, err := s.Load()
+		if err != nil {
+			return err
 		}
-	}
-	if index < 0 {
-		return fmt.Errorf("%w: %s", ErrEndpointNotFound, selector)
-	}
-	cfg.Endpoints = append(cfg.Endpoints[:index], cfg.Endpoints[index+1:]...)
-	if cfg.Default == selector {
-		cfg.Default = ""
-	}
-	return s.Save(cfg)
+		index := -1
+		for i, endpoint := range cfg.Endpoints {
+			if endpoint.Alias == selector || endpoint.ID == selector {
+				if endpoint.Builtin {
+					return ErrBuiltinImmutable
+				}
+				index = i
+				break
+			}
+		}
+		if index < 0 {
+			return fmt.Errorf("%w: %s", ErrEndpointNotFound, selector)
+		}
+		cfg.Endpoints = append(cfg.Endpoints[:index], cfg.Endpoints[index+1:]...)
+		if cfg.Default == selector {
+			cfg.Default = ""
+		}
+		return s.Save(cfg)
+	})
 }
 
 // SelectEndpoint implements the CLI-independent precedence hook: an explicit

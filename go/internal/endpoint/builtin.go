@@ -56,6 +56,19 @@ func (s EndpointStore) EnsureBuiltinLocal(codexHome string) (Endpoint, error) {
 	if s.StateHome == "" {
 		return Endpoint{}, errors.New("state home is required for built-in local identity")
 	}
+	var result Endpoint
+	err := withExclusiveLock(filepath.Join(s.StateHome, ".endpoint-identities.lock"), func() error {
+		var err error
+		result, err = s.ensureBuiltinLocal(codexHome)
+		return err
+	})
+	return result, err
+}
+
+func (s EndpointStore) ensureBuiltinLocal(codexHome string) (Endpoint, error) {
+	if s.StateHome == "" {
+		return Endpoint{}, errors.New("state home is required for built-in local identity")
+	}
 	if codexHome == "" {
 		var err error
 		codexHome, err = defaultCodexHome()
@@ -82,7 +95,7 @@ func (s EndpointStore) EnsureBuiltinLocal(codexHome string) (Endpoint, error) {
 			if routeErr != nil {
 				return Endpoint{}, routeErr
 			}
-			return Endpoint{ID: identity.EndpointID, Alias: "local", Route: route, Builtin: true, Herdr: HerdrDisabled}, nil
+			return Endpoint{ID: identity.EndpointID, Alias: "local", Route: route, Builtin: true, Herdr: HerdrAuto}, nil
 		}
 	}
 	id, err := NewEndpointID()
@@ -97,7 +110,7 @@ func (s EndpointStore) EnsureBuiltinLocal(codexHome string) (Endpoint, error) {
 	if err != nil {
 		return Endpoint{}, err
 	}
-	return Endpoint{ID: id, Alias: "local", Route: route, Builtin: true, Herdr: HerdrDisabled}, nil
+	return Endpoint{ID: id, Alias: "local", Route: route, Builtin: true, Herdr: HerdrAuto}, nil
 }
 
 func (s EndpointStore) builtinByID(id string) (Endpoint, bool, error) {
@@ -113,7 +126,7 @@ func (s EndpointStore) builtinByID(id string) (Endpoint, bool, error) {
 		if routeErr != nil {
 			return Endpoint{}, false, routeErr
 		}
-		return Endpoint{ID: identity.EndpointID, Alias: "local", Route: route, Builtin: true, Herdr: HerdrDisabled}, true, nil
+		return Endpoint{ID: identity.EndpointID, Alias: "local", Route: route, Builtin: true, Herdr: HerdrAuto}, true, nil
 	}
 	return Endpoint{}, false, nil
 }

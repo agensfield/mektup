@@ -103,19 +103,53 @@ func (e Endpoint) Validate() error {
 	if err := e.Route.Validate(); err != nil {
 		return err
 	}
-	if strings.TrimSpace(e.ID) == "" || strings.ContainsAny(e.ID, "\r\n\t ") {
-		return errors.New("endpoint ID must be a nonempty stable token")
+	if !validEndpointID(e.ID) {
+		return errors.New("endpoint ID must be a UUIDv7 stable ID (ep_<uuid>)")
 	}
-	if strings.TrimSpace(e.Alias) == "" || strings.ContainsAny(e.Alias, "/?#\r\n\t ") {
+	if e.Builtin {
+		if e.Alias != "local" {
+			return errors.New("built-in endpoint must use the local alias")
+		}
+	} else if !validAlias(e.Alias) {
 		return errors.New("endpoint alias must be a nonempty local token")
 	}
-	if e.Herdr == "" {
-		e.Herdr = HerdrDisabled
-	}
 	if e.Herdr != HerdrAuto && e.Herdr != HerdrDisabled {
-		return fmt.Errorf("unknown Herdr mode %q", e.Herdr)
+		return fmt.Errorf("unknown or unspecified Herdr mode %q", e.Herdr)
 	}
 	return nil
+}
+
+func validEndpointID(value string) bool {
+	if len(value) != len("ep_00000000-0000-7000-8000-000000000000") {
+		return false
+	}
+	if !strings.HasPrefix(value, "ep_") || value[11] != '-' || value[16] != '-' || value[21] != '-' || value[26] != '-' || value[17] != '7' {
+		return false
+	}
+	for i, char := range value[3:] {
+		if i == 8 || i == 13 || i == 18 || i == 23 {
+			continue
+		}
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return false
+		}
+	}
+	variant := value[22]
+	return variant == '8' || variant == '9' || variant == 'a' || variant == 'b'
+}
+
+// Normalized returns the explicit endpoint capability defaults used by all
+// constructors and persistence readers. Validate intentionally does not mutate
+// its receiver because it is a predicate.
+func (e Endpoint) Normalized() Endpoint {
+	if e.Herdr == "" {
+		e.Herdr = HerdrAuto
+	}
+	return e
+}
+
+func (e Endpoint) HerdrEnabled() bool {
+	return e.Normalized().Herdr == HerdrAuto
 }
 
 func (e Endpoint) Portable() PortableEndpoint {

@@ -7,6 +7,8 @@ import (
 	"strings"
 )
 
+var ErrSourceConflict = errors.New("explicit source conflicts with observed Codex identity")
+
 type ResolvedTarget struct {
 	Endpoint Endpoint
 	Target   Target
@@ -39,7 +41,7 @@ func (s EndpointStore) ResolveEndpoint(selector, codexHome string) (Endpoint, er
 // ResolveDestination resolves only the destination selector. It does not
 // inspect CODEX_THREAD_ID and cannot accidentally rebind source identity when
 // the caller supplies an endpoint override.
-func (s EndpointStore) ResolveDestination(target Target, endpointOverride, codexHome string, herdr *HerdrResolver) (ResolvedTarget, error) {
+func (s EndpointStore) ResolveDestination(ctx context.Context, target Target, endpointOverride, codexHome string, herdr *HerdrResolver) (ResolvedTarget, error) {
 	selector := endpointOverride
 	if target.Explicit {
 		if target.Endpoint == "" {
@@ -56,14 +58,14 @@ func (s EndpointStore) ResolveDestination(target Target, endpointOverride, codex
 	case TargetCodex:
 		result.ThreadID = target.ThreadID
 	case TargetAgent, TargetPane, TargetBare:
-		if herdr == nil || endpoint.Herdr == HerdrDisabled {
+		if herdr == nil || !endpoint.HerdrEnabled() {
 			return ResolvedTarget{}, fmt.Errorf("resolver_unavailable: Herdr is disabled for endpoint %s", endpoint.Alias)
 		}
 		selectorTarget := target
 		if target.Kind == TargetBare {
 			selectorTarget = Target{Kind: TargetAgent, Name: target.Name}
 		}
-		resolved, resolveErr := herdr.Resolve(context.Background(), selectorTarget)
+		resolved, resolveErr := herdr.ResolveEndpoint(ctx, endpoint, selectorTarget)
 		if resolveErr != nil {
 			return ResolvedTarget{}, resolveErr
 		}
@@ -92,6 +94,19 @@ func (s EndpointStore) ResolveSource(options SourceOptions) (ResolvedTarget, err
 		}
 		if target.Kind != TargetCodex {
 			return ResolvedTarget{}, errors.New("reply-to source must be a direct codex thread URI")
+		}
+		if strings.TrimSpace(options.CurrentThreadID) != "" {
+			observed, observedErr := s.EnsureBuiltinLocal(options.CodexHome)
+			if observedErr != nil {
+				return ResolvedTarget{}, observedErr
+			}
+			explicit, explicitErr := s.ResolveEndpoint(target.Endpoint, options.CodexHome)
+			if explicitErr != nil {
+				return ResolvedTarget{}, explicitErr
+			}
+			if target.ThreadID != options.CurrentThreadID || explicit.ID != observed.ID {
+				return ResolvedTarget{}, ErrSourceConflict
+			}
 		}
 		endpoint, err := s.ResolveEndpoint(target.Endpoint, options.CodexHome)
 		if err != nil {

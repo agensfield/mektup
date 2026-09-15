@@ -23,6 +23,20 @@ type CommandRunner interface {
 	Run(context.Context, []string) ([]byte, error)
 }
 
+// EndpointCommandRunner is the transport boundary for endpoint-specific
+// Herdr lookups. A caller may provide a remote one-shot implementation for an
+// SSH route; this package only supplies the fixed argv and never builds a
+// shell command or transports bytes itself.
+type EndpointCommandRunner interface {
+	RunEndpoint(context.Context, Endpoint, []string) ([]byte, error)
+}
+
+type EndpointCommandRunnerFunc func(context.Context, Endpoint, []string) ([]byte, error)
+
+func (f EndpointCommandRunnerFunc) RunEndpoint(ctx context.Context, endpoint Endpoint, argv []string) ([]byte, error) {
+	return f(ctx, endpoint, argv)
+}
+
 type ExecRunner struct{}
 
 func (ExecRunner) Run(ctx context.Context, argv []string) ([]byte, error) {
@@ -42,7 +56,8 @@ func (ExecRunner) Run(ctx context.Context, argv []string) ([]byte, error) {
 }
 
 type HerdrResolver struct {
-	Runner CommandRunner
+	Runner         CommandRunner
+	EndpointRunner EndpointCommandRunner
 }
 
 func NewHerdrResolver(runner CommandRunner) *HerdrResolver {
@@ -70,13 +85,41 @@ type herdrAgent struct {
 	Status      string `json:"agent_status"`
 	Agent       string `json:"agent"`
 	Session     struct {
-		Value string `json:"value"`
+		Kind   string `json:"kind"`
+		Source string `json:"source"`
+		Value  string `json:"value"`
 	} `json:"agent_session"`
 }
 
 func (r *HerdrResolver) Resolve(ctx context.Context, target Target) (HerdrResolution, error) {
-	if r == nil || r.Runner == nil {
+	return r.resolve(ctx, target, func(runCtx context.Context, argv []string) ([]byte, error) {
+		return r.Runner.Run(runCtx, argv)
+	})
+}
+
+// ResolveEndpoint binds a resolver query to the selected endpoint. SSH routes
+// require an explicitly supplied endpoint runner, while direct local routes
+// may use the installed herdr executable through Runner.
+func (r *HerdrResolver) ResolveEndpoint(ctx context.Context, endpoint Endpoint, target Target) (HerdrResolution, error) {
+	if r == nil {
 		return HerdrResolution{}, ErrResolverUnavailable
+	}
+	if r.EndpointRunner != nil {
+		return r.resolve(ctx, target, func(runCtx context.Context, argv []string) ([]byte, error) {
+			return r.EndpointRunner.RunEndpoint(runCtx, endpoint, argv)
+		})
+	}
+	if endpoint.Route.Kind == RouteSSH {
+		return HerdrResolution{}, fmt.Errorf("%w: SSH endpoint needs an endpoint-specific Herdr runner", ErrResolverUnavailable)
+	}
+	return r.Resolve(ctx, target)
+}
+
+func (r *HerdrResolver) resolve(ctx context.Context, target Target, run func(context.Context, []string) ([]byte, error)) (HerdrResolution, error) {
+	if r == nil || r.Runner == nil {
+		if r == nil || r.EndpointRunner == nil {
+			return HerdrResolution{}, ErrResolverUnavailable
+		}
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -87,7 +130,7 @@ func (r *HerdrResolver) Resolve(ctx context.Context, target Target) (HerdrResolu
 	if target.Kind != TargetAgent && target.Kind != TargetPane {
 		return HerdrResolution{}, fmt.Errorf("%w: target is not a Herdr selector", ErrInvalidTarget)
 	}
-	list, err := r.Runner.Run(ctx, []string{"herdr", "agent", "list"})
+	list, err := run(ctx, []string{"herdr", "agent", "list"})
 	if err != nil {
 		return HerdrResolution{}, err
 	}
@@ -111,7 +154,7 @@ func (r *HerdrResolver) Resolve(ctx context.Context, target Target) (HerdrResolu
 	if err := validateLive(candidate); err != nil {
 		return HerdrResolution{}, err
 	}
-	get, err := r.Runner.Run(ctx, []string{"herdr", "agent", "get", candidate.PaneID})
+	get, err := run(ctx, []string{"herdr", "agent", "get", candidate.PaneID})
 	if err != nil {
 		return HerdrResolution{}, err
 	}
@@ -133,8 +176,9 @@ func (r *HerdrResolver) Resolve(ctx context.Context, target Target) (HerdrResolu
 }
 
 func validateLive(agent herdrAgent) error {
-	if agent.Name == "" || agent.PaneID == "" || !fullyQualifiedPane(agent.PaneID) ||
-		agent.WorkspaceID == "" || agent.TabID == "" || agent.Session.Value == "" {
+	if agent.Agent != "codex" || agent.Name == "" || agent.PaneID == "" || !fullyQualifiedPane(agent.PaneID) ||
+		agent.WorkspaceID == "" || agent.TabID == "" || agent.Session.Kind != "id" ||
+		agent.Session.Source != "herdr:codex" || agent.Session.Value == "" {
 		return ErrResolverStale
 	}
 	switch strings.ToLower(agent.Status) {
