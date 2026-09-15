@@ -116,6 +116,83 @@ func TestStorageMaintainHonorsThirtyDayRetentionAndSeparatesActions(t *testing.T
 	}
 }
 
+func TestRetentionPreservesUnansweredAndUnknownRequestReplyButPrunesWinner(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	old := now.Load() - int64(31*24*time.Hour)
+	prepareRequest := func(operationID, messageID string) {
+		t.Helper()
+		if _, err := j.Prepare(context.Background(), Operation{OperationID: operationID, MessageID: messageID, SourceRoute: "src", TargetRoute: "dst", Semantics: "send", ReplyRoute: "reply-route", CustodyRoute: "custody", CustodyStoreID: "store-test", AttemptOwner: operationID + "-owner", Digest: operationID + "-digest", BodySize: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.MarkDispatchStarted(context.Background(), operationID); err != nil {
+			t.Fatal(err)
+		}
+		if err := j.RecordResult(context.Background(), operationID, StateAccepted, ""); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := j.db.Exec("UPDATE operations SET created_at=?,updated_at=?,terminal_at=? WHERE operation_id=?", old, old, old, operationID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	prepareRequest("unanswered-op", "unanswered-msg")
+	claim, err := j.ClaimReply(context.Background(), ClaimInput{ReplyID: "unknown-reply", OriginalID: "unanswered-msg", Digest: "unknown-digest", BodySize: 1, Status: "success", ReplyRoute: "reply-route", CustodyRoute: "custody", CustodyStoreID: "store-test", Owner: "receiver"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("UPDATE reply_claims SET created_at=?,updated_at=?,lease_until=? WHERE reply_id=?", old, old, old, claim.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+
+	prepareRequest("completed-op", "completed-msg")
+	winner, err := j.ClaimReply(context.Background(), ClaimInput{ReplyID: "completed-reply", OriginalID: "completed-msg", Digest: "completed-digest", BodySize: 1, Status: "success", ReplyRoute: "reply-route", CustodyRoute: "custody", CustodyStoreID: "store-test", Owner: "receiver"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.CommitReply(context.Background(), winner.ReplyID, winner.Owner, winner.Token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("UPDATE reply_claims SET created_at=?,updated_at=? WHERE reply_id=?", old, old, winner.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+
+	status, err := j.StorageStatus(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.RetentionEligible != 2 {
+		t.Fatalf("retention counted unanswered request: got %d", status.RetentionEligible)
+	}
+	dry, err := j.StorageMaintain(context.Background(), MaintenanceOptions{DryRun: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dry.Actions[0].Eligible != 1 || dry.Actions[1].Eligible != 2 {
+		t.Fatalf("dry-run retention/expiry mismatch: %#v", dry)
+	}
+	if _, err := j.StorageMaintain(context.Background(), MaintenanceOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Operation(context.Background(), "unanswered-op"); err != nil {
+		t.Fatalf("unanswered request was pruned: %v", err)
+	}
+	unknown, err := j.Reply(context.Background(), "unknown-reply")
+	if err != nil || unknown.State != StateReplyOutcomeUnknown {
+		t.Fatalf("expired/unknown reply was not preserved: %#v %v", unknown, err)
+	}
+	if _, err := j.Operation(context.Background(), "completed-op"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("completed operation was not pruned: %v", err)
+	}
+	if _, err := j.Reply(context.Background(), "completed-reply"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("completed reply was not pruned: %v", err)
+	}
+	if _, err := j.StorageCheck(context.Background()); err != nil {
+		t.Fatalf("prune left inconsistent relationships: %v", err)
+	}
+}
+
 func TestStorageVacuumReportsSizeAndIsExplicit(t *testing.T) {
 	dir := t.TempDir()
 	var now atomic.Int64

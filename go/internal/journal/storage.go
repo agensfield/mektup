@@ -15,6 +15,36 @@ import (
 // Unknown and active records are never eligible solely because of age.
 const RetentionAge = 30 * 24 * time.Hour
 
+const retentionOperationStates = `state IN (?,?,?,?) AND terminal_at IS NOT NULL AND terminal_at > 0 AND terminal_at <= ?`
+
+// retentionOperationPredicate keeps an accepted request-reply operation
+// alive until custody has a durable winner and every related claim is itself
+// terminal and old. This prevents an accepted outbound send from erasing the
+// relationship a later wait needs to inspect.
+const retentionOperationPredicate = retentionOperationStates + ` AND (
+	reply_route = '' OR (
+		state IN (?,?,?) AND NOT EXISTS (
+			SELECT 1 FROM reply_claims related
+			WHERE related.original_id = operations.message_id
+			  AND (related.state NOT IN (?,?) OR related.updated_at > ?)
+		)
+	) OR (
+		state = ? AND
+		EXISTS (
+			SELECT 1 FROM reply_winners w
+			JOIN reply_claims winner ON winner.reply_id = w.reply_id
+			WHERE w.original_id = operations.message_id
+			  AND winner.state IN (?,?)
+			  AND winner.updated_at <= ?
+		)
+		AND NOT EXISTS (
+			SELECT 1 FROM reply_claims related
+			WHERE related.original_id = operations.message_id
+			  AND (related.state NOT IN (?,?) OR related.updated_at > ?)
+		)
+	)
+)`
+
 var (
 	ErrStorageBusy = errors.New("journal: storage busy")
 	// ErrStorageCorrupt is an alias for the journal's established corruption
@@ -160,7 +190,7 @@ func (j *Journal) StorageStatus(ctx context.Context) (StorageStatus, error) {
 	if j.now != nil {
 		status.RetentionCutoff = j.now().UTC().Add(-RetentionAge)
 	}
-	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations WHERE state IN (?,?,?,?) AND terminal_at IS NOT NULL AND terminal_at > 0 AND terminal_at <= ?`, string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), status.RetentionCutoff.UnixNano()).Scan(&status.RetentionEligible); err != nil {
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations WHERE `+retentionOperationPredicate, retentionOperationArgs(status.RetentionCutoff.UnixNano())...).Scan(&status.RetentionEligible); err != nil {
 		return status, classifyStorageError(err)
 	}
 	var replies int64
@@ -188,6 +218,16 @@ func statFile(path string, bytes *int64, modified *time.Time) error {
 		*modified = info.ModTime().UTC()
 	}
 	return nil
+}
+
+func retentionOperationArgs(cutoff int64) []any {
+	return []any{
+		string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), cutoff,
+		string(StateRejected), string(StateNotSent), string(StateManuallyResolved),
+		string(StateReplyAccepted), string(StateReplyObserved), cutoff,
+		string(StateAccepted), string(StateReplyAccepted), string(StateReplyObserved), cutoff,
+		string(StateReplyAccepted), string(StateReplyObserved), cutoff,
+	}
 }
 
 // StorageCheck performs only SELECTs and read-only SQLite pragmas. It never
@@ -283,18 +323,19 @@ func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) 
 		{Kind: "optimize", Attempted: !opts.DryRun},
 	}}
 	var eligibleOps, eligibleReplies, activeExpired int64
-	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations WHERE state IN (?,?,?,?) AND terminal_at IS NOT NULL AND terminal_at > 0 AND terminal_at <= ?`, string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), cutoff.UnixNano()).Scan(&eligibleOps); err != nil {
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations WHERE `+retentionOperationPredicate, retentionOperationArgs(cutoff.UnixNano())...).Scan(&eligibleOps); err != nil {
 		return receipt, classifyStorageError(err)
 	}
 	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims WHERE state IN (?,?) AND updated_at <= ?`, string(StateReplyAccepted), string(StateReplyObserved), cutoff.UnixNano()).Scan(&eligibleReplies); err != nil {
 		return receipt, classifyStorageError(err)
 	}
 	receipt.Actions[1].Eligible = eligibleOps + eligibleReplies
-	if opts.DryRun {
-		return receipt, nil
-	}
 	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims WHERE state=? AND lease_until <= ?`, string(StateReplyClaimed), now.UnixNano()).Scan(&activeExpired); err != nil {
 		return receipt, classifyStorageError(err)
+	}
+	receipt.Actions[0].Eligible = activeExpired
+	if opts.DryRun {
+		return receipt, nil
 	}
 	if err := j.ExpireClaims(ctx); err != nil {
 		receipt.Actions[0].Error = err.Error()
@@ -304,10 +345,11 @@ func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) 
 	receipt.Actions[0].Changed = activeExpired
 	var pruned int64
 	err := j.withTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.Exec(`DELETE FROM events WHERE operation_id IN (SELECT operation_id FROM operations WHERE state IN (?,?,?,?) AND terminal_at IS NOT NULL AND terminal_at > 0 AND terminal_at <= ?)`, string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), cutoff.UnixNano()); err != nil {
+		args := retentionOperationArgs(cutoff.UnixNano())
+		if _, err := tx.Exec(`DELETE FROM events WHERE operation_id IN (SELECT operation_id FROM operations WHERE `+retentionOperationPredicate+`)`, args...); err != nil {
 			return err
 		}
-		res, err := tx.Exec(`DELETE FROM operations WHERE state IN (?,?,?,?) AND terminal_at IS NOT NULL AND terminal_at > 0 AND terminal_at <= ?`, string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), cutoff.UnixNano())
+		res, err := tx.Exec(`DELETE FROM operations WHERE `+retentionOperationPredicate, args...)
 		if err != nil {
 			return err
 		}

@@ -93,6 +93,9 @@ func DefaultOptions(paths Paths) Options { return Options{Paths: paths} }
 // only safe repairs returned by probes are applied, one by one, and every
 // attempted action gets a receipt, including failures.
 func Run(ctx context.Context, opts Options, fix bool) (Report, error) {
+	if err := ValidatePaths(opts.Paths); err != nil {
+		return Report{ReadOnly: !fix, Fix: fix}, err
+	}
 	now := time.Now().UTC()
 	if opts.Now != nil {
 		now = opts.Now().UTC()
@@ -254,7 +257,10 @@ func chmodFix(path string, mode os.FileMode) FixFunc {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return "", fmt.Errorf("refusing symlink repair: %s", path)
 		}
-		if err := os.Chmod(path, mode); err != nil {
+		if info.Mode()&os.ModeSocket != 0 {
+			return "", fmt.Errorf("refusing socket permission repair without descriptor support: %s", path)
+		}
+		if err := safeChmod(path, mode); err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("mode set to %04o", mode.Perm()), nil

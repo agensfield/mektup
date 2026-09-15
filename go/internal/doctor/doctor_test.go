@@ -77,3 +77,42 @@ func TestDoctorInjectableProbeDoesNotRunFixUnlessNamed(t *testing.T) {
 		t.Fatalf("fix injected probe: %#v %v called=%d", fixed, err, called)
 	}
 }
+
+func TestDoctorRejectsRelativePathsBeforeProbingOrFixing(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	report, err := Run(context.Background(), Options{Paths: Paths{StateDir: "relative-state", ConfigDir: "relative-config", ConfigFile: "relative-config/config.json"}}, true)
+	if err == nil {
+		t.Fatal("relative paths unexpectedly accepted")
+	}
+	if len(report.Plan) != 0 || len(report.Repairs) != 0 {
+		t.Fatalf("invalid path produced a repair plan/receipt: %#v", report)
+	}
+	for _, path := range []string{"relative-state", "relative-config"} {
+		if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+			t.Fatalf("invalid path caused mutation at %s: %v", path, statErr)
+		}
+	}
+}
+
+func TestDoctorPermissionRepairRefusesSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	link := filepath.Join(root, "link")
+	if err := os.WriteFile(target, []byte("private"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := chmodFix(link, 0600)(context.Background()); err == nil {
+		t.Fatal("symlink permission repair unexpectedly succeeded")
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0644 {
+		t.Fatalf("symlink repair changed target mode to %04o", info.Mode().Perm())
+	}
+}
