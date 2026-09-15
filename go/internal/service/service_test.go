@@ -14,6 +14,7 @@ import (
 const (
 	epSource = "ep_01999999-9999-7999-8999-999999999999"
 	epTarget = "ep_02999999-9999-7999-8999-999999999999"
+	epReply  = "ep_03999999-9999-7999-8999-999999999999"
 	storeID  = "store_03999999-9999-7999-8999-999999999999"
 )
 
@@ -296,6 +297,20 @@ func TestReplyObservationUsesReplyBodyDigestAndPinnedReplyRoute(t *testing.T) {
 	}
 }
 
+func TestReplyObservationUsesIndependentEndpointAndThread(t *testing.T) {
+	status := OperationStatus{Operation: Operation{MessageID: "msg_25999999-9999-7999-8999-999999999999", SourceRoute: "codex://local/thread/source", TargetRoute: "codex://local/thread/target", ReplyRoute: "codex://third/thread/reply", ReplyEndpointID: epReply, SourceEndpointID: epSource, TargetEndpointID: epTarget, ReplyRequested: true}, ReplyDigest: digest("answer"), ReplyBodySize: 6}
+	e := mektup.Envelope{MessageID: "msg_26999999-9999-7999-8999-999999999999", Kind: mektup.KindReply, FromEndpointID: epTarget, From: status.TargetRoute, FromKind: "agent", ToEndpointID: epReply, To: status.ReplyRoute, RequestedTarget: status.ReplyRoute, InReplyTo: status.MessageID, ReplyStatus: mektup.ReplySuccess, Body: "answer", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	e.PayloadBytes = uint64(len(e.Body))
+	e.PayloadSHA256 = digest(e.Body)
+	payload, err := mektup.RenderEnvelope(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateObservedEnvelope(ObservedItem{ThreadID: "reply", NativeItemID: "native", ClientMessageID: e.MessageID, Text: string(payload)}, status, true); err != nil {
+		t.Fatal(err)
+	}
+}
+
 type countingDelivery struct {
 	inner        *fakeDelivery
 	firstErr     error
@@ -410,6 +425,21 @@ func TestReplyResumesAndDetachesUnloadedPersistentReturnTarget(t *testing.T) {
 	}
 	if d.resume != 1 || d.detach != 1 {
 		t.Fatalf("persistent reply residency not closed: resume=%d detach=%d", d.resume, d.detach)
+	}
+}
+
+func TestReplyReviewRetryReachesCommit(t *testing.T) {
+	r := baseResolver()
+	d := &repeatedReviewDelivery{}
+	j := newFakeJournal()
+	original := mektup.Envelope{MessageID: "msg_21999999-9999-7999-8999-999999999999", Kind: mektup.KindMessage, FromEndpointID: epSource, From: r.source.URI, FromKind: "agent", ToEndpointID: epTarget, To: r.target.URI, RequestedTarget: "target", ReplyRequested: true, ReplyEndpointID: epSource, ReplyTo: r.source.URI, ReplyCustodyEndpointID: epSource, ReplyCustodyStoreID: storeID, Body: "request", Provenance: "observed"}
+	original.PayloadBytes = uint64(len(original.Body))
+	original.PayloadSHA256 = digest(original.Body)
+	original.SentAt = time.Now().UTC().Format(time.RFC3339Nano)
+	replyID := "msg_22999999-9999-7999-8999-999999999999"
+	out, err := (&Service{Resolver: &r, Delivery: d, Journal: j}).Reply(context.Background(), originalResolver{original: OriginalMessage{Envelope: original, CurrentThread: r.target.URI}}, ReplyRequest{Reference: original.MessageID, MessageID: replyID, Body: "answer", DeliveryTimeout: time.Second})
+	if err != nil || out.Receipt.State != mektup.StateReplyAccepted || j.claims[replyID].State != mektup.StateReplyAccepted {
+		t.Fatalf("retry did not commit: calls=%d receipt=%s claim=%s err=%v", d.calls, out.Receipt.State, j.claims[replyID].State, err)
 	}
 }
 

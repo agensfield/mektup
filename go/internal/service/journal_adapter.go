@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"time"
 
 	"github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/internal/journal"
@@ -74,6 +75,7 @@ func (a SQLiteJournal) Lookup(ctx context.Context, ref string) (OperationStatus,
 	// putting bodies or relationship prose in the journal schema.
 	if ownClaim, claimErr := a.Inner.Reply(ctx, r.MessageID); claimErr == nil {
 		status.InReplyTo = ownClaim.OriginalID
+		status.State = mektup.EvidenceState(ownClaim.State)
 	}
 	claims, err := a.Inner.RepliesFor(ctx, r.MessageID)
 	if err != nil {
@@ -144,6 +146,33 @@ func (a SQLiteJournal) ReconcileReplyObservation(ctx context.Context, id, native
 		return err
 	}
 	return a.Inner.ReconcileReplyObservation(ctx, id, native, digest)
+}
+
+func (a SQLiteJournal) WaitReply(ctx context.Context, replyID string, timeout time.Duration) (OperationStatus, error) {
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := a.ExpireClaims(ctx); err != nil {
+			return OperationStatus{}, err
+		}
+		status, err := a.Lookup(ctx, replyID)
+		if err != nil {
+			return OperationStatus{}, err
+		}
+		if status.State == mektup.StateReplyAccepted || status.State == mektup.StateReplyObserved || status.State == mektup.StateReplyOutcomeUnknown {
+			return status, nil
+		}
+		select {
+		case <-ctx.Done():
+			return status, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func replyClaim(c journal.ReplyClaim) ReplyClaim {

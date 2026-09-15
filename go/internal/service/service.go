@@ -258,6 +258,13 @@ type JournalPort interface {
 	ReconcileReplyObservation(context.Context, string, string, string) error
 }
 
+// JoinedReplyWaiter is an optional custody-side wait used when a receiver
+// joins an existing fenced claim. It observes the same claim and never
+// redispatches its body.
+type JoinedReplyWaiter interface {
+	WaitReply(context.Context, string, time.Duration) (OperationStatus, error)
+}
+
 type Service struct {
 	Resolver Resolver
 	Delivery DeliveryPort

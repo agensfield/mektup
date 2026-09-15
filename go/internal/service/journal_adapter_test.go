@@ -42,6 +42,25 @@ func TestSQLiteJournalAdapterPreservesDispatchFenceAndReceiptIdentity(t *testing
 	}
 }
 
+func TestOperationByMessageRedactsAttemptToken(t *testing.T) {
+	ctx := context.Background()
+	inner, err := journal.Open(ctx, journal.Options{StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	if _, err := inner.Prepare(ctx, journal.Operation{OperationID: "op_23999999-9999-7999-8999-999999999999", MessageID: "msg_24999999-9999-7999-8999-999999999999", SourceRoute: "src", TargetRoute: "dst", Semantics: "message", Digest: digest("x"), BodySize: 1}); err != nil {
+		t.Fatal(err)
+	}
+	record, err := inner.OperationByMessage(ctx, "msg_24999999-9999-7999-8999-999999999999")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.AttemptToken != "" {
+		t.Fatal("message lookup exposed a live fencing token")
+	}
+}
+
 func TestSQLiteJournalAdapterReplyAcceptanceProjectsClaimMetadata(t *testing.T) {
 	ctx := context.Background()
 	inner, err := journal.Open(ctx, journal.Options{StateDir: t.TempDir()})

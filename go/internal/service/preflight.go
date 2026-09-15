@@ -41,7 +41,11 @@ func validateObservedEnvelope(item ObservedItem, original OperationStatus, accep
 	if original.Operation.TargetEndpointID != "" && e.FromEndpointID != original.Operation.TargetEndpointID {
 		return mektup.Envelope{}, fmt.Errorf("reply sender endpoint mismatch")
 	}
-	if original.Operation.SourceEndpointID != "" && e.ToEndpointID != original.Operation.SourceEndpointID {
+	expectedEndpoint := original.ReplyEndpointID
+	if expectedEndpoint == "" {
+		expectedEndpoint = original.Operation.SourceEndpointID
+	}
+	if expectedEndpoint != "" && e.ToEndpointID != expectedEndpoint {
 		return mektup.Envelope{}, fmt.Errorf("reply destination endpoint mismatch")
 	}
 	if original.ReplyDigest != "" && e.PayloadSHA256 != original.ReplyDigest {
@@ -50,7 +54,7 @@ func validateObservedEnvelope(item ObservedItem, original OperationStatus, accep
 	if original.ReplyBodySize > 0 && int64(e.PayloadBytes) != original.ReplyBodySize {
 		return mektup.Envelope{}, fmt.Errorf("reply body size mismatch")
 	}
-	if item.ThreadID != "" && item.ThreadID != threadID(original.SourceRoute) {
+	if item.ThreadID != "" && item.ThreadID != threadID(expectedRoute) {
 		return mektup.Envelope{}, fmt.Errorf("reply was observed in a different thread")
 	}
 	if item.ClientMessageID != "" && item.ClientMessageID != e.MessageID {

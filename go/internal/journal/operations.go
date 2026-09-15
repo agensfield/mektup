@@ -105,6 +105,9 @@ func (j *Journal) OperationByMessage(ctx context.Context, messageID string) (Ope
 	if err == sql.ErrNoRows {
 		return out, ErrNotFound
 	}
+	// Message lookup is read-only and must never grant the live dispatch
+	// fencing token. Owned-token recovery remains confined to Prepare.
+	out.AttemptToken = ""
 	return out, err
 }
 
