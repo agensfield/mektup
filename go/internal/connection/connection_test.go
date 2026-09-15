@@ -359,3 +359,61 @@ func TestCallCannotBypassClosedGateAndEventsRemainObservable(t *testing.T) {
 	default:
 	}
 }
+
+func TestRPCAdapterPreservesCallerIDAndAppserverErrorEvidence(t *testing.T) {
+	conn, f := connectFixture(t, "codex/0.154.0", Options{ExperimentalAPI: true})
+	defer conn.Close(context.Background())
+	adapter := NewRPCAdapter(conn)
+	if !adapter.ExperimentalAPIEnabled() {
+		t.Fatal("adapter lost experimental API proof")
+	}
+	f.onWrite = func(payload []byte) {
+		var msg struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+		}
+		if err := json.Unmarshal(payload, &msg); err != nil {
+			t.Errorf("decode raw request: %v", err)
+			return
+		}
+		switch msg.Method {
+		case "raw/read":
+			f.reads <- appserver.Frame{Type: appserver.FrameText, Payload: []byte(fmt.Sprintf(`{"id":%s,"result":{"nested":{"ok":true}}}`, msg.ID))}
+		case "raw/error":
+			f.reads <- appserver.Frame{Type: appserver.FrameText, Payload: []byte(fmt.Sprintf(`{"id":%s,"error":{"code":-32603,"message":"raw failure","data":{"nested":{"reason":"preserve"}}}}`, msg.ID))}
+		}
+	}
+	result, err := adapter.Call(context.Background(), appserver.RPCRequest{ID: "caller-selected", Method: "raw/read"})
+	if err != nil || result == nil || result.ID != "caller-selected" || string(result.Value) != `{"nested":{"ok":true}}` || result.Evidence.Phase != appserver.WriteComplete || result.Generation != conn.Generation() {
+		t.Fatalf("raw result = %+v err=%v", result, err)
+	}
+	_, err = adapter.Call(context.Background(), appserver.RPCRequest{ID: "error-id", Method: "raw/error"})
+	var callErr *appserver.CallError
+	if !errors.As(err, &callErr) || callErr.Server == nil || callErr.Server.Code != -32603 || string(callErr.Server.Data) != `{"nested":{"reason":"preserve"}}` || callErr.Evidence.Phase != appserver.WriteComplete || callErr.Generation != conn.Generation() {
+		t.Fatalf("raw server error = %T %+v", err, err)
+	}
+}
+
+func TestRPCAdapterClosedGateRejectsBeforeWrite(t *testing.T) {
+	conn, f := connectFixture(t, "codex/0.154.0", Options{})
+	adapter := NewRPCAdapter(conn)
+	if err := conn.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := adapter.Call(context.Background(), appserver.RPCRequest{ID: "closed", Method: "raw/read"})
+	var callErr *appserver.CallError
+	if !errors.As(err, &callErr) || callErr.Evidence.Phase != appserver.WriteProvenBeforeWrite || callErr.Generation != conn.Generation() {
+		t.Fatalf("closed gate error = %T %+v", err, err)
+	}
+	select {
+	case payload := <-f.writes:
+		if strings.Contains(string(payload), `"method":"raw/read"`) {
+			t.Fatalf("closed adapter wrote operational request: %s", payload)
+		}
+	default:
+	}
+	var nilAdapter *RPCAdapter
+	if nilAdapter.ExperimentalAPIEnabled() {
+		t.Fatal("nil raw adapter reported experimental API")
+	}
+}

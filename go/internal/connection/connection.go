@@ -182,6 +182,45 @@ type Connection struct {
 
 var _ codexapi.Caller = (*Connection)(nil)
 
+// RPCAdapter exposes the low-level appserver request/result contract without
+// exposing Connection's underlying client. It is intended for raw-RPC layers
+// that need caller-selected request IDs and appserver's untouched evidence.
+type RPCAdapter struct{ connection *Connection }
+
+// NewRPCAdapter constructs a raw-RPC adapter over one compatibility-gated
+// connection. A nil connection is retained as a safe, closed adapter.
+func NewRPCAdapter(connection *Connection) *RPCAdapter {
+	return &RPCAdapter{connection: connection}
+}
+
+var _ interface {
+	Call(context.Context, appserver.RPCRequest) (*appserver.RPCResult, error)
+	ExperimentalAPIEnabled() bool
+} = (*RPCAdapter)(nil)
+
+// ExperimentalAPIEnabled reports the negotiated initialize capability.
+func (a *RPCAdapter) ExperimentalAPIEnabled() bool {
+	if a == nil || a.connection == nil {
+		return false
+	}
+	return a.connection.ExperimentalAPIEnabled()
+}
+
+// Call delegates exactly one request after the connection's initialized,
+// compatibility, and closed gate. The appserver result and error are returned
+// untouched, including caller-selected IDs, nested server data, generation,
+// and write evidence.
+func (a *RPCAdapter) Call(ctx context.Context, request appserver.RPCRequest) (*appserver.RPCResult, error) {
+	if a == nil {
+		return nil, &appserver.CallError{Err: ErrNotReady, Evidence: appserver.WriteEvidence{Phase: appserver.WriteProvenBeforeWrite}}
+	}
+	client, _, gateErr := a.connection.operationalClient()
+	if gateErr != nil {
+		return nil, &appserver.CallError{Err: gateErr.Err, Evidence: gateErr.Evidence, Generation: gateErr.Generation}
+	}
+	return client.Call(ctx, request)
+}
+
 // Connect resolves and opens exactly the supplied route, completes the full
 // appserver handshake, and gates operational use on compatibility. On an
 // unsupported server the client is closed and CompatibilityError retains the
@@ -305,6 +344,22 @@ func (c *Connection) ExperimentalAPIEnabled() bool {
 	return c.experimentalAPI
 }
 
+func (c *Connection) operationalClient() (*appserver.Client, Info, *CallError) {
+	if c == nil {
+		return nil, Info{}, &CallError{Err: ErrNotReady, Evidence: appserver.WriteEvidence{Phase: appserver.WriteProvenBeforeWrite}}
+	}
+	c.mu.RLock()
+	client := c.client
+	closed := c.closed
+	info := c.info
+	c.mu.RUnlock()
+	if closed || client == nil || info.Compatibility.Class == compat.Unsupported {
+		evidence := appserver.WriteEvidence{Phase: appserver.WriteProvenBeforeWrite, Generation: info.Generation}
+		return nil, info, &CallError{Err: ErrNotReady, Evidence: evidence, Generation: info.Generation}
+	}
+	return client, info, nil
+}
+
 // Call implements codexapi.Caller. The compatibility and initialization gates
 // are checked before reaching appserver.Client.Call, so an operational request
 // can never bypass this layer.
@@ -329,21 +384,9 @@ func (c *Connection) RawCall(ctx context.Context, method string, params json.Raw
 // request-id machinery. It dispatches exactly once and returns JSON-RPC server
 // errors as data, matching codexapi.Caller's second-return contract.
 func (c *Connection) CallDetailed(ctx context.Context, method string, params json.RawMessage) (RawCall, error) {
-	if c == nil {
-		return RawCall{Evidence: appserver.WriteEvidence{Phase: appserver.WriteProvenBeforeWrite}}, &CallError{Err: ErrNotReady, Evidence: appserver.WriteEvidence{Phase: appserver.WriteProvenBeforeWrite}}
-	}
-	c.mu.RLock()
-	client := c.client
-	closed := c.closed
-	info := c.info
-	c.mu.RUnlock()
-	if closed || client == nil || info.Compatibility.Class == compat.Unsupported {
-		evidence := appserver.WriteEvidence{Phase: appserver.WriteProvenBeforeWrite, Generation: info.Generation}
-		return RawCall{Evidence: evidence, Generation: info.Generation}, &CallError{
-			Err:        ErrNotReady,
-			Evidence:   evidence,
-			Generation: info.Generation,
-		}
+	client, info, gateErr := c.operationalClient()
+	if gateErr != nil {
+		return RawCall{Evidence: gateErr.Evidence, Generation: gateErr.Generation}, gateErr
 	}
 	result, err := client.Call(ctx, appserver.RPCRequest{ID: fmt.Sprintf("mektup:%d", c.nextID.Add(1)), Method: method, Params: params})
 	if err != nil {
