@@ -286,7 +286,7 @@ func TestLifecycleWarningsRemainAtEnvelopeLevel(t *testing.T) {
 	}
 	first, _ := warnings[0].(map[string]any)
 	second, _ := warnings[1].(map[string]any)
-	if first["code"] != "experimental_api" || second["code"] != "compatibility_warning" {
+	if first["code"] != "evidence_gap" || second["code"] != "untested_server_version" || first["details"] == nil || second["details"] == nil {
 		t.Fatalf("warning objects=%#v", warnings)
 	}
 	data, _ := event["data"].(map[string]any)

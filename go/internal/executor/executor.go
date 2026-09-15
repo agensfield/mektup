@@ -588,11 +588,11 @@ func (e *Executor) result(ctx context.Context, kind string, data any, cursor str
 func warningObjects(warnings []string) []map[string]any {
 	objects := make([]map[string]any, 0, len(warnings))
 	for _, warning := range warnings {
-		code := "compatibility_warning"
+		code := "untested_server_version"
 		if strings.Contains(strings.ToLower(warning), "experimental") {
-			code = "experimental_api"
+			code = "evidence_gap"
 		}
-		objects = append(objects, map[string]any{"code": code, "message": warning})
+		objects = append(objects, map[string]any{"code": code, "message": warning, "details": map[string]any{}})
 	}
 	return objects
 }
