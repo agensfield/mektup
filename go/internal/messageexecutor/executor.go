@@ -35,6 +35,10 @@ type ArtifactFactory func(context.Context, cli.Invocation) (receipts.SpillWriter
 type HistoryFactory func(context.Context, cli.Invocation, mektup.Receipt) (receipts.HistoryPort, error)
 type InspectorFactory func(context.Context, cli.Invocation) (receipts.TargetInspector, error)
 type HumanGateFactory func(context.Context, cli.Invocation) (receipts.HumanGate, error)
+type ReceiptImportResolver interface {
+	ResolveOriginal(context.Context, cli.Invocation, receipts.Imported) (service.OriginalResolver, error)
+	ResolveWaitReference(context.Context, cli.Invocation, receipts.Imported) (string, error)
+}
 
 type ReceiptStore interface {
 	List(context.Context, receipts.ListOptions) ([]mektup.Receipt, error)
@@ -46,15 +50,16 @@ type ReceiptStore interface {
 }
 
 type Ports struct {
-	Service   ServiceFactory
-	Original  OriginalResolverFactory
-	Receipts  ReceiptStore
-	Input     InputPort
-	Artifacts ArtifactFactory
-	History   HistoryFactory
-	Inspector InspectorFactory
-	HumanGate HumanGateFactory
-	Actor     string
+	Service        ServiceFactory
+	Original       OriginalResolverFactory
+	Receipts       ReceiptStore
+	Input          InputPort
+	Artifacts      ArtifactFactory
+	History        HistoryFactory
+	Inspector      InspectorFactory
+	HumanGate      HumanGateFactory
+	ImportResolver ReceiptImportResolver
+	Actor          string
 }
 
 type Executor struct{ ports Ports }
@@ -148,9 +153,23 @@ func (e *Executor) reply(ctx context.Context, inv cli.Invocation) (cli.Execution
 		return cli.ExecutionResult{}, err
 	}
 	if e.ports.Original == nil {
-		return cli.ExecutionResult{}, cliErr("message_not_found", "original message resolver factory is required", "not_sent", cli.ExitInternal)
+		if inv.Option("receipt-file") == "" || e.ports.ImportResolver == nil {
+			if inv.Option("receipt-file") != "" {
+				return cli.ExecutionResult{}, cliErr("route_unavailable", "receipt-file requires an injected untrusted receipt resolver", "not_sent", cli.ExitRejected)
+			}
+			return cli.ExecutionResult{}, cliErr("message_not_found", "original message resolver factory is required", "not_sent", cli.ExitInternal)
+		}
 	}
-	original, err := e.ports.Original(ctx, inv)
+	var original service.OriginalResolver
+	if inv.Option("receipt-file") != "" {
+		imported, importErr := e.importReceipt(ctx, inv)
+		if importErr != nil {
+			return cli.ExecutionResult{}, importErr
+		}
+		original, err = e.ports.ImportResolver.ResolveOriginal(ctx, inv, imported)
+	} else {
+		original, err = e.ports.Original(ctx, inv)
+	}
 	if err != nil {
 		return cli.ExecutionResult{}, mapError(err)
 	}
@@ -173,20 +192,40 @@ func (e *Executor) wait(ctx context.Context, inv cli.Invocation) (cli.ExecutionR
 	if err != nil {
 		return cli.ExecutionResult{}, err
 	}
-	result, callErr := svc.Wait(ctx, service.WaitRequest{Reference: inv.Position[0], Timeout: timeout})
+	reference := inv.Position[0]
+	if inv.Option("receipt-file") != "" {
+		if e.ports.ImportResolver == nil {
+			return cli.ExecutionResult{}, cliErr("route_unavailable", "receipt-file requires an injected untrusted receipt resolver", "not_sent", cli.ExitRejected)
+		}
+		imported, importErr := e.importReceipt(ctx, inv)
+		if importErr != nil {
+			return cli.ExecutionResult{}, importErr
+		}
+		reference, err = e.ports.ImportResolver.ResolveWaitReference(ctx, inv, imported)
+		if err != nil {
+			return cli.ExecutionResult{}, mapError(err)
+		}
+	}
+	result, callErr := svc.Wait(ctx, service.WaitRequest{Reference: reference, Timeout: timeout})
 	if result.Receipt.ReceiptID == "" {
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr)
 		}
 		return cli.ExecutionResult{}, cliErr("internal_error", "wait returned no receipt", "unknown", cli.ExitInternal)
 	}
-	eventName := "wait.completed"
+	eventName := "reply.accepted"
 	if result.Incomplete {
 		eventName = "wait.incomplete"
+	} else if result.State == mektup.StateReplyOutcomeUnknown {
+		eventName = "reply.unknown"
 	}
-	event := lifecycle(eventName, result.Receipt, true, result.State == mektup.StateReplyAccepted || result.State == mektup.StateReplyObserved)
+	ok := result.State == mektup.StateReplyAccepted || result.State == mektup.StateReplyObserved
+	if result.ReplyStatus == string(mektup.ReplyError) {
+		ok = false
+	}
+	event := lifecycle(eventName, result.Receipt, true, ok)
 	if callErr != nil {
-		return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: event}}, Receipt: result.Receipt, Exit: errorExit(callErr)}, nil
+		return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: event}}, Receipt: result.Receipt, Exit: waitExit(&result, callErr)}, nil
 	}
 	return cli.ExecutionResult{Events: []cli.OutputEvent{{Machine: event}}, Receipt: result.Receipt}, nil
 }
@@ -216,7 +255,11 @@ func (e *Executor) receipt(ctx context.Context, inv cli.Invocation) (cli.Executi
 	sub := inv.Position[0]
 	switch sub {
 	case "list":
-		items, err := e.ports.Receipts.List(ctx, receipts.ListOptions{State: mektup.EvidenceState(inv.Option("state")), Since: parseSince(inv.Option("since")), Limit: optionInt(inv, "limit")})
+		since, sinceErr := parseSince(inv.Option("since"))
+		if sinceErr != nil {
+			return cli.ExecutionResult{}, sinceErr
+		}
+		items, err := e.ports.Receipts.List(ctx, receipts.ListOptions{State: mektup.EvidenceState(inv.Option("state")), Since: since, Limit: optionInt(inv, "limit")})
 		if err != nil {
 			return cli.ExecutionResult{}, mapError(err)
 		}
@@ -314,17 +357,20 @@ func (e *Executor) body(ctx context.Context, inv cli.Invocation, messageIndex in
 		if e.ports.Input == nil {
 			return "", cliErr("internal_error", "input port is required", "not_sent", cli.ExitInternal)
 		}
-		data, err = e.ports.Input.ReadStdin(ctx, int64(4*MaxInputChars))
+		data, err = e.ports.Input.ReadStdin(ctx, int64(4*MaxInputChars+1))
 	case file:
 		if e.ports.Input == nil {
 			return "", cliErr("internal_error", "input port is required", "not_sent", cli.ExitInternal)
 		}
-		data, err = e.ports.Input.ReadFile(ctx, inv.Option("file"), int64(4*MaxInputChars))
+		data, err = e.ports.Input.ReadFile(ctx, inv.Option("file"), int64(4*MaxInputChars+1))
 	default:
 		data = []byte(inv.Position[messageIndex])
 	}
 	if err != nil {
 		return "", cliErr("invalid_arguments", "message source could not be read", "not_sent", cli.ExitUsage)
+	}
+	if len(data) > 4*MaxInputChars {
+		return "", cliErr("input_too_large", "message body exceeds the UTF-8 byte bound for the character limit", "not_sent", cli.ExitUsage)
 	}
 	if len(data) == 0 || !utf8.Valid(data) {
 		return "", cliErr("invalid_arguments", "message body must be non-empty UTF-8", "not_sent", cli.ExitUsage)
@@ -333,6 +379,24 @@ func (e *Executor) body(ctx context.Context, inv cli.Invocation, messageIndex in
 		return "", cliErr("input_too_large", "message body exceeds the 2^20 character limit", "not_sent", cli.ExitUsage)
 	}
 	return string(data), nil
+}
+
+func (e *Executor) importReceipt(ctx context.Context, inv cli.Invocation) (receipts.Imported, error) {
+	if inv.Option("receipt-file") == "" || e.ports.Input == nil {
+		return receipts.Imported{}, cliErr("invalid_arguments", "--receipt-file requires an injected input port", "not_sent", cli.ExitUsage)
+	}
+	data, err := e.ports.Input.ReadFile(ctx, inv.Option("receipt-file"), int64(4*MaxInputChars+1))
+	if err != nil {
+		return receipts.Imported{}, cliErr("invalid_arguments", "receipt file could not be read", "not_sent", cli.ExitUsage)
+	}
+	if len(data) > 4*MaxInputChars {
+		return receipts.Imported{}, cliErr("input_too_large", "receipt file exceeds the bounded input size", "not_sent", cli.ExitUsage)
+	}
+	imported, err := receipts.Import(data)
+	if err != nil {
+		return receipts.Imported{}, cliErr("invalid_arguments", "receipt file is not a valid untrusted portable receipt", "not_sent", cli.ExitUsage)
+	}
+	return imported, nil
 }
 
 func (e *Executor) messagingResult(kind string, accepted mektup.Receipt, wait *service.WaitResult, callErr error) (cli.ExecutionResult, error) {
@@ -347,18 +411,19 @@ func (e *Executor) messagingResult(kind string, accepted mektup.Receipt, wait *s
 	exit := cli.ExitSuccess
 	if wait != nil {
 		final = wait.Receipt
-		name := "reply.received"
+		name := "reply.accepted"
 		if wait.Incomplete {
 			name = "wait.incomplete"
 		}
 		if wait.State == mektup.StateReplyOutcomeUnknown {
 			name = "reply.unknown"
 		}
-		events = append(events, cli.OutputEvent{Machine: lifecycle(name, final, true, !wait.Incomplete && wait.State != mektup.StateReplyOutcomeUnknown)})
+		ok := !wait.Incomplete && wait.State != mektup.StateReplyOutcomeUnknown && wait.ReplyStatus != string(mektup.ReplyError)
+		events = append(events, cli.OutputEvent{Machine: lifecycle(name, final, true, ok)})
 		exit = waitExit(wait, callErr)
 	}
 	if callErr != nil && wait == nil {
-		return cli.ExecutionResult{}, mapError(callErr)
+		return cli.ExecutionResult{Events: events, Receipt: final, Exit: errorExit(callErr)}, nil
 	}
 	return cli.ExecutionResult{Events: events, Receipt: final, Exit: exit}, nil
 }
@@ -412,13 +477,35 @@ func mapError(err error) error {
 	}
 	var se *service.Error
 	if errors.As(err, &se) {
-		effect := "unknown"
-		if se.Code == mektup.ErrInputTooLarge || se.Code == mektup.ErrInvalidArguments {
-			effect = "not_sent"
-		}
-		return &cli.Error{Code: string(se.Code), Message: se.Message, Effect: effect, Exit: errorExit(err), Details: se.Details}
+		return &cli.Error{Code: string(se.Code), Message: se.Message, Effect: serviceEffect(se.Code), Exit: serviceExit(se.Code), Details: se.Details}
 	}
 	return &cli.Error{Code: "internal_error", Message: err.Error(), Effect: "unknown", Exit: cli.ExitInternal}
+}
+
+func serviceEffect(code mektup.ErrorCode) string {
+	switch code {
+	case mektup.ErrInvalidArguments, mektup.ErrInvalidTarget, mektup.ErrInputTooLarge, mektup.ErrReplyRouteRequired, mektup.ErrInvalidRawWait, mektup.ErrInvalidRawReplyRequest:
+		return "not_sent"
+	case mektup.ErrDeliveryRejected, mektup.ErrReplyRouteUnavailable, mektup.ErrReplyNotRequested, mektup.ErrMessageNotFound, mektup.ErrMessageNotAddressedThread:
+		return "rejected"
+	default:
+		return "unknown"
+	}
+}
+
+func serviceExit(code mektup.ErrorCode) cli.ExitCode {
+	switch code {
+	case mektup.ErrInvalidArguments, mektup.ErrInvalidTarget, mektup.ErrInputTooLarge, mektup.ErrReplyRouteRequired, mektup.ErrInvalidRawWait, mektup.ErrInvalidRawReplyRequest:
+		return cli.ExitUsage
+	case mektup.ErrDeliveryRejected, mektup.ErrReplyRouteUnavailable, mektup.ErrReplyNotRequested, mektup.ErrMessageNotFound, mektup.ErrMessageNotAddressedThread:
+		return cli.ExitRejected
+	case mektup.ErrWaitIncomplete:
+		return cli.ExitIncomplete
+	case mektup.ErrOutcomeUnknown, mektup.ErrReplyOutcomeUnknown:
+		return cli.ExitUnknown
+	default:
+		return cli.ExitInternal
+	}
 }
 func cliErr(code, message, effect string, exit cli.ExitCode) error {
 	return &cli.Error{Code: code, Message: message, Effect: effect, Exit: exit}
@@ -449,10 +536,13 @@ func optionInt(inv cli.Invocation, name string) int {
 	_, _ = fmt.Sscan(inv.Option(name), &n)
 	return n
 }
-func parseSince(value string) time.Time {
+func parseSince(value string) (time.Time, error) {
 	if value == "" {
-		return time.Time{}
+		return time.Time{}, nil
 	}
-	parsed, _ := time.Parse(time.RFC3339Nano, value)
-	return parsed
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, cliErr("invalid_arguments", "invalid --since timestamp", "not_sent", cli.ExitUsage)
+	}
+	return parsed, nil
 }
