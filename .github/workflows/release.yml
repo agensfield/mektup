@@ -23,6 +23,9 @@ jobs:
         with:
           go-version-file: go/go.mod
           cache-dependency-path: go/go.sum
+      - name: Prefetch pinned Go modules
+        working-directory: go
+        run: go mod download
       - name: Verify the repository and Go module tags agree
         env:
           RELEASE_TAG: ${{ github.ref_name }}

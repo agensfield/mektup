@@ -2,6 +2,10 @@ version: 2
 
 project_name: mektup
 
+before:
+  hooks:
+    - ./scripts/generate-third-party-notices.sh
+
 builds:
   - id: mektup
     dir: go
@@ -34,7 +38,9 @@ archives:
     files:
       - README.md
       - LICENSE
+      - THIRD_PARTY_NOTICES.md
       - docs/architecture.md
+      - docs/dependencies.md
       - docs/releasing.md
 
 checksum:

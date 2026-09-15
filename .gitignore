@@ -3,4 +3,4 @@
 dist/
 coverage/
 *.test
-
+THIRD_PARTY_NOTICES.md

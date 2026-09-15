@@ -1,4 +1,6 @@
-.PHONY: test test-race vet fmt-check contracts conformance build
+.PHONY: test test-race vet fmt-check contracts conformance notices govulncheck build
+
+GOVULNCHECK_VERSION ?= v1.8.0
 
 test:
 	cd go && go test ./...
@@ -21,6 +23,12 @@ contracts:
 
 conformance:
 	cd go && go run ./cmd/mektup-conformance
+
+notices:
+	./scripts/generate-third-party-notices.sh
+
+govulncheck:
+	cd go && go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 
 build:
 	cd go && go build ./...
