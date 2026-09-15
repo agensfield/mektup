@@ -100,6 +100,7 @@ func TestReceiverClaimHeartbeatCommitStatusAndDuplicate(t *testing.T) {
 	claimRequest := request(j)
 	claimResult := receive(t, receiver, claimRequest)
 	var claimPayload struct {
+		Disposition  string         `json:"disposition"`
 		State        string         `json:"state"`
 		FencingToken string         `json:"fencingToken"`
 		Lease        sshproxy.Lease `json:"lease"`
@@ -107,12 +108,20 @@ func TestReceiverClaimHeartbeatCommitStatusAndDuplicate(t *testing.T) {
 	if err := json.Unmarshal(claimResult.Result, &claimPayload); err != nil {
 		t.Fatal(err)
 	}
-	if claimPayload.State != string(journal.StateReplyClaimed) || claimPayload.FencingToken == "" || claimPayload.Lease.ExpiresAt == "" {
+	if claimPayload.Disposition != "claimed" || claimPayload.State != string(journal.StateReplyClaimed) || claimPayload.FencingToken == "" || claimPayload.Lease.ExpiresAt == "" {
 		t.Fatalf("claim result = %s", claimResult.Result)
 	}
 
-	if _, err := receiver.Receive(context.Background(), mustMarshal(t, claimRequest)); !errors.Is(err, ErrClaimInFlight) {
-		t.Fatalf("duplicate claim err = %v", err)
+	duplicateBytes, err := receiver.Receive(context.Background(), mustMarshal(t, claimRequest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate, err := sshproxy.ValidateControlRequest(duplicateBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(duplicate.Result), `"disposition":"existing"`) {
+		t.Fatalf("duplicate result = %s", duplicate.Result)
 	}
 
 	heartbeat := claimRequest

@@ -110,12 +110,12 @@ func TestControlKnownFieldPresenceAndResultShapes(t *testing.T) {
 		{name: "result-bodySha256-invalid", mutate: func(raw map[string]any) {
 			raw["kind"] = "result"
 			raw["bodySha256"] = "invalid"
-			raw["result"] = map[string]any{"fencingToken": "fence", "lease": map[string]any{"expiresAt": "2026-09-15T03:00:31.900000Z"}}
+			raw["result"] = map[string]any{"disposition": "claimed", "state": "reply_dispatch_claimed", "fencingToken": "fence", "lease": map[string]any{"expiresAt": "2026-09-15T03:00:31.900000Z"}}
 		}},
 		{name: "result-replyStatus-invalid", mutate: func(raw map[string]any) {
 			raw["kind"] = "result"
 			raw["replyStatus"] = "invalid"
-			raw["result"] = map[string]any{"fencingToken": "fence", "lease": map[string]any{"expiresAt": "2026-09-15T03:00:31.900000Z"}}
+			raw["result"] = map[string]any{"disposition": "claimed", "state": "reply_dispatch_claimed", "fencingToken": "fence", "lease": map[string]any{"expiresAt": "2026-09-15T03:00:31.900000Z"}}
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {

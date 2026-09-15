@@ -63,27 +63,38 @@ func (r FileRegistry) Resolve(ctx context.Context, endpointID, storeID string) (
 	if r.Path == "" {
 		return Store{}, ErrStoreUnavailable
 	}
-	if err := privateRegistry(r.Path); err != nil {
-		return Store{}, err
-	}
-	data, err := os.ReadFile(r.Path)
+	data, err := readPrivateRegistry(r.Path)
 	if err != nil {
-		return Store{}, fmt.Errorf("%w: read registry: %v", ErrStoreUnavailable, err)
+		return Store{}, err
 	}
 	var document RegistryDocument
 	if err := json.Unmarshal(data, &document); err != nil || document.Version != 1 {
 		return Store{}, fmt.Errorf("%w: malformed registry", ErrRegistryInvalid)
 	}
+	var matches []RegistryEntry
 	for _, entry := range document.Stores {
-		if entry.StoreID != storeID {
-			continue
+		if entry.StoreID == storeID {
+			matches = append(matches, entry)
 		}
+	}
+	if len(matches) == 0 {
+		return Store{}, fmt.Errorf("%w: store ID is not pre-registered", ErrStoreUnavailable)
+	}
+	if len(matches) != 1 {
+		return Store{}, fmt.Errorf("%w: store ID has ambiguous registry entries", ErrStoreUnavailable)
+	}
+	for _, entry := range matches {
 		if entry.EndpointID != endpointID || !validID(entry.StoreID, mektup.StoreIDPrefix) || entry.StateDir == "" || !filepath.IsAbs(entry.StateDir) {
 			return Store{}, fmt.Errorf("%w: store route does not match", ErrStoreUnavailable)
 		}
 		info, statErr := os.Stat(entry.StateDir)
 		if statErr != nil || !info.IsDir() {
 			return Store{}, fmt.Errorf("%w: registered state directory unavailable", ErrStoreUnavailable)
+		}
+		dbPath := filepath.Join(entry.StateDir, "journal.sqlite3")
+		dbInfo, statErr := os.Lstat(dbPath)
+		if statErr != nil || !dbInfo.Mode().IsRegular() || dbInfo.Mode().Perm()&0077 != 0 {
+			return Store{}, fmt.Errorf("%w: registered journal database does not exist privately", ErrStoreUnavailable)
 		}
 		j, err := journal.Open(ctx, journal.Options{StateDir: entry.StateDir})
 		if err != nil {
@@ -97,22 +108,6 @@ func (r FileRegistry) Resolve(ctx context.Context, endpointID, storeID string) (
 		return Store{Journal: j, StoreID: canonical, EndpointID: entry.EndpointID, CloseFunc: j.Close}, nil
 	}
 	return Store{}, fmt.Errorf("%w: store ID is not pre-registered", ErrStoreUnavailable)
-}
-
-func privateRegistry(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return fmt.Errorf("%w: %v", ErrRegistryInvalid, err)
-	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 {
-		return fmt.Errorf("%w: registry must be an owner-private regular file", ErrRegistryInvalid)
-	}
-	parent := filepath.Dir(path)
-	parentInfo, err := os.Stat(parent)
-	if err != nil || !parentInfo.IsDir() || parentInfo.Mode().Perm()&0077 != 0 {
-		return fmt.Errorf("%w: registry directory must be owner-private", ErrRegistryInvalid)
-	}
-	return nil
 }
 
 func validID(value, prefix string) bool {

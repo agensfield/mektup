@@ -23,7 +23,6 @@ const (
 var (
 	ErrRelationshipMismatch = errors.New("control receiver: custody relationship mismatch")
 	ErrControlOutput        = errors.New("control receiver: response exceeds bound")
-	ErrClaimInFlight        = errors.New("control receiver: matching claim is already in flight")
 )
 
 type Receiver struct {
@@ -55,7 +54,10 @@ func (r Receiver) Serve(ctx context.Context, input io.Reader, output io.Writer) 
 	if err != nil {
 		return err
 	}
-	_, err = output.Write(append(response, '\n'))
+	written, err := output.Write(append(response, '\n'))
+	if err == nil && written != len(response)+1 {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -78,7 +80,7 @@ func (r Receiver) Receive(ctx context.Context, data []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer store.Close()
-	if store.Journal == nil || store.EndpointID != r.LocalEndpointID || store.EndpointID != request.Custody.EndpointID {
+	if store.Journal == nil || store.EndpointID != r.LocalEndpointID || store.EndpointID != request.Custody.EndpointID || request.ReplyDestination.EndpointID != r.LocalEndpointID {
 		return nil, ErrRelationshipMismatch
 	}
 	canonical, err := store.Journal.ResolveStoreID(ctx, request.Custody.StoreID)
@@ -87,6 +89,11 @@ func (r Receiver) Receive(ctx context.Context, data []byte) ([]byte, error) {
 	}
 	if err := validateOriginal(ctx, store.Journal, request, canonical); err != nil {
 		return nil, err
+	}
+	if request.Operation == "heartbeat" || request.Operation == "commit" || request.Operation == "abandon" {
+		if err := validateClaimTuple(ctx, store.Journal, request, canonical); err != nil {
+			return nil, err
+		}
 	}
 
 	result, err := apply(ctx, store.Journal, request, canonical)
@@ -130,6 +137,20 @@ func validateOriginal(ctx context.Context, j *journal.Journal, req sshproxy.Cont
 	return nil
 }
 
+func validateClaimTuple(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) error {
+	claim, err := j.Reply(ctx, req.ReplyMessageID)
+	if err != nil {
+		return fmt.Errorf("%w: selected claim unavailable: %v", ErrRelationshipMismatch, err)
+	}
+	if claim.OriginalID != req.OriginalMessageID || claim.Digest != req.BodySHA256 ||
+		(req.BodyBytes == nil || claim.BodySize != *req.BodyBytes) || claim.Status != req.ReplyStatus ||
+		claim.ReplyRoute != req.ReplyDestination.URI || claim.CustodyRoute != req.Custody.EndpointID ||
+		claim.CustodyStoreID != storeID || (req.AttemptOwner != "" && claim.Owner != req.AttemptOwner) {
+		return ErrRelationshipMismatch
+	}
+	return nil
+}
+
 func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) (json.RawMessage, error) {
 	switch req.Operation {
 	case "claim":
@@ -137,13 +158,12 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 		if err != nil {
 			return nil, err
 		}
-		if claim.Joined && claim.State == journal.StateReplyClaimed {
-			// Journal intentionally withholds an active claim's token on a
-			// matching retry. A claim result cannot satisfy control/v1 without
-			// that issued token, so fail closed and let the caller inspect status.
-			return nil, ErrClaimInFlight
+		if claim.Joined {
+			// Matching retries receive status-only metadata. The existing
+			// disposition never authorizes body dispatch or fencing operations.
+			return resultJSON(map[string]any{"disposition": "existing", "state": claim.State, "replyStatus": claim.Status, "won": claim.Won, "commitSeq": claim.CommitSeq})
 		}
-		return resultJSON(map[string]any{"state": claim.State, "fencingToken": claim.Token, "lease": leaseJSON(claim.LeaseUntil)})
+		return resultJSON(map[string]any{"disposition": "claimed", "state": claim.State, "fencingToken": claim.Token, "lease": leaseJSON(claim.LeaseUntil)})
 	case "heartbeat":
 		claim, err := j.Heartbeat(ctx, req.ReplyMessageID, req.AttemptOwner, req.FencingToken)
 		if err != nil {
