@@ -308,7 +308,7 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (cli.Executio
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
 		data, cursor := pageData(r.Raw, r, r.NextCursor)
-		warnings := append([]string{"experimental API capability used", "scoped search"}, conn.Warnings()...)
+		warnings := append([]string(nil), conn.Warnings()...)
 		return e.result(ctx, "search.scoped", data, cursor, warnings, false, inv.Resolved.Endpoint)
 	}
 	r, callErr := api.Search(ctx, options)
@@ -316,7 +316,7 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (cli.Executio
 		return cli.ExecutionResult{}, mapError(callErr, "unknown")
 	}
 	data, cursor := pageData(r.Raw, r, r.NextCursor)
-	warnings := append([]string{"experimental API capability used"}, conn.Warnings()...)
+	warnings := append([]string(nil), conn.Warnings()...)
 	return e.result(ctx, "search", data, cursor, warnings, false, inv.Resolved.Endpoint)
 }
 
@@ -601,9 +601,11 @@ func (e *Executor) result(ctx context.Context, kind string, data any, cursor str
 func warningObjects(warnings []string) []map[string]any {
 	objects := make([]map[string]any, 0, len(warnings))
 	for _, warning := range warnings {
-		code := "untested_server_version"
-		if strings.Contains(strings.ToLower(warning), "experimental") {
-			code = "evidence_gap"
+		code := strings.TrimSpace(warning)
+		switch code {
+		case "untested_server_version", "server_version_unknown", "evidence_gap", "projection_may_lag", "audit_logging_enabled", "output_spilled", "resolver_degraded", "cleanup_incomplete", "manual_resolution":
+		default:
+			continue
 		}
 		objects = append(objects, map[string]any{"code": code, "message": warning, "details": map[string]any{}})
 	}

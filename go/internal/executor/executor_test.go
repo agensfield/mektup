@@ -36,7 +36,7 @@ func (f fakeCodex) ThreadItems(context.Context, codexapi.ItemsOptions) (codexapi
 	return codexapi.ThreadItemsResponse{Raw: json.RawMessage(`{"data":[],"nextCursor":"items"}`), NextCursor: "items"}, nil
 }
 func (f fakeCodex) ThreadStart(context.Context, codexapi.StartOptions) (codexapi.ThreadStartResponse, error) {
-	return codexapi.ThreadStartResponse{Thread: codexapi.Thread{ID: "thr_new"}, Raw: json.RawMessage(`{"thread":{"id":"thr_new"}}`)}, nil
+	return codexapi.ThreadStartResponse{Thread: codexapi.Thread{ID: "thr_new"}, Raw: json.RawMessage(`{"thread":{"id":"thr_new","turns":[{"items":[{"text":"secret body"}]}]}}`)}, nil
 }
 func (f fakeCodex) ThreadResume(context.Context, codexapi.ResumeOptions) (codexapi.ThreadResumeResponse, error) {
 	return codexapi.ThreadResumeResponse{Raw: json.RawMessage(`{"thread":{"id":"thr_resume"}}`)}, nil
@@ -45,11 +45,11 @@ func (f fakeCodex) ThreadFork(context.Context, codexapi.ForkOptions) (codexapi.T
 	return codexapi.ThreadForkResponse{Thread: codexapi.Thread{ID: "thr_fork"}, Raw: json.RawMessage(`{"thread":{"id":"thr_fork"}}`)}, nil
 }
 
-func (f fakeCodex) ThreadSetName(context.Context, string, string) (any, error) {
+func (f fakeCodex) ThreadSetName(context.Context, string, string) (codexapi.ThreadNameResponse, error) {
 	if !f.allowName {
-		return nil, errors.New("thread/name/set failed")
+		return codexapi.ThreadNameResponse{}, errors.New("thread/name/set failed")
 	}
-	return map[string]any{"ok": true}, nil
+	return codexapi.ThreadNameResponse{Raw: json.RawMessage(`{"ok":true}`)}, nil
 }
 func (f fakeCodex) Search(context.Context, codexapi.SearchOptions) (codexapi.SearchResponse, error) {
 	return codexapi.SearchResponse{Raw: json.RawMessage(`{"data":[],"nextCursor":"search"}`), NextCursor: "search"}, nil
@@ -65,7 +65,7 @@ type fakeConnection struct{ api Codex }
 
 func (f *fakeConnection) Codex() Codex       { return f.api }
 func (f *fakeConnection) RPC() rawrpc.Caller { return nil }
-func (f *fakeConnection) Warnings() []string { return []string{"compat warning"} }
+func (f *fakeConnection) Warnings() []string { return []string{"server_version_unknown"} }
 func (f *fakeConnection) Close() error       { return nil }
 
 type fakeConnections struct {
@@ -121,11 +121,18 @@ func (f *fakeDoctor) Run(_ context.Context, _ doctor.Options, fix bool) (doctor.
 	return doctor.Report{Fix: fix, ReadOnly: !fix}, nil
 }
 
-type fakeReceipts struct{ count int }
+type fakeReceipts struct {
+	count    int
+	payloads []any
+}
 
-func (f *fakeReceipts) Mutation(context.Context, string, string, any) (any, error) {
+func (f *fakeReceipts) Mutation(_ context.Context, _ string, _ string, payload any) (any, error) {
 	f.count++
-	return map[string]any{"schema": "mektup/receipt/v1", "receiptId": "rcpt_test", "state": "accepted"}, nil
+	// The fake intentionally retains the input so privacy tests can inspect
+	// exactly what would have crossed the journal boundary.
+	f.payloads = append(f.payloads, payload)
+	returnValue := map[string]any{"schema": "mektup/receipt/v1", "receiptId": "rcpt_test", "state": "accepted"}
+	return returnValue, nil
 }
 
 type fakeInput struct{ file, stdin []byte }
@@ -269,6 +276,26 @@ func TestThreadNameFailureCarriesPartialEffectEvidence(t *testing.T) {
 	}
 }
 
+func TestThreadMutationProjectionNeverCarriesTranscriptBodies(t *testing.T) {
+	receipts := &fakeReceipts{}
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}, Receipts: receipts})
+	result, err := e.Execute(context.Background(), invocation("thread", "start"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(receipts.payloads) != 1 {
+		t.Fatalf("receipt payloads=%d", len(receipts.payloads))
+	}
+	eventBytes, _ := json.Marshal(result.Events[0].Machine)
+	receiptBytes, _ := json.Marshal(receipts.payloads[0])
+	if strings.Contains(string(eventBytes), "secret body") || strings.Contains(string(receiptBytes), "secret body") {
+		t.Fatalf("thread mutation leaked transcript body: event=%s receipt=%s", eventBytes, receiptBytes)
+	}
+	if !strings.Contains(string(eventBytes), "thr_new") || !strings.Contains(string(receiptBytes), "thr_new") {
+		t.Fatalf("bounded thread metadata missing: event=%s receipt=%s", eventBytes, receiptBytes)
+	}
+}
+
 func TestLifecycleWarningsRemainAtEnvelopeLevel(t *testing.T) {
 	var out, errOut bytes.Buffer
 	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}})
@@ -281,15 +308,17 @@ func TestLifecycleWarningsRemainAtEnvelopeLevel(t *testing.T) {
 		t.Fatal(err)
 	}
 	warnings, ok := event["warnings"].([]any)
-	if !ok || len(warnings) != 2 {
+	if !ok || len(warnings) != 1 {
 		t.Fatalf("warnings=%#v event=%#v", event["warnings"], event)
 	}
 	first, _ := warnings[0].(map[string]any)
-	second, _ := warnings[1].(map[string]any)
-	if first["code"] != "evidence_gap" || second["code"] != "untested_server_version" || first["details"] == nil || second["details"] == nil {
+	if first["code"] != "server_version_unknown" || first["details"] == nil {
 		t.Fatalf("warning objects=%#v", warnings)
 	}
 	data, _ := event["data"].(map[string]any)
+	if data["experimental"] != true {
+		t.Fatalf("experimental marker missing from result: %#v", data)
+	}
 	if _, nested := data["warnings"]; nested {
 		t.Fatalf("warning was nested under data: %#v", data)
 	}
@@ -404,7 +433,7 @@ func TestPinnedDomainErrorsKeepStableExitClasses(t *testing.T) {
 }
 
 func TestExecutorRechecksPageAndCursorBounds(t *testing.T) {
-	connections := &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}
+	connections := &fakeConnections{conn: &fakeConnection{api: fakeCodex{scoped: true}}}
 	e := New(Ports{Connections: connections})
 	tooMany := invocation("search", "needle")
 	tooMany.Options["limit"] = []string{"101"}
@@ -418,6 +447,12 @@ func TestExecutorRechecksPageAndCursorBounds(t *testing.T) {
 	}
 	if connections.opened != 0 {
 		t.Fatalf("bounds were checked after opening a connection: %d", connections.opened)
+	}
+	scoped := invocation("search", "needle")
+	scoped.Options["thread"] = []string{"thr_1"}
+	scoped.Options["limit"] = []string{"250"}
+	if _, err := e.Execute(context.Background(), scoped); err != nil {
+		t.Fatalf("scoped search rejected its 250-result bound: %v", err)
 	}
 }
 
