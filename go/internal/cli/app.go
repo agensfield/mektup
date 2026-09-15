@@ -279,6 +279,16 @@ func (a *App) env() map[string]string {
 }
 
 func (a *App) Run(args []string) int {
+	return a.RunContext(context.Background(), args)
+}
+
+// RunContext executes one invocation with caller-owned cancellation. Long
+// waits and transport operations must observe this context; cancellation never
+// invalidates an already accepted delivery.
+func (a *App) RunContext(ctx context.Context, args []string) int {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if a.In == nil {
 		a.In = os.Stdin
 	}
@@ -370,7 +380,7 @@ func (a *App) Run(args []string) int {
 	if err := validateInvocation(a, parsed); err != nil {
 		return a.finish(presentation, parsed, err)
 	}
-	result, err := a.Executor.Execute(context.Background(), parsed)
+	result, err := a.Executor.Execute(ctx, parsed)
 	if err == nil {
 		return a.writeExecutionResult(presentation, parsed, result)
 	}

@@ -330,3 +330,20 @@ func TestStructuredErrorsAlwaysCarryEffectState(t *testing.T) {
 		t.Fatalf("usage error effect state=%#v", errorData["effectState"])
 	}
 }
+
+func TestRunContextReachesOperationalExecutor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	seenCanceled := false
+	var out, errOut bytes.Buffer
+	a := &App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{}, Executor: executorFunc(func(callCtx context.Context, _ Invocation) (ExecutionResult, error) {
+		seenCanceled = errors.Is(callCtx.Err(), context.Canceled)
+		return ExecutionResult{}, &Error{Code: "wait_interrupted", Message: "wait canceled", Effect: "accepted", Exit: ExitIncomplete}
+	})}
+	if code := a.RunContext(ctx, []string{"--human", "wait", "msg_test"}); code != int(ExitIncomplete) {
+		t.Fatalf("code=%d stderr=%q", code, errOut.String())
+	}
+	if !seenCanceled {
+		t.Fatal("executor did not receive caller cancellation")
+	}
+}
