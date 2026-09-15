@@ -298,6 +298,41 @@ func decodeThreadList(raw json.RawMessage, limit int) (ThreadListResponse, error
 	}
 	return ThreadListResponse{Data: data, NextCursor: next, BackwardsCursor: back, Raw: append(json.RawMessage(nil), raw...)}, nil
 }
+
+func decodeLoadedList(raw json.RawMessage, limit int) (ThreadLoadedListResponse, error) {
+	m, err := object(raw)
+	if err != nil {
+		return ThreadLoadedListResponse{}, err
+	}
+	v, err := req(m, "data")
+	if err != nil {
+		return ThreadLoadedListResponse{}, err
+	}
+	items, err := jsonArray(v)
+	if err != nil {
+		return ThreadLoadedListResponse{}, fmt.Errorf("data must be array")
+	}
+	bound := MaxThreadPageLimit
+	if limit > 0 && limit < bound {
+		bound = limit
+	}
+	if len(items) > bound {
+		return ThreadLoadedListResponse{}, ErrUnboundedPage
+	}
+	data := make([]string, 0, len(items))
+	for _, item := range items {
+		var id string
+		if err := json.Unmarshal(item, &id); err != nil || id == "" {
+			return ThreadLoadedListResponse{}, fmt.Errorf("loaded thread data must contain non-empty string IDs")
+		}
+		data = append(data, id)
+	}
+	next, err := cursor(m, "nextCursor")
+	if err != nil {
+		return ThreadLoadedListResponse{}, err
+	}
+	return ThreadLoadedListResponse{Data: data, NextCursor: next, Raw: append(json.RawMessage(nil), raw...)}, nil
+}
 func decodeThreadRead(raw json.RawMessage, includeTurns bool) (ThreadReadResponse, error) {
 	m, err := object(raw)
 	if err != nil {

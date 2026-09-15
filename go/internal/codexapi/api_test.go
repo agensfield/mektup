@@ -3,6 +3,7 @@ package codexapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -13,6 +14,23 @@ type recordingCaller struct {
 	params json.RawMessage
 	result json.RawMessage
 	err    *ServerError
+}
+
+type sequencedCaller struct {
+	methods []string
+	params  []json.RawMessage
+	results []json.RawMessage
+}
+
+func (r *sequencedCaller) Call(_ context.Context, method string, params json.RawMessage) (json.RawMessage, *ServerError, error) {
+	r.methods = append(r.methods, method)
+	r.params = append(r.params, append(json.RawMessage(nil), params...))
+	if len(r.results) == 0 {
+		return nil, nil, nil
+	}
+	result := r.results[0]
+	r.results = r.results[1:]
+	return result, nil, nil
 }
 
 func (r *recordingCaller) Call(_ context.Context, method string, params json.RawMessage) (json.RawMessage, *ServerError, error) {
@@ -71,6 +89,61 @@ func TestListDefaultsAllSourceKindsIncludingSubagents(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("subagent source kinds missing: %#v", sources)
+	}
+}
+
+func TestLoadedListUsesDedicatedBoundedBackendAndIDs(t *testing.T) {
+	r := &recordingCaller{result: json.RawMessage(`{"data":["thread-a","thread-b"],"nextCursor":"next"}`)}
+	out, err := New(r, Options{}).ThreadList(context.Background(), ThreadListOptions{Loaded: true, Cursor: "start", Limit: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.method != "thread/loaded/list" || out.Loaded != true || !reflect.DeepEqual(out.LoadedIDs, []string{"thread-a", "thread-b"}) || len(out.Data) != 0 || out.NextCursor != "next" {
+		t.Fatalf("loaded result = %+v, method=%q", out, r.method)
+	}
+	var params map[string]any
+	if err := json.Unmarshal(r.params, &params); err != nil {
+		t.Fatal(err)
+	}
+	if params["cursor"] != "start" || params["limit"] != float64(2) {
+		t.Fatalf("loaded params = %#v", params)
+	}
+}
+
+func TestLoadedListRejectsUnsupportedFiltersButAllowsCursorOnly(t *testing.T) {
+	r := &recordingCaller{result: json.RawMessage(`{"data":[],"nextCursor":null}`)}
+	if _, err := New(r, Options{}).ThreadList(context.Background(), ThreadListOptions{Loaded: true, Archived: new(bool)}); !errors.Is(err, ErrUnsupportedOption) {
+		t.Fatalf("archived loaded filter error = %v", err)
+	}
+	if r.method != "" {
+		t.Fatalf("unsupported loaded filter called %q", r.method)
+	}
+}
+
+func TestReconcileHistoryPaginatesFullTurns(t *testing.T) {
+	page1 := json.RawMessage(`{"data":[{"id":"turn-1","items":[],"status":"completed","itemsView":"full"}],"nextCursor":"c2","backwardsCursor":null}`)
+	page2 := json.RawMessage(`{"data":[{"id":"turn-2","items":[],"status":"completed","itemsView":"full"}],"nextCursor":null,"backwardsCursor":null}`)
+	r := &sequencedCaller{results: []json.RawMessage{page1, page2}}
+	out, err := New(r, Options{}).ReconcileHistory(context.Background(), "thread")
+	if err != nil || len(out.Data) != 2 || len(r.methods) != 2 {
+		t.Fatalf("reconcile = %+v, err=%v, calls=%d", out, err, len(r.methods))
+	}
+	for i, raw := range r.params {
+		var params map[string]any
+		if err := json.Unmarshal(raw, &params); err != nil {
+			t.Fatal(err)
+		}
+		if params["itemsView"] != "full" || params["limit"] != float64(MaxTurnsPageLimit) {
+			t.Fatalf("page %d params = %#v", i, params)
+		}
+	}
+}
+
+func TestReconcileHistoryRejectsRepeatedCursor(t *testing.T) {
+	r := &sequencedCaller{results: []json.RawMessage{json.RawMessage(`{"data":[],"nextCursor":"c"}`), json.RawMessage(`{"data":[],"nextCursor":"c"}`)}}
+	_, err := New(r, Options{}).ReconcileHistory(context.Background(), "thread")
+	if !errors.Is(err, ErrPaginationStalled) {
+		t.Fatalf("repeated cursor error = %v", err)
 	}
 }
 

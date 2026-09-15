@@ -23,6 +23,8 @@ const (
 	DefaultOccurrencesPageLimit = 50
 	MaxOccurrencesPageLimit     = 250
 	MaxCursorBytes              = 4096
+	MaxReconciliationPages      = 1000
+	MaxReconciliationItems      = 100000
 )
 
 var (
@@ -30,6 +32,8 @@ var (
 	ErrUnsupportedOption       = errors.New("codexapi: option is unsupported by the pinned app-server")
 	ErrInProgressCutoff        = errors.New("codexapi: throughTurn cannot name an in-progress turn")
 	ErrUnboundedPage           = errors.New("codexapi: response page exceeds the bounded limit")
+	ErrPaginationStalled       = errors.New("codexapi: pagination cursor repeated")
+	ErrPaginationExceeded      = errors.New("codexapi: reconciliation pagination bound exceeded")
 )
 
 // ServerError is the exact JSON-RPC error evidence supplied by a Caller.
@@ -166,9 +170,18 @@ type LifecycleResponse struct {
 }
 
 type ThreadListResponse struct {
-	Data                        []Thread
+	Data []Thread
+	// LoadedIDs is populated only for loaded enumeration. Loaded thread IDs
+	// are intentionally not represented as hydrated Threads.
+	LoadedIDs                   []string
+	Loaded                      bool
 	NextCursor, BackwardsCursor string
 	Raw                         json.RawMessage
+}
+type ThreadLoadedListResponse struct {
+	Data       []string
+	NextCursor string
+	Raw        json.RawMessage
 }
 type ThreadReadResponse struct {
 	Thread Thread
@@ -259,7 +272,31 @@ func (c *Client) StartOrSteer(ctx context.Context, threadID, text, clientUserMes
 // backed by legacy thread stores reject thread/items/list; this helper never
 // attempts a lossy local projection or silently filters one partial page.
 func (c *Client) ReconcileHistory(ctx context.Context, threadID string) (ThreadTurnsResponse, error) {
-	return c.ThreadTurns(ctx, TurnsOptions{ThreadID: threadID, ItemsView: "full"})
+	if threadID == "" {
+		return ThreadTurnsResponse{}, errors.New("codexapi: threadId is required")
+	}
+	var all []Turn
+	cursor := ""
+	var lastRaw json.RawMessage
+	for pageNo := 0; pageNo < MaxReconciliationPages; pageNo++ {
+		page, err := c.ThreadTurns(ctx, TurnsOptions{ThreadID: threadID, Cursor: cursor, Limit: MaxTurnsPageLimit, ItemsView: "full"})
+		if err != nil {
+			return ThreadTurnsResponse{}, fmt.Errorf("codexapi: reconcile turns page %d: %w", pageNo+1, err)
+		}
+		if len(all)+len(page.Data) > MaxReconciliationItems {
+			return ThreadTurnsResponse{}, ErrPaginationExceeded
+		}
+		all = append(all, page.Data...)
+		lastRaw = page.Raw
+		if page.NextCursor == "" {
+			return ThreadTurnsResponse{Data: all, Raw: lastRaw}, nil
+		}
+		if page.NextCursor == cursor {
+			return ThreadTurnsResponse{}, ErrPaginationStalled
+		}
+		cursor = page.NextCursor
+	}
+	return ThreadTurnsResponse{}, ErrPaginationExceeded
 }
 
 // ReadFullTurns is an explicit alias for reconciliation callers.
@@ -290,9 +327,8 @@ type SearchOptions struct {
 	Archived                                   *bool
 }
 type ThreadReadOptions struct {
-	ThreadID      string
-	IncludeTurns  bool
-	ThroughTurnID string
+	ThreadID     string
+	IncludeTurns bool
 }
 type TurnsOptions struct {
 	ThreadID, Cursor, SortDirection, ItemsView string
@@ -322,7 +358,14 @@ var allSourceKinds = []string{"cli", "vscode", "exec", "appServer", "subAgent", 
 
 func (c *Client) ThreadList(ctx context.Context, options ThreadListOptions) (ThreadListResponse, error) {
 	if options.Loaded {
-		return ThreadListResponse{}, fmt.Errorf("%w: loaded thread list is a separate backend", ErrUnsupportedOption)
+		if err := validateLoadedListOptions(options); err != nil {
+			return ThreadListResponse{}, err
+		}
+		loaded, err := c.ThreadLoadedList(ctx, options.Cursor, options.Limit)
+		if err != nil {
+			return ThreadListResponse{}, err
+		}
+		return ThreadListResponse{LoadedIDs: loaded.Data, Loaded: true, NextCursor: loaded.NextCursor, Raw: loaded.Raw}, nil
 	}
 	// originators are hosted-only in the pinned protocol. There is no local
 	// backend capability in this package, so fail closed instead of pretending
@@ -361,14 +404,38 @@ func (c *Client) ThreadList(ctx context.Context, options ThreadListOptions) (Thr
 	return out, err
 }
 
+func validateLoadedListOptions(options ThreadListOptions) error {
+	if options.Archived != nil || options.CWD != nil || options.Cwd != nil || options.SourceKinds != nil || options.SortKey != "" || options.SortDirection != "" || len(options.ModelProviders) != 0 || len(options.Originators) != 0 || options.SectionID != nil || options.ProjectID != nil || options.SearchTerm != "" || options.ParentThreadID != "" || options.AncestorThreadID != "" {
+		return fmt.Errorf("%w: loaded enumeration supports only cursor and limit", ErrUnsupportedOption)
+	}
+	return nil
+}
+
+func (c *Client) ThreadLoadedList(ctx context.Context, cursor string, limit int) (ThreadLoadedListResponse, error) {
+	if err := validatePage(limit, MaxThreadPageLimit); err != nil {
+		return ThreadLoadedListResponse{}, err
+	}
+	p := map[string]any{"limit": DefaultThreadPageLimit}
+	if limit > 0 {
+		p["limit"] = limit
+	}
+	putString(p, "cursor", cursor)
+	var out ThreadLoadedListResponse
+	err := c.callDecode(ctx, "thread/loaded/list", p, func(raw json.RawMessage) error {
+		var e error
+		out, e = decodeLoadedList(raw, limit)
+		return e
+	})
+	return out, err
+}
+
+func (c *Client) LoadedThreads(ctx context.Context, cursor string, limit int) (ThreadLoadedListResponse, error) {
+	return c.ThreadLoadedList(ctx, cursor, limit)
+}
+
 func (c *Client) ThreadRead(ctx context.Context, options ThreadReadOptions) (ThreadReadResponse, error) {
 	if options.ThreadID == "" {
 		return ThreadReadResponse{}, errors.New("codexapi: threadId is required")
-	}
-	if options.ThroughTurnID != "" {
-		if err := c.checkThroughTurn(ctx, options.ThreadID, options.ThroughTurnID, c.read); err != nil {
-			return ThreadReadResponse{}, err
-		}
 	}
 	p := map[string]any{"threadId": options.ThreadID}
 	if options.IncludeTurns {
