@@ -15,6 +15,7 @@ import (
 	"time"
 
 	mektup "github.com/agensfield/mektup/go"
+	"github.com/agensfield/mektup/go/appserver"
 	"github.com/agensfield/mektup/go/internal/artifact"
 	"github.com/agensfield/mektup/go/internal/cli"
 	"github.com/agensfield/mektup/go/internal/codexapi"
@@ -965,6 +966,16 @@ func mapError(err error, effect string) error {
 	}
 	if errors.Is(err, connection.ErrUnsupported) {
 		return &cli.Error{Code: "unsupported_server_version", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
+	}
+	var callErr *connection.CallError
+	if errors.As(err, &callErr) && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) && callErr.Evidence.Phase >= appserver.WriteMayHaveWritten {
+		return &cli.Error{Code: "outcome_unknown", Message: "operation outcome is unknown after a possible write", Effect: "outcome_unknown", Details: map[string]any{"writePhase": callErr.Evidence.Phase.String(), "generation": callErr.Evidence.Generation}, Exit: cli.ExitUnknown}
+	}
+	if errors.Is(err, journal.ErrStorageBusy) {
+		return &cli.Error{Code: "storage_busy", Message: err.Error(), Effect: effect, Exit: cli.ExitRejected}
+	}
+	if errors.Is(err, journal.ErrStorageCorrupt) {
+		return &cli.Error{Code: "storage_corrupt", Message: err.Error(), Effect: effect, Exit: cli.ExitRejected}
 	}
 	var re *rawrpc.Error
 	if errors.As(err, &re) {

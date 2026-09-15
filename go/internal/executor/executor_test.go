@@ -9,8 +9,10 @@ import (
 	"testing"
 
 	mektup "github.com/agensfield/mektup/go"
+	"github.com/agensfield/mektup/go/appserver"
 	"github.com/agensfield/mektup/go/internal/cli"
 	"github.com/agensfield/mektup/go/internal/codexapi"
+	"github.com/agensfield/mektup/go/internal/connection"
 	"github.com/agensfield/mektup/go/internal/doctor"
 	"github.com/agensfield/mektup/go/internal/endpoint"
 	"github.com/agensfield/mektup/go/internal/journal"
@@ -566,6 +568,29 @@ func TestPinnedDomainErrorsKeepStableExitClasses(t *testing.T) {
 				t.Fatalf("err=%v mapped=%+v", tc.err, ce)
 			}
 		})
+	}
+}
+
+func TestPossibleWriteDeadlineMapsToOutcomeUnknown(t *testing.T) {
+	err := &connection.CallError{Err: context.DeadlineExceeded, Evidence: appserver.WriteEvidence{Phase: appserver.WriteMayHaveWritten, Generation: 42}, Generation: 42}
+	var ce *cli.Error
+	if !errors.As(mapError(err, "unknown"), &ce) || ce.Code != "outcome_unknown" || ce.Exit != cli.ExitUnknown || ce.Details["generation"] != uint64(42) {
+		t.Fatalf("mapped=%+v", ce)
+	}
+}
+
+func TestStorageSentinelsMapToStableRejectedErrors(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		code string
+	}{
+		{journal.ErrStorageBusy, "storage_busy"},
+		{journal.ErrStorageCorrupt, "storage_corrupt"},
+	} {
+		var ce *cli.Error
+		if !errors.As(mapError(tc.err, "not_sent"), &ce) || ce.Code != tc.code || ce.Exit != cli.ExitRejected {
+			t.Fatalf("err=%v mapped=%+v", tc.err, ce)
+		}
 	}
 }
 
