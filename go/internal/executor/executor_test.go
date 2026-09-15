@@ -1,12 +1,14 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 
+	mektup "github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/internal/cli"
 	"github.com/agensfield/mektup/go/internal/codexapi"
 	"github.com/agensfield/mektup/go/internal/doctor"
@@ -63,7 +65,7 @@ type fakeConnection struct{ api Codex }
 
 func (f *fakeConnection) Codex() Codex       { return f.api }
 func (f *fakeConnection) RPC() rawrpc.Caller { return nil }
-func (f *fakeConnection) Warnings() []string { return nil }
+func (f *fakeConnection) Warnings() []string { return []string{"compat warning"} }
 func (f *fakeConnection) Close() error       { return nil }
 
 type fakeConnections struct {
@@ -89,9 +91,6 @@ type fakeEndpoints struct {
 func (f *fakeEndpoints) List() ([]endpoint.Endpoint, error)     { return []endpoint.Endpoint{f.item}, nil }
 func (f *fakeEndpoints) Show(string) (endpoint.Endpoint, error) { return f.item, nil }
 func (f *fakeEndpoints) Add(v endpoint.Endpoint) error {
-	if v.ID == "" {
-		v.ID = "ep_00000000-0000-7000-8000-000000000000"
-	}
 	f.item = v
 	f.added++
 	return nil
@@ -134,9 +133,13 @@ type fakeInput struct{ file, stdin []byte }
 func (f fakeInput) ReadFile(context.Context, string, int64) ([]byte, error) { return f.file, nil }
 func (f fakeInput) ReadStdin(context.Context, int64) ([]byte, error)        { return f.stdin, nil }
 
-type fakeRPC struct{ request rawrpc.Request }
+type fakeRPC struct {
+	request rawrpc.Request
+	count   int
+}
 
 func (f *fakeRPC) Execute(_ context.Context, _ rawrpc.Caller, request rawrpc.Request) (*rawrpc.Response, error) {
+	f.count++
 	f.request = request
 	return &rawrpc.Response{Method: request.Method, Raw: json.RawMessage(`{"ok":true}`), Effects: []rpcmeta.EffectClass{rpcmeta.Read}}, nil
 }
@@ -219,7 +222,7 @@ func TestOwnedCommandsUseOnlyInjectedPorts(t *testing.T) {
 	if endpoints.added != 1 || endpoints.removed != 1 {
 		t.Fatalf("endpoint mutations not exercised: %+v", endpoints)
 	}
-	if endpoints.item.Alias != "dev" || endpoints.item.ID != "ep_00000000-0000-7000-8000-000000000000" {
+	if endpoints.item.Alias != "dev" || mektup.ValidateID(endpoints.item.ID, mektup.EndpointIDPrefix) != nil {
 		t.Fatalf("endpoint alias/id were not mapped independently: %+v", endpoints.item)
 	}
 	if receipts.count != 8 {
@@ -235,7 +238,7 @@ func TestEndpointAddLeavesIDEmptyForStoreGeneration(t *testing.T) {
 	if _, err := e.Execute(context.Background(), i); err != nil {
 		t.Fatal(err)
 	}
-	if endpoints.item.Alias != "generated" || endpoints.item.ID != "ep_00000000-0000-7000-8000-000000000000" {
+	if endpoints.item.Alias != "generated" || mektup.ValidateID(endpoints.item.ID, mektup.EndpointIDPrefix) != nil {
 		t.Fatalf("store did not receive alias and generate ID: %+v", endpoints.item)
 	}
 }
@@ -261,8 +264,47 @@ func TestThreadNameFailureCarriesPartialEffectEvidence(t *testing.T) {
 	start.Options["name"] = []string{"session-name"}
 	_, err := e.Execute(context.Background(), start)
 	var ce *cli.Error
-	if !errors.As(err, &ce) || ce.Effect != "unknown" || ce.Details["partialEffect"] != true || receipts.count != 1 {
+	if !errors.As(err, &ce) || ce.Effect != "accepted" || ce.Details["partialEffect"] != true || ce.Details["creationState"] != "accepted" || ce.Details["nameEffect"] != "unknown" || receipts.count != 1 {
 		t.Fatalf("err=%v receipts=%d", err, receipts.count)
+	}
+}
+
+func TestLifecycleWarningsRemainAtEnvelopeLevel(t *testing.T) {
+	var out, errOut bytes.Buffer
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}})
+	a := &cli.App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, Executor: e}
+	if code := a.Run([]string{"--json", "search", "needle"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("code=%d stderr=%q", code, errOut.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &event); err != nil {
+		t.Fatal(err)
+	}
+	warnings, ok := event["warnings"].([]any)
+	if !ok || len(warnings) != 2 {
+		t.Fatalf("warnings=%#v event=%#v", event["warnings"], event)
+	}
+	first, _ := warnings[0].(map[string]any)
+	second, _ := warnings[1].(map[string]any)
+	if first["code"] != "experimental_api" || second["code"] != "compatibility_warning" {
+		t.Fatalf("warning objects=%#v", warnings)
+	}
+	data, _ := event["data"].(map[string]any)
+	if _, nested := data["warnings"]; nested {
+		t.Fatalf("warning was nested under data: %#v", data)
+	}
+}
+
+func TestEmptyInlineParamsAreRejectedBeforeRPC(t *testing.T) {
+	rpc := &fakeRPC{}
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}, RPC: rpc, Receipts: &fakeReceipts{}})
+	i := invocation("rpc", "thread/list")
+	i.Options["params"] = []string{""}
+	if _, err := e.Execute(context.Background(), i); err == nil {
+		t.Fatal("empty inline params were accepted")
+	}
+	if rpc.count != 0 {
+		t.Fatalf("RPC dispatched invalid inline params: %d", rpc.count)
 	}
 }
 

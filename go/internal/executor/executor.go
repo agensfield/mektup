@@ -358,6 +358,12 @@ func (e *Executor) endpoint(ctx context.Context, inv cli.Invocation) (cli.Execut
 			return cli.ExecutionResult{}, mapError(err, "not_sent")
 		}
 		item := endpoint.Endpoint{ID: inv.Option("id"), Alias: inv.Position[1], Route: route, Herdr: endpoint.HerdrMode(inv.Option("herdr"))}.Normalized()
+		if item.ID == "" {
+			item.ID, err = endpoint.NewEndpointID()
+			if err != nil {
+				return cli.ExecutionResult{}, mapError(err, "not_sent")
+			}
+		}
 		if err := e.ports.Endpoints.Add(item); err != nil {
 			return cli.ExecutionResult{}, mapError(err, "not_sent")
 		}
@@ -505,7 +511,8 @@ func (e *Executor) params(ctx context.Context, inv cli.Invocation) (json.RawMess
 	if count > 1 {
 		return nil, "", usage("rpc accepts exactly one params source")
 	}
-	if value := inv.Option("params"); value != "" {
+	if has(inv, "params") {
+		value := inv.Option("params")
 		if !json.Valid([]byte(value)) {
 			return nil, "", usage("--params must contain valid JSON")
 		}
@@ -554,10 +561,13 @@ func (e *Executor) result(ctx context.Context, kind string, data any, cursor str
 	if cursor != "" {
 		payload["nextCursor"] = cursor
 	}
+	eventMachine := map[string]any{"event": kind + ".completed", "terminal": true, "ok": true, "data": payload}
 	if len(warnings) != 0 {
-		payload["warnings"] = append([]string(nil), warnings...)
+		// warnings is a lifecycle envelope field. Keeping it out of data is
+		// important because App preserves this top-level location verbatim.
+		eventMachine["warnings"] = warningObjects(warnings)
 	}
-	event := cli.OutputEvent{Machine: map[string]any{"event": kind + ".completed", "terminal": true, "ok": true, "data": payload}, Human: kind}
+	event := cli.OutputEvent{Machine: eventMachine, Human: kind}
 	result := cli.ExecutionResult{Events: []cli.OutputEvent{event}, Exit: cli.ExitSuccess}
 	if mutation {
 		if e.ports.Receipts == nil {
@@ -573,6 +583,18 @@ func (e *Executor) result(ctx context.Context, kind string, data any, cursor str
 		result.Receipt = receipt
 	}
 	return result, nil
+}
+
+func warningObjects(warnings []string) []map[string]any {
+	objects := make([]map[string]any, 0, len(warnings))
+	for _, warning := range warnings {
+		code := "compatibility_warning"
+		if strings.Contains(strings.ToLower(warning), "experimental") {
+			code = "experimental_api"
+		}
+		objects = append(objects, map[string]any{"code": code, "message": warning})
+	}
+	return objects
 }
 
 func (e *Executor) setThreadName(ctx context.Context, api Codex, name, threadID string, raw json.RawMessage, operation, endpointID string) error {
@@ -597,6 +619,8 @@ func (e *Executor) setThreadName(ctx context.Context, api Codex, name, threadID 
 
 func (e *Executor) partialNameFailure(ctx context.Context, operation, endpointID, threadID, name string, cause error) error {
 	details := map[string]any{"partialEffect": true, "threadId": threadID, "name": name, "cause": cause.Error()}
+	details["creationState"] = "accepted"
+	details["nameEffect"] = "unknown"
 	if e.ports.Receipts != nil {
 		receipt, err := e.ports.Receipts.Mutation(ctx, operation, endpointID, details)
 		if err != nil {
@@ -605,7 +629,7 @@ func (e *Executor) partialNameFailure(ctx context.Context, operation, endpointID
 			details["receipt"] = receipt
 		}
 	}
-	return &cli.Error{Code: "internal_error", Message: "thread was created but naming failed", Effect: "unknown", Details: details, Exit: cli.ExitInternal}
+	return &cli.Error{Code: "internal_error", Message: "thread was created but naming failed", Effect: "accepted", Details: details, Exit: cli.ExitInternal}
 }
 
 func rawOr(raw json.RawMessage, value any) any {
