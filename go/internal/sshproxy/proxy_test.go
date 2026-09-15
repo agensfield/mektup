@@ -6,7 +6,9 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -142,6 +144,35 @@ func TestProxyCarriesRawBytesWithoutJSONL(t *testing.T) {
 	}
 }
 
+func TestRealExecProxyDrainsBurstBeforeWait(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell helper uses POSIX executable semantics")
+	}
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "proxy-helper")
+	if err := os.WriteFile(helper, []byte("#!/bin/sh\nprintf '%s' 'raw-burst-abcdefghijklmnopqrstuvwxyz'\nprintf '%s' 'diagnostic' >&2\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	conn, err := Dial(context.Background(), Config{Host: "helper", SSHBinary: helper}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(25 * time.Millisecond)
+	waitErr := conn.Wait()
+	var waitFailure *Failure
+	if !errors.As(waitErr, &waitFailure) || waitFailure.Kind != FailureEOF {
+		t.Fatalf("wait error = %T %v", waitErr, waitErr)
+	}
+	data := make([]byte, len("raw-burst-abcdefghijklmnopqrstuvwxyz"))
+	_, err = io.ReadFull(conn, data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "raw-burst-abcdefghijklmnopqrstuvwxyz" {
+		t.Fatalf("raw data = %q", data)
+	}
+}
+
 func TestProxyFailureKindsAndPossibleWriteEvidence(t *testing.T) {
 	t.Run("spawn", func(t *testing.T) {
 		_, err := Dial(context.Background(), Config{Host: "host"}, ProcessFactoryFunc(func([]string) (Process, error) {
@@ -170,6 +201,7 @@ func TestProxyFailureKindsAndPossibleWriteEvidence(t *testing.T) {
 			go func() {
 				_, _ = p.stderrW.Write([]byte(test.stderr))
 				_ = p.stderrW.Close()
+				_ = p.stdoutW.Close()
 				p.releaseWait()
 			}()
 			failure := conn.Wait()
@@ -322,4 +354,23 @@ func TestDeadlineUpdatesWakeBlockedReadAndWrite(t *testing.T) {
 			t.Fatal("write deadline update did not wake writer")
 		}
 	})
+}
+
+func TestRepeatedEOFIsStable(t *testing.T) {
+	p := newFakeProcess()
+	conn, err := Dial(context.Background(), Config{Host: "host"}, &fakeFactory{process: p})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = p.stdoutW.Close()
+	_, first := conn.Read(make([]byte, 1))
+	if !errors.Is(first, io.EOF) {
+		t.Fatalf("first read = %v", first)
+	}
+	conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	_, second := conn.Read(make([]byte, 1))
+	if !errors.Is(second, io.EOF) {
+		t.Fatalf("second read = %v", second)
+	}
 }

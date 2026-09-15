@@ -229,6 +229,8 @@ type child struct {
 
 	waitDone    chan struct{}
 	stderrDone  chan struct{}
+	stdoutDone  chan struct{}
+	stdoutOnce  sync.Once
 	childErr    error
 	stderrText  string
 	stderrTrunc bool
@@ -268,9 +270,11 @@ func startChild(argv []string, cfg Config, factory ProcessFactory) (*child, erro
 		_ = stderr.Close()
 		return nil, &Failure{Kind: FailureSpawn, Cause: FailureSpawn, Evidence: WriteNotStarted, Err: err}
 	}
-	c := &child{process: process, stdin: stdin, stdout: stdout, stderr: stderr, argv: append([]string(nil), argv...), config: cfg.normalized(), waitDone: make(chan struct{}), stderrDone: make(chan struct{}), closeDone: make(chan struct{})}
+	c := &child{process: process, stdin: stdin, stdout: stdout, stderr: stderr, argv: append([]string(nil), argv...), config: cfg.normalized(), waitDone: make(chan struct{}), stderrDone: make(chan struct{}), stdoutDone: make(chan struct{}), closeDone: make(chan struct{})}
 	go c.collectStderr()
 	go func() {
+		<-c.stdoutDone
+		<-c.stderrDone
 		err := process.Wait()
 		c.mu.Lock()
 		c.childErr = err
@@ -279,6 +283,8 @@ func startChild(argv []string, cfg Config, factory ProcessFactory) (*child, erro
 	}()
 	return c, nil
 }
+
+func (c *child) markStdoutDone() { c.stdoutOnce.Do(func() { close(c.stdoutDone) }) }
 
 func (c *child) collectStderr() {
 	defer close(c.stderrDone)
@@ -337,8 +343,11 @@ type Conn struct {
 	readCh        chan readChunk
 	done          chan struct{}
 	closeOnce     sync.Once
+	readCallMu    sync.Mutex
 	readMu        sync.Mutex
 	readBuf       []byte
+	terminalErr   error
+	terminalSeen  bool
 	deadlineMu    sync.Mutex
 	readDeadline  time.Time
 	writeDeadline time.Time
@@ -349,6 +358,8 @@ type Conn struct {
 	host          string
 	closeErrMu    sync.Mutex
 	closeErr      error
+	admissionMu   sync.Mutex
+	closed        bool
 }
 
 type readChunk struct {
@@ -393,6 +404,7 @@ func newConn(child *child, host string) *Conn {
 }
 
 func (c *Conn) pump() {
+	defer c.child.markStdoutDone()
 	buf := make([]byte, defaultReadChunk)
 	for {
 		n, err := c.child.stdout.Read(buf)
@@ -457,12 +469,19 @@ func (c *Conn) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
+	c.readCallMu.Lock()
+	defer c.readCallMu.Unlock()
 	c.readMu.Lock()
 	if len(c.readBuf) > 0 {
 		n := copy(p, c.readBuf)
 		c.readBuf = c.readBuf[n:]
 		c.readMu.Unlock()
 		return n, nil
+	}
+	if c.terminalSeen {
+		err := c.terminalErr
+		c.readMu.Unlock()
+		return 0, err
 	}
 	c.readMu.Unlock()
 	for {
@@ -483,7 +502,12 @@ func (c *Conn) Read(p []byte) (int, error) {
 				return n, nil
 			}
 			if chunk.err != nil {
-				return 0, classifyReadError(chunk.err, c.phase())
+				failure := classifyReadError(chunk.err, c.phase())
+				c.readMu.Lock()
+				c.terminalErr = failure
+				c.terminalSeen = true
+				c.readMu.Unlock()
+				return 0, failure
 			}
 		case <-c.done:
 			if cancel != nil {
@@ -537,6 +561,17 @@ func (c *Conn) Write(p []byte) (int, error) {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
+	deadline, wake := c.writeState()
+	c.admissionMu.Lock()
+	if c.closed {
+		c.admissionMu.Unlock()
+		return 0, &Failure{Kind: FailureCanceled, Cause: FailureCanceled, Evidence: WriteNotStarted, Err: io.ErrClosedPipe}
+	}
+	if !deadline.IsZero() && !time.Now().Before(deadline) {
+		c.admissionMu.Unlock()
+		return 0, &Failure{Kind: FailureCanceled, Cause: FailureCanceled, Evidence: WriteNotStarted, Err: os.ErrDeadlineExceeded}
+	}
+	c.admissionMu.Unlock()
 	if c.phase() != WriteNotStarted && c.phase() != WriteComplete {
 		return 0, &Failure{Kind: FailurePossibleWrite, Evidence: c.phase(), Err: io.ErrClosedPipe}
 	}
@@ -548,7 +583,7 @@ func (c *Conn) Write(p []byte) (int, error) {
 		result <- writeResult{n: n, err: err}
 	}()
 	for {
-		deadline, wake := c.writeState()
+		deadline, wake = c.writeState()
 		wait, cancel := deadlineTimer(deadline)
 		select {
 		case outcome := <-result:
@@ -589,6 +624,9 @@ type writeResult struct {
 
 func (c *Conn) abort() error {
 	c.closeOnce.Do(func() {
+		c.admissionMu.Lock()
+		c.closed = true
+		c.admissionMu.Unlock()
 		close(c.done)
 		err := c.child.close()
 		c.closeErrMu.Lock()

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 )
 
 // ControlRequest is the metadata-only seam between SSH transport and the
@@ -91,6 +92,11 @@ func ValidateControlRequest(data []byte) (ControlRequest, error) {
 	if err := req.Validate(); err != nil {
 		return ControlRequest{}, err
 	}
+	if req.Kind == "request" && req.Operation == "claim" {
+		if _, present := raw["lease"]; present {
+			return ControlRequest{}, fmt.Errorf("%w: claim cannot contain lease, including null", ErrControlValidation)
+		}
+	}
 	return req, nil
 }
 
@@ -121,6 +127,15 @@ func (r ControlRequest) Validate() error {
 	}
 	if r.ReplyErrorCode != "" && r.ReplyStatus != "error" {
 		return fmt.Errorf("%w: replyErrorCode requires error status", ErrControlValidation)
+	}
+	if r.BodyBytes != nil && *r.BodyBytes < 0 {
+		return fmt.Errorf("%w: bodyBytes cannot be negative", ErrControlValidation)
+	}
+	if r.RequestedLease != nil && r.RequestedLease.DurationMS <= 0 {
+		return fmt.Errorf("%w: requested lease must be positive", ErrControlValidation)
+	}
+	if r.Operation != "claim" && r.Operation != "status" && r.Operation != "reconcile" && r.RequestedLease != nil {
+		return fmt.Errorf("%w: %s cannot contain requestedLease", ErrControlValidation, r.Operation)
 	}
 	switch r.Operation {
 	case "claim", "heartbeat", "commit", "abandon", "status", "reconcile":
@@ -164,14 +179,8 @@ func (r ControlRequest) Validate() error {
 		}
 	case "status", "reconcile":
 	}
-	if r.BodyBytes != nil && *r.BodyBytes < 0 {
-		return fmt.Errorf("%w: bodyBytes cannot be negative", ErrControlValidation)
-	}
 	if r.BodySHA256 != "" && !validSHA256(r.BodySHA256) {
 		return fmt.Errorf("%w: bodySha256 must be sha256:<64 lowercase hex>", ErrControlValidation)
-	}
-	if r.RequestedLease != nil && r.RequestedLease.DurationMS <= 0 {
-		return fmt.Errorf("%w: requested lease must be positive", ErrControlValidation)
 	}
 	if r.ReplyStatus != "" && r.ReplyStatus != "success" && r.ReplyStatus != "error" {
 		return fmt.Errorf("%w: invalid reply status", ErrControlValidation)
@@ -212,23 +221,8 @@ func validTimestamp(value string) bool {
 	if len(value) < len("2006-01-02T15:04:05.0Z") || !strings.HasSuffix(value, "Z") {
 		return false
 	}
-	if value[4] != '-' || value[7] != '-' || value[10] != 'T' || value[13] != ':' || value[16] != ':' || value[19] != '.' {
-		return false
-	}
-	for i, r := range value[:19] {
-		if i == 4 || i == 7 || i == 10 || i == 13 || i == 16 {
-			continue
-		}
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	for _, r := range value[20 : len(value)-1] {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	return true
+	_, err := time.Parse(time.RFC3339Nano, value)
+	return err == nil
 }
 
 func validURI(value string) bool {
@@ -273,6 +267,9 @@ func validSHA256(value string) bool {
 func InvokeControl(ctx context.Context, cfg Config, req ControlRequest, factory ProcessFactory, validator ControlValidator) (response []byte, returnErr error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, &Failure{Kind: FailureCanceled, Cause: FailureCanceled, Evidence: WriteNotStarted, Err: err}
 	}
 	if err := req.Validate(); err != nil {
 		return nil, err
@@ -338,6 +335,7 @@ func InvokeControl(ctx context.Context, cfg Config, req ControlRequest, factory 
 
 	outputDone := make(chan controlReadResult, 1)
 	go func() {
+		defer child.markStdoutDone()
 		body, readErr := io.ReadAll(io.LimitReader(child.stdout, cfg.normalized().ControlLimit+1))
 		outputDone <- controlReadResult{body: body, err: readErr}
 	}()
@@ -346,15 +344,35 @@ func InvokeControl(ctx context.Context, cfg Config, req ControlRequest, factory 
 		if result.err != nil {
 			return nil, &Failure{Kind: FailureEOF, Cause: FailureEOF, Evidence: WriteComplete, Err: result.err}
 		}
-		<-child.waitDone
-		<-child.stderrDone
+		limit := cfg.normalized().ControlLimit
+		if int64(len(result.body)) > limit {
+			_ = child.close()
+			return nil, &Failure{Kind: FailureProxy, Cause: FailureProxy, Evidence: WriteComplete, Err: ErrControlTooLarge}
+		}
+		waitTimer := time.NewTimer(cfg.normalized().CleanupTimeout)
+		select {
+		case <-child.waitDone:
+			if !waitTimer.Stop() {
+				select {
+				case <-waitTimer.C:
+				default:
+				}
+			}
+		case <-ctx.Done():
+			if !waitTimer.Stop() {
+				select {
+				case <-waitTimer.C:
+				default:
+				}
+			}
+			return nil, &Failure{Kind: FailurePossibleWrite, Cause: FailureCanceled, Evidence: WriteComplete, Err: ctx.Err()}
+		case <-waitTimer.C:
+			_ = child.close()
+			return nil, &Failure{Kind: FailureProxy, Cause: FailureProxy, Evidence: WriteComplete, Err: ErrCleanupTimeout}
+		}
 		if childErr, stderr, trunc := child.status(); childErr != nil {
 			kind := classifyChildFailure(stderr)
 			return nil, &Failure{Kind: FailurePossibleWrite, Cause: kind, Evidence: WriteComplete, Err: childErr, ExitCode: processExitCode(childErr), Stderr: stderr, StderrTrunc: trunc}
-		}
-		limit := cfg.normalized().ControlLimit
-		if int64(len(result.body)) > limit {
-			return nil, &Failure{Kind: FailureProxy, Cause: FailureProxy, Evidence: WriteComplete, Err: ErrControlTooLarge}
 		}
 		if _, validationErr := validateControlResult(result.body, req); validationErr != nil {
 			return nil, &Failure{Kind: FailureProxy, Cause: FailureProxy, Evidence: WriteComplete, Err: validationErr}
