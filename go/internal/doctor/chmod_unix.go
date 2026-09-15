@@ -13,7 +13,7 @@ import (
 // already-open inode. This closes the check-then-use swap window for the
 // owner-private repairs doctor is allowed to make.
 func safeChmod(path string, mode os.FileMode, expected os.FileInfo) error {
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return fmt.Errorf("open permission target without following symlink: %w", err)
 	}

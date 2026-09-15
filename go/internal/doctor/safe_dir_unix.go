@@ -24,10 +24,11 @@ func safeEnsureDir(path string, mode uint32) error {
 	}
 	defer func() { _ = unix.Close(fd) }()
 	parts := strings.Split(strings.TrimPrefix(abs, string(filepath.Separator)), string(filepath.Separator))
-	for _, part := range parts {
+	for index, part := range parts {
 		if part == "" || part == "." {
 			continue
 		}
+		isFinal := index == len(parts)-1
 		next, openErr := unix.Openat(fd, part, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 		created := false
 		if openErr != nil {
@@ -55,7 +56,7 @@ func safeEnsureDir(path string, mode uint32) error {
 			unix.Close(next)
 			return fmt.Errorf("directory component %q is not a directory", part)
 		}
-		if created {
+		if created || isFinal {
 			if err := unix.Fchmod(next, mode); err != nil {
 				unix.Close(next)
 				return fmt.Errorf("protect directory component %q: %w", part, err)
