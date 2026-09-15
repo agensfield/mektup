@@ -45,6 +45,14 @@ func (q ReceiptQuery) limit() (int, error) {
 // check protects the journal if additive evidence maps are supplied by a
 // future caller.
 func (j *Journal) PutReceipt(ctx context.Context, receipt mektup.Receipt) error {
+	return j.putReceiptTx(ctx, j.db, receipt)
+}
+
+type receiptExec interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}
+
+func (j *Journal) putReceiptTx(ctx context.Context, execer receiptExec, receipt mektup.Receipt) error {
 	if err := receipt.Validate(); err != nil {
 		return fmt.Errorf("journal: invalid receipt: %w", err)
 	}
@@ -63,7 +71,7 @@ func (j *Journal) PutReceipt(ctx context.Context, receipt mektup.Receipt) error 
 	if err != nil {
 		return err
 	}
-	_, err = j.db.ExecContext(ctx, `INSERT INTO receipts(receipt_id,operation_id,message_id,state,created_at,updated_at,source_endpoint_id,source_thread_id,target_endpoint_id,target_thread_id,document)
+	_, err = execer.ExecContext(ctx, `INSERT INTO receipts(receipt_id,operation_id,message_id,state,created_at,updated_at,source_endpoint_id,source_thread_id,target_endpoint_id,target_thread_id,document)
 VALUES(?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(receipt_id) DO UPDATE SET operation_id=excluded.operation_id,message_id=excluded.message_id,state=excluded.state,created_at=excluded.created_at,updated_at=excluded.updated_at,source_endpoint_id=excluded.source_endpoint_id,source_thread_id=excluded.source_thread_id,target_endpoint_id=excluded.target_endpoint_id,target_thread_id=excluded.target_thread_id,document=excluded.document`,
 		receipt.ReceiptID, receipt.OperationID, receipt.Message.MessageID, string(receipt.State), created.UnixNano(), updated.UnixNano(), receipt.Source.EndpointID, receipt.Source.ThreadID, receipt.Target.EndpointID, receipt.Target.ThreadID, string(document))

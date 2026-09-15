@@ -16,6 +16,25 @@ func (failingReceiptJournal) PutReceipt(context.Context, mektup.Receipt) error {
 	return errors.New("injected receipt write failure")
 }
 
+type stagedProjectionJournal struct {
+	*journal.Journal
+	staged  chan struct{}
+	release chan struct{}
+	once    bool
+}
+
+func (s *stagedProjectionJournal) PutReceipt(ctx context.Context, receipt mektup.Receipt) error {
+	if err := s.Journal.PutReceipt(ctx, receipt); err != nil {
+		return err
+	}
+	if !s.once && receipt.State == mektup.StateManuallyResolved {
+		s.once = true
+		close(s.staged)
+		<-s.release
+	}
+	return nil
+}
+
 func reviewPrepare(t *testing.T, j *journal.Journal, receipt mektup.Receipt, reply bool) {
 	t.Helper()
 	op := journal.Operation{OperationID: receipt.OperationID, MessageID: receipt.Message.MessageID, SourceRoute: "src", TargetRoute: "dst", Semantics: "send", Digest: receipt.Message.PayloadSHA256, BodySize: int64(receipt.Message.PayloadBytes)}
@@ -49,6 +68,39 @@ func TestManualResolveReceiptWriteFailureRemainsRetryable(t *testing.T) {
 	stored, _ := j.Receipt(context.Background(), receipt.ReceiptID)
 	if mektup.EvidenceState(op.State) != stored.State {
 		t.Fatalf("partial manual commit: operation=%s receipt=%s", op.State, stored.State)
+	}
+}
+
+func TestManualResolveRecoveryCannotBeClobberedByOriginalWriter(t *testing.T) {
+	store, j := openStore(t)
+	receipt := testReceipt(t, mektup.StateOutcomeUnknown)
+	reviewPrepare(t, j, receipt, false)
+	if err := store.Save(context.Background(), receipt); err != nil {
+		t.Fatal(err)
+	}
+	staged := &stagedProjectionJournal{Journal: j, staged: make(chan struct{}), release: make(chan struct{})}
+	first := Store{Journal: staged, Now: store.Now}
+	request := ResolveRequest{Reference: receipt.ReceiptID, Assertion: "not_delivered", Actor: "operator", Reason: "test", EvidenceRef: "test", Presentation: "human", Intent: "receipt.resolve", Gate: &gateStub{}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := first.Resolve(context.Background(), request)
+		done <- err
+	}()
+	<-staged.staged
+	resolved, err := store.Resolve(context.Background(), request)
+	if err != nil {
+		close(staged.release)
+		<-done
+		t.Fatal(err)
+	}
+	close(staged.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	op, _ := j.Operation(context.Background(), receipt.OperationID)
+	stored, _ := j.Receipt(context.Background(), receipt.ReceiptID)
+	if stored.State != resolved.State || stored.State != mektup.EvidenceState(op.State) {
+		t.Fatalf("successful recovery overwritten by stale writer: returned=%s operation=%s receipt=%s", resolved.State, op.State, stored.State)
 	}
 }
 

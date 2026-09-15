@@ -263,6 +263,10 @@ func (s Store) Resolve(ctx context.Context, request ResolveRequest) (mektup.Rece
 	receipt.State = mektup.StateManuallyResolved
 	receipt.UpdatedAt = now.Format(time.RFC3339Nano)
 	receipt.ManualResolution = &mektup.ManualResolution{Assertion: request.Assertion, Actor: request.Actor, Reason: request.Reason, EvidenceRef: request.EvidenceRef, Presentation: request.Presentation, Timestamp: now.Format(time.RFC3339Nano)}
+	resolution := journal.ManualResolution{Assertion: request.Assertion, Actor: request.Actor, Reason: request.Reason, EvidenceRef: request.EvidenceRef, Presentation: request.Presentation, Timestamp: now}
+	if concrete, ok := s.Journal.(*journal.Journal); ok {
+		return concrete.ResolveWithReceipt(ctx, receipt.OperationID, resolution, receipt)
+	}
 	// The journal's transition API predates receipt projections. Write the
 	// projection first so an injected/failed receipt write leaves the operation
 	// outcome-unknown and retryable. If the transition then fails, restore the
@@ -271,7 +275,12 @@ func (s Store) Resolve(ctx context.Context, request ResolveRequest) (mektup.Rece
 	if err := s.Journal.PutReceipt(ctx, receipt); err != nil {
 		return mektup.Receipt{}, err
 	}
-	if err := s.Journal.RecordManualResolution(ctx, receipt.OperationID, journal.ManualResolution{Assertion: request.Assertion, Actor: request.Actor, Reason: request.Reason, EvidenceRef: request.EvidenceRef, Presentation: request.Presentation, Timestamp: now}); err != nil {
+	if err := s.Journal.RecordManualResolution(ctx, receipt.OperationID, resolution); err != nil {
+		latestOp, latestOpErr := s.Journal.Operation(ctx, receipt.OperationID)
+		latestReceipt, latestReceiptErr := s.Show(ctx, receipt.ReceiptID, ShowOptions{})
+		if latestOpErr == nil && latestReceiptErr == nil && latestOp.State == journal.StateManuallyResolved && latestReceipt.State == mektup.StateManuallyResolved {
+			return latestReceipt, nil
+		}
 		if rollbackErr := s.Journal.PutReceipt(ctx, previous); rollbackErr != nil {
 			return mektup.Receipt{}, fmt.Errorf("%w: projection rollback failed: %v (transition: %v)", ErrReconcileIncomplete, rollbackErr, err)
 		}

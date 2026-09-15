@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"fmt"
 	"time"
+
+	mektup "github.com/agensfield/mektup/go"
 )
 
 // Operation describes metadata persisted before a request can be dispatched.
@@ -357,6 +359,71 @@ func (j *Journal) RecordManualResolution(ctx context.Context, operationID string
 		}
 		return emit(tx, "operation.manually_resolved", operationID, "", StateManuallyResolved, now)
 	})
+}
+
+// ResolveWithReceipt atomically commits a caller assertion, its evidence
+// transition, and the bodyless receipt projection. Human authorization is
+// intentionally performed by the caller before entering this transaction.
+// Repeated callers observe the already committed projection rather than
+// clobbering it with an older assertion.
+func (j *Journal) ResolveWithReceipt(ctx context.Context, operationID string, resolution ManualResolution, receipt mektup.Receipt) (mektup.Receipt, error) {
+	if operationID == "" || receipt.OperationID != operationID || resolution.Actor == "" || resolution.Reason == "" || resolution.EvidenceRef == "" || (resolution.Assertion != "accepted" && resolution.Assertion != "not_delivered") {
+		return mektup.Receipt{}, fmt.Errorf("journal: incomplete atomic manual resolution")
+	}
+	if receipt.State != mektup.StateManuallyResolved {
+		return mektup.Receipt{}, fmt.Errorf("journal: atomic manual receipt must be manually_resolved")
+	}
+	var committed mektup.Receipt
+	err := j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
+		var state EvidenceState
+		if err := tx.QueryRow("SELECT state FROM operations WHERE operation_id=?", operationID).Scan(&state); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrNotFound
+			}
+			return err
+		}
+		if state == StateManuallyResolved {
+			var document string
+			if err := tx.QueryRow("SELECT document FROM receipts WHERE receipt_id=?", receipt.ReceiptID).Scan(&document); err != nil {
+				if err == sql.ErrNoRows {
+					return ErrNotFound
+				}
+				return err
+			}
+			var err error
+			committed, err = parseStoredReceipt(document)
+			return err
+		}
+		if state != StateOutcomeUnknown {
+			return ErrInvalidTransition
+		}
+		resolvedAt := now
+		if !resolution.Timestamp.IsZero() {
+			resolvedAt = resolution.Timestamp.UTC().UnixNano()
+		}
+		if _, err := tx.Exec("UPDATE operations SET state=?,updated_at=?,terminal_at=?,error_code=? WHERE operation_id=? AND state=?", string(StateManuallyResolved), now, now, resolution.Assertion, operationID, string(StateOutcomeUnknown)); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("INSERT OR REPLACE INTO manual_resolutions(operation_id,assertion,actor,reason,evidence_ref,presentation,resolved_at) VALUES(?,?,?,?,?,?,?)", operationID, resolution.Assertion, resolution.Actor, resolution.Reason, resolution.EvidenceRef, resolution.Presentation, resolvedAt); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("UPDATE attempts SET state=?,updated_at=? WHERE operation_id=?", string(StateManuallyResolved), now, operationID); err != nil {
+			return err
+		}
+		if err := emit(tx, "operation.manually_resolved", operationID, "", StateManuallyResolved, now); err != nil {
+			return err
+		}
+		if err := j.putReceiptTx(ctx, tx, receipt); err != nil {
+			return err
+		}
+		committed = receipt
+		return nil
+	})
+	if err != nil {
+		return mektup.Receipt{}, err
+	}
+	return committed, nil
 }
 
 // RecoverOrphans is conservative and idempotent. Prepared intent is proven
