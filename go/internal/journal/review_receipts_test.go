@@ -2,6 +2,7 @@ package journal
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -24,6 +25,44 @@ func TestCurrentSchemaMissingReceiptsFailsClosed(t *testing.T) {
 		t.Fatal("current schema missing receipts silently recreated")
 	} else if !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("missing schema error: %v", err)
+	}
+}
+
+func TestV4ToV5MalformedBlockerMigrationRollsBack(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	j, err := Open(ctx, Options{StateDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("ALTER TABLE blockers RENAME TO old_blockers"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("CREATE TABLE blockers AS SELECT * FROM old_blockers WHERE 0"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("DROP TABLE old_blockers"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("PRAGMA user_version=4"); err != nil {
+		t.Fatal(err)
+	}
+	_ = j.Close()
+	if migrated, err := Open(ctx, Options{StateDir: dir}); err == nil {
+		migrated.Close()
+		t.Fatal("malformed v4 supplemental schema was published as v5")
+	}
+	db, err := sql.Open("sqlite", "file:"+escapedSQLitePath(filepath.Join(dir, "journal.sqlite3"))+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var version int
+	if err := db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
+		t.Fatal(err)
+	}
+	if version != 4 {
+		t.Fatalf("failed migration published version %d", version)
 	}
 }
 

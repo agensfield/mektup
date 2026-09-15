@@ -585,6 +585,13 @@ func migrateV4ToV5(ctx context.Context, tx *sql.Tx) error {
 	if err := ensureSupplementalTables(ctx, tx); err != nil {
 		return err
 	}
+	// Validate the completed v5 shape while the migration transaction is still
+	// open. A malformed legacy supplemental table must roll back rather than
+	// publishing user_version=5 and leaving a journal that current readers
+	// reject.
+	if err := validateV5Schema(ctx, tx); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, "PRAGMA user_version=5"); err != nil {
 		return fmt.Errorf("journal migration: %w", err)
 	}
