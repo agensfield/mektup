@@ -171,6 +171,27 @@ func TestStorageCorruptOpenUsesStableCode(t *testing.T) {
 	_ = env.Close()
 }
 
+func TestStorageCheckUsesReadOnlyPathWithoutJournalOpen(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	if err := os.Mkdir(state, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, "journal.sqlite3"), []byte("corrupt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	env := New(Options{CodexHome: filepath.Join(root, "codex")})
+	app := &cli.App{Out: &out, Err: &errOut, Executor: env, Env: []string{"MEKTUP_OUTPUT=json", "MEKTUP_STATE_DIR=" + state, "MEKTUP_CONFIG=" + filepath.Join(root, "config.json")}}
+	if code := app.Run([]string{"storage", "check"}); code != int(cli.ExitRejected) || !strings.Contains(out.String(), `"code":"storage_corrupt"`) {
+		t.Fatalf("storage check exit=%d output=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(state, "journal.sqlite3-wal")); !os.IsNotExist(err) {
+		t.Fatalf("read-only storage check created WAL: %v", err)
+	}
+	_ = env.Close()
+}
+
 func TestCanceledFIFOIsRejectedBeforeBlockingOpen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "params.fifo")
 	if err := syscall.Mkfifo(path, 0600); err != nil {
@@ -326,6 +347,46 @@ func TestEndpointRemovePinsIdentityBeforeEffect(t *testing.T) {
 	receipt := value.(mektup.Receipt)
 	if receipt.Target.EndpointID != ep.ID {
 		t.Fatalf("removed endpoint identity = %+v", receipt.Target)
+	}
+}
+
+func TestReceiptPinsConnectedEndpointAcrossAliasReplacement(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	config := filepath.Join(root, "config.json")
+	store := endpoint.NewStore(config, state)
+	route, _ := endpoint.SSHRoute("example.invalid")
+	first := endpoint.Endpoint{ID: endpointID(), Alias: "remote", Route: route, Herdr: endpoint.HerdrDisabled}
+	if err := store.Add(first); err != nil {
+		t.Fatal(err)
+	}
+	dialer := &recordingDialer{transport: newFakeTransport()}
+	env := New(Options{DialerForRoute: func(endpoint.Route, bool) connection.ClientDialer { return dialer }})
+	resources, err := env.openResources(context.Background(), cli.Invocation{Command: "thread", Position: []string{"start"}, Resolved: cli.ResolvedGlobals{Endpoint: "remote", Config: config, StateDir: state}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resources.Close()
+	conn, err := resources.ports.Connections.Open(context.Background(), "remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := store.Remove("remote"); err != nil {
+		t.Fatal(err)
+	}
+	second := first
+	second.ID = "ep_0198f0e0-0000-7000-8000-000000000002"
+	if err := store.Add(second); err != nil {
+		t.Fatal(err)
+	}
+	value, err := resources.ports.Receipts.Mutation(context.Background(), "thread.start", "remote", map[string]any{"threadId": "real-thread"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt := value.(mektup.Receipt)
+	if receipt.Target.EndpointID != first.ID || receipt.Target.ServerVersion == "" {
+		t.Fatalf("receipt lost connected identity/facts: %+v", receipt.Target)
 	}
 }
 

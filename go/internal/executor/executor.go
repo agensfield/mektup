@@ -972,7 +972,7 @@ func mapError(err error, effect string) error {
 		return &cli.Error{Code: "outcome_unknown", Message: "operation outcome is unknown after a possible write", Effect: "outcome_unknown", Details: map[string]any{"writePhase": callErr.Evidence.Phase.String(), "generation": callErr.Evidence.Generation}, Exit: cli.ExitUnknown}
 	}
 	if errors.Is(err, journal.ErrStorageBusy) {
-		return &cli.Error{Code: "storage_busy", Message: err.Error(), Effect: effect, Exit: cli.ExitRejected}
+		return &cli.Error{Code: "storage_busy", Message: err.Error(), Effect: effect, Exit: cli.ExitUnknown}
 	}
 	if errors.Is(err, journal.ErrStorageCorrupt) {
 		return &cli.Error{Code: "storage_corrupt", Message: err.Error(), Effect: effect, Exit: cli.ExitRejected}

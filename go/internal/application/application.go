@@ -268,10 +268,11 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 
 	store := endpoint.NewStore(configPath, stateDir)
 	facts := &connectionFacts{values: make(map[string]connection.Info)}
-	connections := &connectionFactory{store: store, codexHome: e.options.CodexHome, options: e.options.Connection, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute, facts: facts}
+	pins := &receiptPins{values: make(map[string]endpoint.Endpoint)}
+	connections := &connectionFactory{store: store, codexHome: e.options.CodexHome, options: e.options.Connection, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute, facts: facts, pins: pins}
 	var receipts *receiptStore
 	if j != nil {
-		receipts = &receiptStore{journal: j, endpoints: store, codexHome: e.options.CodexHome, facts: facts, pins: &receiptPins{values: make(map[string]endpoint.Endpoint)}}
+		receipts = &receiptStore{journal: j, endpoints: store, codexHome: e.options.CodexHome, facts: facts, pins: pins}
 	}
 	endpoints := endpointPort{store: store, receipts: receipts}
 	input := executor.ReaderInput{In: e.options.Input}
@@ -289,7 +290,7 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 		Connections:    connections,
 		Endpoints:      endpoints,
 		EndpointHealth: endpointHealth{factory: connections},
-		Storage:        storagePort(j),
+		Storage:        storagePortFor(inv, j, stateDir),
 		Doctor:         doctorPort{},
 		Input:          input,
 		Artifacts:      executor.ArtifactStoreOutput{Store: artifacts},
@@ -305,8 +306,10 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 
 func needsJournal(inv cli.Invocation) bool {
 	switch inv.Command {
-	case "search", "rpc", "storage":
+	case "search", "rpc":
 		return true
+	case "storage":
+		return len(inv.Position) == 0 || inv.Position[0] != "check"
 	case "doctor":
 		return hasOption(inv, "fix")
 	case "endpoint":
@@ -327,6 +330,28 @@ func storagePort(j *journal.Journal) executor.StoragePort {
 		return nil
 	}
 	return storage.New(j)
+}
+
+func storagePortFor(inv cli.Invocation, j *journal.Journal, stateDir string) executor.StoragePort {
+	if inv.Command == "storage" && len(inv.Position) > 0 && inv.Position[0] == "check" {
+		return readOnlyStorage{databasePath: filepath.Join(stateDir, "journal.sqlite3")}
+	}
+	return storagePort(j)
+}
+
+type readOnlyStorage struct{ databasePath string }
+
+func (s readOnlyStorage) Status(context.Context) (journal.StorageStatus, error) {
+	return journal.StorageStatus{}, errors.New("storage status requires a writable journal")
+}
+func (s readOnlyStorage) Check(ctx context.Context) (journal.StorageCheck, error) {
+	return journal.CheckPath(ctx, s.databasePath)
+}
+func (s readOnlyStorage) Maintain(context.Context, journal.MaintenanceOptions) (journal.MaintenanceReceipt, error) {
+	return journal.MaintenanceReceipt{}, errors.New("storage maintenance requires a writable journal")
+}
+func (s readOnlyStorage) Vacuum(context.Context) (journal.VacuumReceipt, error) {
+	return journal.VacuumReceipt{}, errors.New("storage vacuum requires a writable journal")
 }
 
 func mapJournalOpenError(err error) error {
@@ -410,6 +435,7 @@ type connectionFactory struct {
 	dialerForRoute func(endpoint.Route, bool) connection.ClientDialer
 	openOverride   func(context.Context, string, executor.OpenOptions) (executor.Connection, error)
 	facts          *connectionFacts
+	pins           *receiptPins
 }
 
 func (f *connectionFactory) Open(ctx context.Context, selector string) (executor.Connection, error) {
@@ -426,6 +452,11 @@ func (f *connectionFactory) OpenWithOptions(ctx context.Context, selector string
 	}
 	if err := ep.Validate(); err != nil {
 		return nil, err
+	}
+	if f.pins != nil {
+		// Pin before dialing. A later config mutation or alias replacement must
+		// not alter the identity attached to this operation's receipt.
+		f.pins.Set(selector, ep)
 	}
 	options := f.options
 	options.ExperimentalAPI = open.ExperimentalAPI
@@ -514,13 +545,20 @@ type receiptPins struct {
 	values map[string]endpoint.Endpoint
 }
 
+func (p *receiptPins) Set(selector string, ep endpoint.Endpoint) {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	p.values[selector] = ep
+	p.mu.Unlock()
+}
+
 func (s *receiptStore) Pin(selector string, ep endpoint.Endpoint) {
 	if s == nil || s.pins == nil {
 		return
 	}
-	s.pins.mu.Lock()
-	s.pins.values[selector] = ep
-	s.pins.mu.Unlock()
+	s.pins.Set(selector, ep)
 }
 
 func (s receiptStore) pinned(selector string) (endpoint.Endpoint, bool) {

@@ -579,16 +579,17 @@ func TestPossibleWriteDeadlineMapsToOutcomeUnknown(t *testing.T) {
 	}
 }
 
-func TestStorageSentinelsMapToStableRejectedErrors(t *testing.T) {
+func TestStorageSentinelsMapToStableErrors(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
 		code string
+		exit cli.ExitCode
 	}{
-		{journal.ErrStorageBusy, "storage_busy"},
-		{journal.ErrStorageCorrupt, "storage_corrupt"},
+		{journal.ErrStorageBusy, "storage_busy", cli.ExitUnknown},
+		{journal.ErrStorageCorrupt, "storage_corrupt", cli.ExitRejected},
 	} {
 		var ce *cli.Error
-		if !errors.As(mapError(tc.err, "not_sent"), &ce) || ce.Code != tc.code || ce.Exit != cli.ExitRejected {
+		if !errors.As(mapError(tc.err, "not_sent"), &ce) || ce.Code != tc.code || ce.Exit != tc.exit {
 			t.Fatalf("err=%v mapped=%+v", tc.err, ce)
 		}
 	}
