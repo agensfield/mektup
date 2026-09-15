@@ -118,7 +118,7 @@ type Executor interface {
 type defaultExecutor struct{}
 
 func (defaultExecutor) Execute(context.Context, Invocation) (ExecutionResult, error) {
-	return ExecutionResult{}, &Error{Code: "internal_error", Message: "operational command is not implemented", Exit: ExitInternal}
+	return ExecutionResult{}, &Error{Code: "internal_error", Message: "operational command is not implemented", Effect: "not_sent", Exit: ExitInternal}
 }
 
 // App is the embeddable CLI application.
@@ -537,8 +537,34 @@ func (a *App) lifecycleEvents(inv Invocation, result ExecutionResult) ([]map[str
 		}
 		events = append(events, event)
 	}
-	if len(events) == 0 && result.Receipt != nil {
-		events = append(events, map[string]any{"data": map[string]any{"receipt": result.Receipt}})
+	syntheticTerminal := len(events) == 0
+	if syntheticTerminal && result.Receipt != nil {
+		events = append(events, map[string]any{"event": "operation.completed", "data": map[string]any{"receipt": result.Receipt}})
+	}
+	if len(events) == 0 {
+		return nil, errors.New("operational command returned no machine output")
+	}
+	operationID := ""
+	for _, event := range events {
+		if supplied, ok := event["operationId"].(string); ok && supplied != "" {
+			if !validUUIDv7ID(supplied, "op_") {
+				return nil, fmt.Errorf("executor operationId is not a UUIDv7: %q", supplied)
+			}
+			if operationID != "" && operationID != supplied {
+				return nil, errors.New("executor lifecycle events contain conflicting operation IDs")
+			}
+			operationID = supplied
+		}
+	}
+	if operationID == "" {
+		var err error
+		operationID, err = a.ID("op_")
+		if err != nil {
+			return nil, fmt.Errorf("unable to allocate lifecycle operation identity: %w", err)
+		}
+		if !validUUIDv7ID(operationID, "op_") {
+			return nil, fmt.Errorf("generated operationId is not a UUIDv7: %q", operationID)
+		}
 	}
 	for index, event := range events {
 		if schema, ok := event["schema"].(string); ok && schema != "" && schema != EventSchema {
@@ -553,15 +579,14 @@ func (a *App) lifecycleEvents(inv Invocation, result ExecutionResult) ([]map[str
 			if err != nil {
 				return nil, fmt.Errorf("unable to allocate lifecycle event identity: %w", err)
 			}
-			event["eventId"] = id
-		}
-		if _, ok := event["operationId"].(string); !ok || event["operationId"] == "" {
-			id, err := a.ID("op_")
-			if err != nil {
-				return nil, fmt.Errorf("unable to allocate lifecycle operation identity: %w", err)
+			if !validUUIDv7ID(id, "evt_") {
+				return nil, fmt.Errorf("generated eventId is not a UUIDv7: %q", id)
 			}
-			event["operationId"] = id
+			event["eventId"] = id
+		} else if !validUUIDv7ID(event["eventId"].(string), "evt_") {
+			return nil, fmt.Errorf("executor eventId is not a UUIDv7: %q", event["eventId"])
 		}
+		event["operationId"] = operationID
 		if _, ok := event["timestamp"].(string); !ok || event["timestamp"] == "" {
 			event["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
 		}
@@ -587,12 +612,37 @@ func (a *App) lifecycleEvents(inv Invocation, result ExecutionResult) ([]map[str
 		data := last["data"].(map[string]any)
 		data["receipt"] = result.Receipt
 		last["terminal"] = true
-		last["event"] = "operation.completed"
+		if syntheticTerminal {
+			last["event"] = "operation.completed"
+		}
 	}
 	if terminal, _ := last["terminal"].(bool); !terminal {
 		last["terminal"] = true
 	}
 	return events, nil
+}
+
+func validUUIDv7ID(value, prefix string) bool {
+	if !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	uuid := strings.TrimPrefix(value, prefix)
+	parts := strings.Split(uuid, "-")
+	if len(parts) != 5 || len(parts[0]) != 8 || len(parts[1]) != 4 || len(parts[2]) != 4 || len(parts[3]) != 4 || len(parts[4]) != 12 {
+		return false
+	}
+	if _, err := hex.DecodeString(strings.Join(parts, "")); err != nil {
+		return false
+	}
+	if parts[2][0] != '7' {
+		return false
+	}
+	switch parts[3][0] {
+	case '8', '9', 'a', 'b':
+		return true
+	default:
+		return false
+	}
 }
 
 func receiptHuman(receipt any) string {
@@ -671,12 +721,25 @@ func (a *App) writeJSON(value any) int {
 func normalizeError(err error) *Error {
 	var e *Error
 	if errors.As(err, &e) {
+		if e.Code == "" {
+			e.Code = "internal_error"
+		}
 		if e.Exit == 0 && e.Code != "" {
 			e.Exit = exitForError(e.Code)
 		}
+		if e.Effect == "" {
+			if e.Exit == ExitUsage {
+				e.Effect = "not_sent"
+			} else {
+				e.Effect = "unknown"
+			}
+		}
+		if e.Details == nil {
+			e.Details = map[string]any{}
+		}
 		return e
 	}
-	return &Error{Code: "internal_error", Message: err.Error(), Exit: ExitInternal}
+	return &Error{Code: "internal_error", Message: err.Error(), Effect: "unknown", Details: map[string]any{}, Exit: ExitInternal}
 }
 
 func exitForError(code string) ExitCode {

@@ -263,6 +263,15 @@ func TestOperationalJSONLHasContiguousTerminalLifecycleAndEmbeddedReceipt(t *tes
 			}
 		}
 	}
+	var first, second map[string]any
+	_ = json.Unmarshal([]byte(lines[0]), &first)
+	_ = json.Unmarshal([]byte(lines[1]), &second)
+	if first["operationId"] != second["operationId"] {
+		t.Fatalf("operation ID changed across events: %v vs %v", first["operationId"], second["operationId"])
+	}
+	if second["event"] != "reply.accepted" {
+		t.Fatalf("receipt embedding erased terminal event: %#v", second)
+	}
 }
 
 func TestOperationalJSONLRejectsLinesAfterTerminal(t *testing.T) {
@@ -289,5 +298,35 @@ func TestHelpJSONUsesOfflineSchema(t *testing.T) {
 	}
 	if document["schema"] != "mektup/help/v1" {
 		t.Fatalf("help used lifecycle schema: %#v", document)
+	}
+}
+
+func TestOperationalJSONLRejectsConflictingOperationIDs(t *testing.T) {
+	op1, _ := defaultID("op_")
+	op2, _ := defaultID("op_")
+	var out, errOut bytes.Buffer
+	a := &App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{}, Executor: executorFunc(func(context.Context, Invocation) (ExecutionResult, error) {
+		return ExecutionResult{Events: []OutputEvent{
+			{Machine: map[string]any{"event": "one", "operationId": op1}},
+			{Machine: map[string]any{"event": "two", "operationId": op2}},
+		}}, nil
+	})}
+	if code := a.Run([]string{"--json", "inspect", "target"}); code != int(ExitInternal) || out.Len() != 0 || !strings.Contains(errOut.String(), "conflicting operation IDs") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+}
+
+func TestStructuredErrorsAlwaysCarryEffectState(t *testing.T) {
+	code, stdout, _ := runTest(t, "--json", "send", "target", "message", "--raw", "--wait")
+	if code != int(ExitUsage) {
+		t.Fatalf("code=%d", code)
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(stdout), &event); err != nil {
+		t.Fatal(err)
+	}
+	errorData := event["data"].(map[string]any)["error"].(map[string]any)
+	if errorData["effectState"] != "not_sent" {
+		t.Fatalf("usage error effect state=%#v", errorData["effectState"])
 	}
 }
