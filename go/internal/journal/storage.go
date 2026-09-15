@@ -1,0 +1,391 @@
+package journal
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// RetentionAge is the minimum age before a completed record can be removed.
+// Unknown and active records are never eligible solely because of age.
+const RetentionAge = 30 * 24 * time.Hour
+
+var (
+	ErrStorageBusy = errors.New("journal: storage busy")
+	// ErrStorageCorrupt is an alias for the journal's established corruption
+	// sentinel so callers do not need separate error handling for check paths.
+	ErrStorageCorrupt = ErrCorrupt
+)
+
+// StorageStatus is bounded, metadata-only information about the journal.
+// Counts are grouped by persisted evidence state and never include bodies.
+type StorageStatus struct {
+	StateDir          string           `json:"stateDir"`
+	DatabasePath      string           `json:"databasePath"`
+	WALPath           string           `json:"walPath"`
+	SHMPath           string           `json:"shmPath"`
+	DatabaseBytes     int64            `json:"databaseBytes"`
+	WALBytes          int64            `json:"walBytes"`
+	SHMBytes          int64            `json:"shmBytes"`
+	DatabaseModified  time.Time        `json:"databaseModified,omitempty"`
+	SchemaVersion     int              `json:"schemaVersion"`
+	SQLiteVersion     string           `json:"sqliteVersion"`
+	JournalMode       string           `json:"journalMode"`
+	Counts            map[string]int64 `json:"counts"`
+	OperationCounts   map[string]int64 `json:"operationCounts"`
+	ReplyCounts       map[string]int64 `json:"replyCounts"`
+	RetentionCutoff   time.Time        `json:"retentionCutoff"`
+	RetentionEligible int64            `json:"retentionEligible"`
+}
+
+// StorageCheck is a read-only integrity result. An empty Issues slice is a
+// successful check; the ReadOnly flag is included in receipts to make the
+// no-write guarantee explicit to callers.
+type StorageCheck struct {
+	ReadOnly           bool     `json:"readOnly"`
+	Integrity          string   `json:"integrity"`
+	ForeignKeyIssues   []string `json:"foreignKeyIssues,omitempty"`
+	RelationshipIssues []string `json:"relationshipIssues,omitempty"`
+}
+
+// MaintenanceOptions controls the explicit maintenance operation.
+type MaintenanceOptions struct {
+	// Before is an optional caller-provided upper bound. It is clamped to the
+	// mandatory 30-day retention boundary and can never make newer records
+	// eligible.
+	Before time.Time
+	DryRun bool
+	Now    func() time.Time
+}
+
+type MaintenanceAction struct {
+	Kind      string `json:"kind"`
+	Attempted bool   `json:"attempted"`
+	Applied   bool   `json:"applied"`
+	Eligible  int64  `json:"eligible,omitempty"`
+	Changed   int64  `json:"changed,omitempty"`
+	Busy      bool   `json:"busy,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// MaintenanceReceipt separately describes expiry, pruning, WAL checkpoint,
+// and optimization. This is intentionally a result/receipt, not a journal
+// event: recording the receipt must not introduce a second write transaction
+// that could make a failed maintenance action look successful.
+type MaintenanceReceipt struct {
+	DryRun          bool                `json:"dryRun"`
+	RetentionCutoff time.Time           `json:"retentionCutoff"`
+	Actions         []MaintenanceAction `json:"actions"`
+}
+
+// VacuumReceipt reports the explicit blocking rewrite and its size effect.
+type VacuumReceipt struct {
+	DatabasePath string `json:"databasePath"`
+	BeforeBytes  int64  `json:"beforeBytes"`
+	AfterBytes   int64  `json:"afterBytes"`
+	Applied      bool   `json:"applied"`
+}
+
+func (j *Journal) StorageStatus(ctx context.Context) (StorageStatus, error) {
+	status := StorageStatus{
+		StateDir:     j.stateDir,
+		DatabasePath: filepath.Join(j.stateDir, "journal.sqlite3"),
+		WALPath:      filepath.Join(j.stateDir, "journal.sqlite3-wal"),
+		SHMPath:      filepath.Join(j.stateDir, "journal.sqlite3-shm"),
+		Counts:       make(map[string]int64), OperationCounts: make(map[string]int64), ReplyCounts: make(map[string]int64),
+	}
+	if err := statFile(status.DatabasePath, &status.DatabaseBytes, &status.DatabaseModified); err != nil {
+		return status, classifyStorageError(err)
+	}
+	if err := statFile(status.WALPath, &status.WALBytes, nil); err != nil {
+		return status, classifyStorageError(err)
+	}
+	if err := statFile(status.SHMPath, &status.SHMBytes, nil); err != nil {
+		return status, classifyStorageError(err)
+	}
+	if err := j.db.QueryRowContext(ctx, "SELECT sqlite_version() ").Scan(&status.SQLiteVersion); err != nil {
+		return status, classifyStorageError(err)
+	}
+	if err := j.db.QueryRowContext(ctx, "PRAGMA user_version").Scan(&status.SchemaVersion); err != nil {
+		return status, classifyStorageError(err)
+	}
+	if err := j.db.QueryRowContext(ctx, "PRAGMA journal_mode").Scan(&status.JournalMode); err != nil {
+		return status, classifyStorageError(err)
+	}
+	for _, table := range []string{"operations", "reply_claims", "events", "observations", "manual_resolutions", "blockers"} {
+		var count int64
+		err := j.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&count)
+		if err != nil {
+			// blockers is not part of the custody foundation yet. It is still
+			// useful to expose a stable zero count when absent.
+			if table == "blockers" && strings.Contains(err.Error(), "no such table") {
+				continue
+			}
+			return status, classifyStorageError(err)
+		}
+		status.Counts[table] = count
+	}
+	for _, table := range []struct {
+		table  string
+		target map[string]int64
+	}{
+		{"operations", status.OperationCounts},
+		{"reply_claims", status.ReplyCounts},
+	} {
+		rows, err := j.db.QueryContext(ctx, "SELECT state,COUNT(*) FROM "+table.table+" GROUP BY state")
+		if err != nil {
+			return status, classifyStorageError(err)
+		}
+		for rows.Next() {
+			var state string
+			var count int64
+			if err := rows.Scan(&state, &count); err != nil {
+				rows.Close()
+				return status, classifyStorageError(err)
+			}
+			table.target[state] = count
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return status, classifyStorageError(err)
+		}
+		rows.Close()
+	}
+	status.RetentionCutoff = time.Now().UTC().Add(-RetentionAge)
+	if j.now != nil {
+		status.RetentionCutoff = j.now().UTC().Add(-RetentionAge)
+	}
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations WHERE state IN (?,?,?,?) AND terminal_at IS NOT NULL AND terminal_at > 0 AND terminal_at <= ?`, string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), status.RetentionCutoff.UnixNano()).Scan(&status.RetentionEligible); err != nil {
+		return status, classifyStorageError(err)
+	}
+	var replies int64
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims WHERE state IN (?,?) AND updated_at <= ?`, string(StateReplyAccepted), string(StateReplyObserved), status.RetentionCutoff.UnixNano()).Scan(&replies); err != nil {
+		return status, classifyStorageError(err)
+	}
+	status.RetentionEligible += replies
+	return status, nil
+}
+
+func statFile(path string, bytes *int64, modified *time.Time) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			*bytes = 0
+			return nil
+		}
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("journal: storage path is a directory: %s", path)
+	}
+	*bytes = info.Size()
+	if modified != nil {
+		*modified = info.ModTime().UTC()
+	}
+	return nil
+}
+
+// StorageCheck performs only SELECTs and read-only SQLite pragmas. It never
+// creates a directory, repairs schema, changes pragmas, or rebuilds files.
+func (j *Journal) StorageCheck(ctx context.Context) (StorageCheck, error) {
+	return checkDB(ctx, j.db)
+}
+
+func checkDB(ctx context.Context, db *sql.DB) (StorageCheck, error) {
+	result := StorageCheck{ReadOnly: true}
+	if err := db.QueryRowContext(ctx, "PRAGMA integrity_check").Scan(&result.Integrity); err != nil {
+		return result, classifyStorageError(err)
+	}
+	if result.Integrity != "ok" {
+		return result, fmt.Errorf("%w: integrity_check: %s", ErrStorageCorrupt, result.Integrity)
+	}
+	rows, err := db.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return result, classifyStorageError(err)
+	}
+	for rows.Next() {
+		var table string
+		var rowid, parent, fkid any
+		if err := rows.Scan(&table, &rowid, &parent, &fkid); err != nil {
+			rows.Close()
+			return result, classifyStorageError(err)
+		}
+		result.ForeignKeyIssues = append(result.ForeignKeyIssues, fmt.Sprintf("%s row=%v parent=%v fk=%v", table, rowid, parent, fkid))
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return result, classifyStorageError(err)
+	}
+	rows.Close()
+	checks := []struct {
+		name  string
+		query string
+	}{
+		{"orphan_attempt", `SELECT COUNT(*) FROM attempts a LEFT JOIN operations o ON o.operation_id=a.operation_id WHERE o.operation_id IS NULL`},
+		{"orphan_reply_claim", `SELECT COUNT(*) FROM reply_claims c LEFT JOIN operations o ON o.message_id=c.original_id WHERE o.operation_id IS NULL`},
+		{"orphan_observation", `SELECT COUNT(*) FROM observations x LEFT JOIN reply_claims c ON c.reply_id=x.reply_id WHERE c.reply_id IS NULL`},
+		{"orphan_winner", `SELECT COUNT(*) FROM reply_winners w LEFT JOIN reply_claims c ON c.reply_id=w.reply_id WHERE c.reply_id IS NULL`},
+	}
+	for _, check := range checks {
+		var count int64
+		if err := db.QueryRowContext(ctx, check.query).Scan(&count); err != nil {
+			return result, classifyStorageError(err)
+		}
+		if count != 0 {
+			result.RelationshipIssues = append(result.RelationshipIssues, fmt.Sprintf("%s=%d", check.name, count))
+		}
+	}
+	if len(result.ForeignKeyIssues) != 0 || len(result.RelationshipIssues) != 0 {
+		return result, fmt.Errorf("%w: relationship checks failed", ErrStorageCorrupt)
+	}
+	return result, nil
+}
+
+// CheckPath opens an existing database read-only. Unlike Open, it does not
+// create directories, run migrations, set pragmas, or create a store ID.
+func CheckPath(ctx context.Context, path string) (StorageCheck, error) {
+	if path == "" {
+		return StorageCheck{ReadOnly: true}, fmt.Errorf("%w: empty database path", ErrStorageCorrupt)
+	}
+	db, err := sql.Open("sqlite", "file:"+escapedSQLitePath(path)+"?mode=ro&_pragma=busy_timeout(2500)")
+	if err != nil {
+		return StorageCheck{ReadOnly: true}, classifyStorageError(err)
+	}
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		return StorageCheck{ReadOnly: true}, classifyStorageError(err)
+	}
+	return checkDB(ctx, db)
+}
+
+// StorageMaintain expires abandoned claims, prunes only records that have
+// passed the 30-day boundary, checkpoints WAL, and runs safe optimization.
+func (j *Journal) StorageMaintain(ctx context.Context, opts MaintenanceOptions) (MaintenanceReceipt, error) {
+	now := time.Now().UTC()
+	if opts.Now != nil {
+		now = opts.Now().UTC()
+	} else if j.now != nil {
+		now = j.now().UTC()
+	}
+	cutoff := now.Add(-RetentionAge)
+	if !opts.Before.IsZero() && opts.Before.Before(cutoff) {
+		cutoff = opts.Before.UTC()
+	}
+	receipt := MaintenanceReceipt{DryRun: opts.DryRun, RetentionCutoff: cutoff, Actions: []MaintenanceAction{
+		{Kind: "expiry", Attempted: !opts.DryRun},
+		{Kind: "prune", Attempted: !opts.DryRun},
+		{Kind: "wal_checkpoint", Attempted: !opts.DryRun},
+		{Kind: "optimize", Attempted: !opts.DryRun},
+	}}
+	var eligibleOps, eligibleReplies, activeExpired int64
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM operations WHERE state IN (?,?,?,?) AND terminal_at IS NOT NULL AND terminal_at > 0 AND terminal_at <= ?`, string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), cutoff.UnixNano()).Scan(&eligibleOps); err != nil {
+		return receipt, classifyStorageError(err)
+	}
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims WHERE state IN (?,?) AND updated_at <= ?`, string(StateReplyAccepted), string(StateReplyObserved), cutoff.UnixNano()).Scan(&eligibleReplies); err != nil {
+		return receipt, classifyStorageError(err)
+	}
+	receipt.Actions[1].Eligible = eligibleOps + eligibleReplies
+	if opts.DryRun {
+		return receipt, nil
+	}
+	if err := j.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM reply_claims WHERE state=? AND lease_until <= ?`, string(StateReplyClaimed), now.UnixNano()).Scan(&activeExpired); err != nil {
+		return receipt, classifyStorageError(err)
+	}
+	if err := j.ExpireClaims(ctx); err != nil {
+		receipt.Actions[0].Error = err.Error()
+		receipt.Actions[0].Busy = isBusy(err)
+		return receipt, classifyStorageError(err)
+	}
+	receipt.Actions[0].Changed = activeExpired
+	var pruned int64
+	err := j.withTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`DELETE FROM events WHERE operation_id IN (SELECT operation_id FROM operations WHERE state IN (?,?,?,?) AND terminal_at IS NOT NULL AND terminal_at > 0 AND terminal_at <= ?)`, string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), cutoff.UnixNano()); err != nil {
+			return err
+		}
+		res, err := tx.Exec(`DELETE FROM operations WHERE state IN (?,?,?,?) AND terminal_at IS NOT NULL AND terminal_at > 0 AND terminal_at <= ?`, string(StateAccepted), string(StateRejected), string(StateNotSent), string(StateManuallyResolved), cutoff.UnixNano())
+		if err != nil {
+			return err
+		}
+		n, _ := res.RowsAffected()
+		pruned += n
+		if _, err := tx.Exec(`DELETE FROM events WHERE reply_id IN (SELECT reply_id FROM reply_claims WHERE state IN (?,?) AND updated_at <= ?)`, string(StateReplyAccepted), string(StateReplyObserved), cutoff.UnixNano()); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(`DELETE FROM reply_winners WHERE reply_id IN (SELECT reply_id FROM reply_claims WHERE state IN (?,?) AND updated_at <= ?)`, string(StateReplyAccepted), string(StateReplyObserved), cutoff.UnixNano()); err != nil {
+			return err
+		}
+		res, err = tx.Exec(`DELETE FROM reply_claims WHERE state IN (?,?) AND updated_at <= ?`, string(StateReplyAccepted), string(StateReplyObserved), cutoff.UnixNano())
+		if err != nil {
+			return err
+		}
+		n, _ = res.RowsAffected()
+		pruned += n
+		return nil
+	})
+	if err != nil {
+		receipt.Actions[1].Error = err.Error()
+		receipt.Actions[1].Busy = isBusy(err)
+		return receipt, classifyStorageError(err)
+	}
+	receipt.Actions[1].Changed = pruned
+	var busy, logPages, checkpointed int64
+	if err := j.db.QueryRowContext(ctx, "PRAGMA wal_checkpoint(PASSIVE)").Scan(&busy, &logPages, &checkpointed); err != nil {
+		receipt.Actions[2].Error = err.Error()
+		receipt.Actions[2].Busy = isBusy(err)
+		return receipt, classifyStorageError(err)
+	}
+	receipt.Actions[2].Changed = checkpointed
+	if busy != 0 {
+		receipt.Actions[2].Busy = true
+	}
+	if _, err := j.db.ExecContext(ctx, "PRAGMA optimize"); err != nil {
+		receipt.Actions[3].Error = err.Error()
+		receipt.Actions[3].Busy = isBusy(err)
+		return receipt, classifyStorageError(err)
+	}
+	receipt.Actions[3].Applied = true
+	for i := range receipt.Actions {
+		if receipt.Actions[i].Attempted && receipt.Actions[i].Error == "" {
+			receipt.Actions[i].Applied = true
+		}
+	}
+	return receipt, nil
+}
+
+func (j *Journal) StorageVacuum(ctx context.Context) (VacuumReceipt, error) {
+	path := filepath.Join(j.stateDir, "journal.sqlite3")
+	receipt := VacuumReceipt{DatabasePath: path}
+	if err := statFile(path, &receipt.BeforeBytes, nil); err != nil {
+		return receipt, classifyStorageError(err)
+	}
+	if _, err := j.db.ExecContext(ctx, "VACUUM"); err != nil {
+		return receipt, classifyStorageError(err)
+	}
+	if err := statFile(path, &receipt.AfterBytes, nil); err != nil {
+		return receipt, classifyStorageError(err)
+	}
+	receipt.Applied = true
+	return receipt, nil
+}
+
+func classifyStorageError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%w: %v", ErrStorageBusy, err)
+	}
+	if isBusy(err) {
+		return fmt.Errorf("%w: %v", ErrStorageBusy, err)
+	}
+	lower := strings.ToLower(err.Error())
+	if errors.Is(err, ErrCorrupt) || strings.Contains(lower, "malformed") || strings.Contains(lower, "not a database") || strings.Contains(lower, "no such table") {
+		return fmt.Errorf("%w: %v", ErrStorageCorrupt, err)
+	}
+	return err
+}

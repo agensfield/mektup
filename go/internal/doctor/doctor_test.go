@@ -1,0 +1,79 @@
+package doctor
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+)
+
+func TestDefaultDoctorIsReadOnly(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	config := filepath.Join(root, "config")
+	report, err := Run(context.Background(), Options{Paths: Paths{StateDir: state, ConfigDir: config, ConfigFile: filepath.Join(config, "config.json")}}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.ReadOnly || report.Fix || len(report.Plan) != 2 || len(report.Repairs) != 0 {
+		t.Fatalf("unexpected read-only report %#v", report)
+	}
+	if _, err := os.Stat(state); !os.IsNotExist(err) {
+		t.Fatalf("doctor created state directory: %v", err)
+	}
+	if _, err := os.Stat(config); !os.IsNotExist(err) {
+		t.Fatalf("doctor created config directory: %v", err)
+	}
+}
+
+func TestDoctorFixReceiptsEachOwnerPrivateRepair(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	config := filepath.Join(root, "config")
+	if err := os.MkdirAll(state, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(config, 0755); err != nil {
+		t.Fatal(err)
+	}
+	configFile := filepath.Join(config, "config.json")
+	if err := os.WriteFile(configFile, []byte(`{"version":1}`), 0644); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{Paths: Paths{StateDir: state, ConfigDir: config, ConfigFile: configFile}}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.ReadOnly || !report.Fix || len(report.Repairs) != 3 {
+		t.Fatalf("unexpected fix report %#v", report)
+	}
+	for _, repair := range report.Repairs {
+		if !repair.Applied || repair.Error != "" {
+			t.Fatalf("unapplied repair %#v", repair)
+		}
+	}
+	for path, want := range map[string]os.FileMode{state: 0700, config: 0700, configFile: 0600} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != want {
+			t.Fatalf("%s mode %04o, want %04o", path, info.Mode().Perm(), want)
+		}
+	}
+}
+
+func TestDoctorInjectableProbeDoesNotRunFixUnlessNamed(t *testing.T) {
+	called := 0
+	probe := ProbeFunc(func(context.Context) ([]Finding, error) {
+		return []Finding{{ID: "test.repair", Category: "test", Severity: SeverityWarning, Message: "safe test repair", Fixable: true, SafeFix: true, Fix: func(context.Context) (string, error) { called++; return "done", nil }}}, nil
+	})
+	readOnly, err := Run(context.Background(), Options{Probes: []Probe{probe}}, false)
+	if err != nil || called != 0 || len(readOnly.Plan) != 1 || len(readOnly.Repairs) != 0 {
+		t.Fatalf("read-only injected probe: %#v %v called=%d", readOnly, err, called)
+	}
+	fixed, err := Run(context.Background(), Options{Probes: []Probe{probe}}, true)
+	if err != nil || called != 1 || len(fixed.Repairs) != 1 || !fixed.Repairs[0].Applied {
+		t.Fatalf("fix injected probe: %#v %v called=%d", fixed, err, called)
+	}
+}
