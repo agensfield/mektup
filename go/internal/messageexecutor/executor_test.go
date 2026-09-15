@@ -383,6 +383,25 @@ func TestUnsupportedServerVersionIsRejected(t *testing.T) {
 	}
 }
 
+func TestEarlyStreamingDomainErrorsStillRenderTerminalJSON(t *testing.T) {
+	for _, code := range []mektup.ErrorCode{mektup.ErrOutcomeUnknown, mektup.ErrDeliveryRejected, mektup.ErrUnsupportedServerVersion} {
+		t.Run(string(code), func(t *testing.T) {
+			svc := &fakeService{sendErr: &service.Error{Code: code, Message: "delivery evidence", Details: map[string]any{"phase": "may_have_written"}}}
+			exec := New(Ports{Service: func(context.Context, cli.Invocation) (MessagingService, error) { return svc, nil }})
+			var out, errOut bytes.Buffer
+			app := &cli.App{Out: &out, Err: &errOut, Executor: exec}
+			exit := app.Run([]string{"send", "target", "body", "--json"})
+			var event map[string]any
+			if err := json.Unmarshal(out.Bytes(), &event); err != nil {
+				t.Fatalf("domain error lost terminal evidence: exit=%d stdout=%q stderr=%q", exit, out.String(), errOut.String())
+			}
+			if event["terminal"] != true || event["ok"] != false {
+				t.Fatalf("bad terminal event: %#v", event)
+			}
+		})
+	}
+}
+
 func TestReceiptFileIsUntrustedAndRequiresInjectedResolver(t *testing.T) {
 	receipt := testReceipt(mektup.StateAccepted)
 	encoded, _ := json.Marshal(receipt)

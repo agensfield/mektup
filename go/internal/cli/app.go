@@ -409,6 +409,9 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 			if emitted && !state.terminal {
 				return a.writeStreamingFailure(presentation, parsed, state, streamErr)
 			}
+			if !emitted {
+				return a.finish(presentation, parsed, normalizeError(streamErr))
+			}
 			return int(normalizeError(streamErr).Exit)
 		}
 		if !emitted {
