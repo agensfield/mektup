@@ -200,23 +200,37 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	j, err := journal.Open(ctx, journal.Options{StateDir: stateDir})
-	if err != nil {
-		return nil, fmt.Errorf("open application journal: %w", err)
+	var j *journal.Journal
+	var artifacts *artifact.Store
+	var err error
+	if needsJournal(inv) {
+		j, err = journal.Open(ctx, journal.Options{StateDir: stateDir})
+		if err != nil {
+			return nil, mapJournalOpenError(err)
+		}
 	}
-	artifactRoot := e.options.ArtifactDir
-	if artifactRoot == "" {
-		artifactRoot = filepath.Join(stateDir, "artifacts")
-	}
-	artifacts, err := artifact.NewStore(artifactRoot)
-	if err != nil {
-		_ = j.Close()
-		return nil, fmt.Errorf("open application artifact store: %w", err)
+	if needsArtifacts(inv) {
+		artifactRoot := e.options.ArtifactDir
+		if artifactRoot == "" {
+			artifactRoot = filepath.Join(stateDir, "artifacts")
+		}
+		artifacts, err = artifact.NewStore(artifactRoot)
+		if err != nil {
+			if j != nil {
+				_ = j.Close()
+			}
+			return nil, fmt.Errorf("open application artifact store: %w", err)
+		}
 	}
 
 	store := endpoint.NewStore(configPath, stateDir)
-	connections := &connectionFactory{store: store, codexHome: e.options.CodexHome, options: e.options.Connection, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute}
-	receipts := receiptStore{journal: j, endpoints: store, codexHome: e.options.CodexHome}
+	facts := &connectionFacts{values: make(map[string]connection.Info)}
+	connections := &connectionFactory{store: store, codexHome: e.options.CodexHome, options: e.options.Connection, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute, facts: facts}
+	var receipts *receiptStore
+	if j != nil {
+		receipts = &receiptStore{journal: j, endpoints: store, codexHome: e.options.CodexHome, facts: facts, pins: &receiptPins{values: make(map[string]endpoint.Endpoint)}}
+	}
+	endpoints := endpointPort{store: store, receipts: receipts}
 	input := executor.ReaderInput{In: e.options.Input}
 	if input.In == nil {
 		input.In = os.Stdin
@@ -230,18 +244,54 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 	doctorOptions := doctor.DefaultOptions(doctor.Paths{StateDir: stateDir, ConfigDir: configDir, ConfigFile: configPath, SocketPath: socketPath})
 	ports := executor.Ports{
 		Connections:    connections,
-		Endpoints:      store,
+		Endpoints:      endpoints,
 		EndpointHealth: endpointHealth{factory: connections},
-		Storage:        storage.New(j),
+		Storage:        storagePort(j),
 		Doctor:         doctorPort{},
 		Input:          input,
 		Artifacts:      executor.ArtifactStoreOutput{Store: artifacts},
 		RPC:            rpcPort{},
-		Receipts:       receipts,
-		ReadReceipts:   receipts,
 		DoctorOptions:  doctorOptions,
 	}
+	if receipts != nil {
+		ports.Receipts = receipts
+		ports.ReadReceipts = receipts
+	}
 	return &resources{journal: j, artifact: artifacts, ports: resourcePorts{Ports: ports}}, nil
+}
+
+func needsJournal(inv cli.Invocation) bool {
+	switch inv.Command {
+	case "search", "rpc", "storage":
+		return true
+	case "doctor":
+		return hasOption(inv, "fix")
+	case "endpoint":
+		return len(inv.Position) > 0 && (inv.Position[0] == "add" || inv.Position[0] == "remove")
+	case "thread":
+		return len(inv.Position) > 0 && (inv.Position[0] == "start" || inv.Position[0] == "resume" || inv.Position[0] == "fork")
+	default:
+		return false
+	}
+}
+
+func needsArtifacts(inv cli.Invocation) bool { return inv.Command == "rpc" }
+
+func hasOption(inv cli.Invocation, name string) bool { return len(inv.Options[name]) != 0 }
+
+func storagePort(j *journal.Journal) executor.StoragePort {
+	if j == nil {
+		return nil
+	}
+	return storage.New(j)
+}
+
+func mapJournalOpenError(err error) error {
+	code := "storage_corrupt"
+	if errors.Is(err, journal.ErrStorageBusy) {
+		code = "storage_busy"
+	}
+	return &cli.Error{Code: code, Message: err.Error(), Effect: "not_sent", Details: map[string]any{"cause": err.Error()}, Exit: cli.ExitRejected}
 }
 
 func (e *Environment) paths(inv cli.Invocation) (string, string) {
@@ -261,6 +311,53 @@ func (e *Environment) paths(inv cli.Invocation) (string, string) {
 	return configPath, stateDir
 }
 
+type connectionFacts struct {
+	mu     sync.RWMutex
+	values map[string]connection.Info
+}
+
+func (f *connectionFacts) Set(id string, info connection.Info) {
+	if f == nil {
+		return
+	}
+	f.mu.Lock()
+	f.values[id] = info
+	f.mu.Unlock()
+}
+
+func (f *connectionFacts) Get(id string) (connection.Info, bool) {
+	if f == nil {
+		return connection.Info{}, false
+	}
+	f.mu.RLock()
+	info, ok := f.values[id]
+	f.mu.RUnlock()
+	return info, ok
+}
+
+type endpointPort struct {
+	store    endpoint.EndpointStore
+	receipts *receiptStore
+}
+
+func (p endpointPort) List() ([]endpoint.Endpoint, error)              { return p.store.List() }
+func (p endpointPort) Show(selector string) (endpoint.Endpoint, error) { return p.store.Show(selector) }
+func (p endpointPort) Add(ep endpoint.Endpoint) error                  { return p.store.Add(ep) }
+
+func (p endpointPort) Remove(selector string) error {
+	// Capture the exact endpoint record before the destructive config change.
+	// Receipt projection can then use the pinned identity even if the alias is
+	// absent or reused by the time the executor emits its receipt.
+	ep, err := p.store.Show(selector)
+	if err != nil {
+		return err
+	}
+	if p.receipts != nil {
+		p.receipts.Pin(selector, ep)
+	}
+	return p.store.Remove(selector)
+}
+
 type connectionFactory struct {
 	store          endpoint.EndpointStore
 	codexHome      string
@@ -269,6 +366,7 @@ type connectionFactory struct {
 	sshFactory     sshproxy.ProcessFactory
 	dialerForRoute func(endpoint.Route, bool) connection.ClientDialer
 	openOverride   func(context.Context, string, executor.OpenOptions) (executor.Connection, error)
+	facts          *connectionFacts
 }
 
 func (f *connectionFactory) Open(ctx context.Context, selector string) (executor.Connection, error) {
@@ -300,6 +398,9 @@ func (f *connectionFactory) OpenWithOptions(ctx context.Context, selector string
 	conn, err := connection.Connect(ctx, ep.Route, options)
 	if err != nil {
 		return nil, err
+	}
+	if f.facts != nil {
+		f.facts.Set(ep.ID, conn.Info())
 	}
 	return &appConnection{endpoint: ep, conn: conn, api: codexapi.New(conn, codexapi.Options{Capabilities: conn.Capabilities()}), rpc: connection.NewRPCAdapter(conn)}, nil
 }
@@ -361,6 +462,32 @@ type receiptStore struct {
 	journal   *journal.Journal
 	endpoints endpoint.EndpointStore
 	codexHome string
+	facts     *connectionFacts
+	pins      *receiptPins
+}
+
+type receiptPins struct {
+	mu     sync.RWMutex
+	values map[string]endpoint.Endpoint
+}
+
+func (s *receiptStore) Pin(selector string, ep endpoint.Endpoint) {
+	if s == nil || s.pins == nil {
+		return
+	}
+	s.pins.mu.Lock()
+	s.pins.values[selector] = ep
+	s.pins.mu.Unlock()
+}
+
+func (s receiptStore) pinned(selector string) (endpoint.Endpoint, bool) {
+	if s.pins == nil {
+		return endpoint.Endpoint{}, false
+	}
+	s.pins.mu.RLock()
+	ep, ok := s.pins.values[selector]
+	s.pins.mu.RUnlock()
+	return ep, ok
 }
 
 func (s receiptStore) Mutation(ctx context.Context, operation, endpointSelector string, payload any) (any, error) {
@@ -372,9 +499,13 @@ func (s receiptStore) Read(ctx context.Context, operation, endpointSelector stri
 }
 
 func (s receiptStore) save(ctx context.Context, operation, endpointSelector string, payload any, state mektup.EvidenceState) (mektup.Receipt, error) {
-	ep, err := s.endpoints.ResolveEndpoint(endpointSelector, s.codexHome)
-	if err != nil {
-		return mektup.Receipt{}, err
+	ep, ok := s.pinned(endpointSelector)
+	if !ok {
+		var err error
+		ep, err = s.endpoints.ResolveEndpoint(endpointSelector, s.codexHome)
+		if err != nil {
+			return mektup.Receipt{}, err
+		}
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
@@ -383,11 +514,19 @@ func (s receiptStore) save(ctx context.Context, operation, endpointSelector stri
 	digest := sha256.Sum256(encoded)
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	identity := mektup.ReceiptIdentity{EndpointID: ep.ID, Alias: ep.Alias, Transport: string(ep.Route.Kind), Requested: endpointSelector, Resolved: ep.Alias}
+	warnings := []mektup.Warning{}
+	if info, found := s.facts.Get(ep.ID); found {
+		identity.ServerVersion = info.DaemonVersion
+		identity.Compatibility = string(info.Compatibility.Class)
+		warnings = warningValues(info.Warnings)
+	}
+	threadID := payloadThreadID(payload)
+	identity.ThreadID = threadID
 	receipt := mektup.Receipt{
 		Schema: mektup.ReceiptSchema, ReceiptID: mektup.NewReceiptID(), OperationID: mektup.NewOperationID(), Operation: operation, State: state,
 		Source: identity, Target: identity,
 		Message:  mektup.ReceiptMessage{MessageID: mektup.NewMessageID(), Kind: string(mektup.KindMessage), PayloadBytes: uint64(len(encoded)), PayloadSHA256: "sha256:" + hex.EncodeToString(digest[:])},
-		Evidence: []mektup.EvidenceRecord{{State: state, At: now, Kind: operation}}, Warnings: []mektup.Warning{}, CreatedAt: now, UpdatedAt: now,
+		Evidence: []mektup.EvidenceRecord{{State: state, At: now, Kind: operation}}, Warnings: warnings, CreatedAt: now, UpdatedAt: now,
 	}
 	if err := s.journal.PutReceipt(ctx, receipt); err != nil {
 		return mektup.Receipt{}, err
@@ -399,6 +538,34 @@ func (s receiptStore) ReadReceipt(ctx context.Context, reference string) (mektup
 	return s.journal.Receipt(ctx, reference)
 }
 
+func payloadThreadID(payload any) string {
+	object, ok := payload.(map[string]any)
+	if !ok {
+		return ""
+	}
+	if value, ok := object["threadId"].(string); ok {
+		return value
+	}
+	if nested, ok := object["thread"].(map[string]any); ok {
+		if value, ok := nested["id"].(string); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+func warningValues(values []string) []mektup.Warning {
+	result := make([]mektup.Warning, 0, len(values))
+	for _, value := range values {
+		code := mektup.WarningCode(value)
+		switch code {
+		case mektup.WarningUntestedServerVersion, mektup.WarningServerVersionUnknown, mektup.WarningEvidenceGap, mektup.WarningProjectionMayLag, mektup.WarningAuditLoggingEnabled, mektup.WarningOutputSpilled, mektup.WarningResolverDegraded, mektup.WarningCleanupIncomplete, mektup.WarningManualResolution:
+			result = append(result, mektup.Warning{Code: code, Message: value, Details: map[string]any{}})
+		}
+	}
+	return result
+}
+
 func readFileBounded(ctx context.Context, name string, max int64) ([]byte, error) {
 	if strings.TrimSpace(name) == "" || strings.ContainsRune(name, 0) {
 		return nil, errors.New("input path is empty or contains NUL")
@@ -406,7 +573,12 @@ func readFileBounded(ctx context.Context, name string, max int64) ([]byte, error
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	file, err := os.Open(name)
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	file, err := openInputFile(name)
 	if err != nil {
 		return nil, err
 	}
@@ -417,11 +589,6 @@ func readFileBounded(ctx context.Context, name string, max int64) ([]byte, error
 	}
 	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
 		return nil, errors.New("input path is not a regular file")
-	}
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
 	}
 	data, err := io.ReadAll(io.LimitReader(file, max+1))
 	if err != nil {

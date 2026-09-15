@@ -11,7 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	mektup "github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/appserver"
@@ -125,6 +127,75 @@ func TestEnvironmentUsesInvocationResolvedFlagAndEnvPaths(t *testing.T) {
 	_ = env.Close()
 }
 
+func TestDoctorDoesNotCreateStateAndCanReadCorruptJournal(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "missing-state")
+	config := filepath.Join(root, "config.json")
+	var out, errOut bytes.Buffer
+	env := New(Options{CodexHome: filepath.Join(root, "codex")})
+	app := &cli.App{Out: &out, Err: &errOut, Executor: env, Env: []string{"MEKTUP_OUTPUT=json", "MEKTUP_STATE_DIR=" + state, "MEKTUP_CONFIG=" + config}}
+	if code := app.Run([]string{"doctor"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("doctor exit=%d stderr=%s", code, errOut.String())
+	}
+	if _, err := os.Stat(state); !os.IsNotExist(err) {
+		t.Fatalf("doctor created state: %v", err)
+	}
+	if err := os.Mkdir(state, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, "journal.sqlite3"), []byte("corrupt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if code := app.Run([]string{"doctor"}); code != int(cli.ExitSuccess) || !strings.Contains(out.String(), "doctor.completed") {
+		t.Fatalf("corrupt doctor exit=%d output=%s", code, out.String())
+	}
+	_ = env.Close()
+}
+
+func TestStorageCorruptOpenUsesStableCode(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	if err := os.Mkdir(state, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(state, "journal.sqlite3"), []byte("corrupt"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	env := New(Options{CodexHome: filepath.Join(root, "codex")})
+	app := &cli.App{Out: &out, Err: &errOut, Executor: env, Env: []string{"MEKTUP_OUTPUT=json", "MEKTUP_STATE_DIR=" + state, "MEKTUP_CONFIG=" + filepath.Join(root, "config.json")}}
+	if code := app.Run([]string{"storage", "status"}); code != int(cli.ExitRejected) || !strings.Contains(out.String(), `"code":"storage_corrupt"`) {
+		t.Fatalf("storage exit=%d output=%s stderr=%s", code, out.String(), errOut.String())
+	}
+	_ = env.Close()
+}
+
+func TestCanceledFIFOIsRejectedBeforeBlockingOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "params.fifo")
+	if err := syscall.Mkfifo(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan error, 1)
+	go func() { _, err := readFileBounded(ctx, path, 10); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("FIFO was accepted")
+		}
+	case <-time.After(100 * time.Millisecond):
+		fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		<-done
+		syscall.Close(fd)
+		t.Fatal("canceled FIFO read blocked before validation")
+	}
+}
+
 func TestInjectedAppEnvironmentWinsOverConflictingHostEnvironment(t *testing.T) {
 	root := t.TempDir()
 	desiredState := filepath.Join(root, "desired-state")
@@ -142,7 +213,7 @@ func TestInjectedAppEnvironmentWinsOverConflictingHostEnvironment(t *testing.T) 
 		t.Fatalf("exit=%d stderr=%s", code, errOut.String())
 	}
 	_ = env.Close()
-	if _, err := os.Stat(filepath.Join(desiredState, "journal.sqlite3")); err != nil {
+	if _, err := os.Stat(filepath.Join(desiredState, "endpoint-identities.json")); err != nil {
 		t.Fatalf("desired state was not used: %v", err)
 	}
 	if _, err := os.Stat(conflictingState); !os.IsNotExist(err) {
@@ -225,6 +296,39 @@ func TestConnectionCheckSurfacesDetachFailure(t *testing.T) {
 	}
 }
 
+func TestEndpointRemovePinsIdentityBeforeEffect(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	config := filepath.Join(root, "config.json")
+	store := endpoint.NewStore(config, state)
+	route, err := endpoint.SSHRoute("example.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep := endpoint.Endpoint{ID: endpointID(), Alias: "remote", Route: route, Herdr: endpoint.HerdrDisabled}
+	if err := store.Add(ep); err != nil {
+		t.Fatal(err)
+	}
+	j, err := journal.Open(context.Background(), journal.Options{StateDir: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	receipts := &receiptStore{journal: j, endpoints: store, pins: &receiptPins{values: make(map[string]endpoint.Endpoint)}}
+	ports := endpointPort{store: store, receipts: receipts}
+	if err := ports.Remove("remote"); err != nil {
+		t.Fatal(err)
+	}
+	value, err := receipts.Mutation(context.Background(), "endpoint.remove", "remote", map[string]any{"removed": true})
+	if err != nil {
+		t.Fatalf("pinned receipt failed after remove: %v", err)
+	}
+	receipt := value.(mektup.Receipt)
+	if receipt.Target.EndpointID != ep.ID {
+		t.Fatalf("removed endpoint identity = %+v", receipt.Target)
+	}
+}
+
 func TestReceiptStorePersistsStableEndpointIdentity(t *testing.T) {
 	root := t.TempDir()
 	state := filepath.Join(root, "state")
@@ -251,7 +355,7 @@ func TestReceiptStorePersistsStableEndpointIdentity(t *testing.T) {
 	if err := receipt.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if receipt.Source.EndpointID != ep.ID || receipt.Target.EndpointID != ep.ID || receipt.Source.Alias != "local" || receipt.Source.Transport != "unix" {
+	if receipt.Source.EndpointID != ep.ID || receipt.Target.EndpointID != ep.ID || receipt.Target.ThreadID != "t1" || receipt.Source.Alias != "local" || receipt.Source.Transport != "unix" {
 		t.Fatalf("receipt identity = %+v", receipt)
 	}
 	for _, operation := range []string{"search", "rpc", "storage.maintain"} {
