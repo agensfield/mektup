@@ -359,8 +359,21 @@ func TestIDsAreCanonicalStrictAndCompletedIDsAreRetired(t *testing.T) {
 	if _, err := c.call(context.Background(), RPCRequest{ID: json.RawMessage(`"a\u0062"`), Method: "canonical"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.call(context.Background(), RPCRequest{ID: "ab", Method: "stale"}); err == nil {
-		t.Fatal("completed request ID was reusable")
+	second := make(chan *RPCResult, 1)
+	go func() {
+		result, _ := c.call(context.Background(), RPCRequest{ID: "ab", Method: "stale"})
+		second <- result
+	}()
+	_ = waitWrite(t, f)
+	pushJSON(f, response(`"ab"`, `{"old":true}`))
+	pushJSON(f, response(`"ab"`, `{"new":true}`))
+	select {
+	case result := <-second:
+		if result == nil || string(result.Value) != `{"new":true}` {
+			t.Fatalf("reused ID result = %+v", result)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fresh response did not satisfy reused ID after stale quarantine")
 	}
 	if _, err := c.call(context.Background(), RPCRequest{ID: uint64(^uint64(0)), Method: "bad"}); err == nil {
 		t.Fatal("unsigned overflow ID was accepted")
@@ -483,5 +496,34 @@ func TestPublicCallRequiresInitialize(t *testing.T) {
 	case write := <-f.writes:
 		t.Fatalf("pre-init call wrote %s", write)
 	default:
+	}
+}
+
+func TestNegativeZeroIDMatchesCanonicalZeroResponse(t *testing.T) {
+	f := newFakeTransport()
+	c := New(f, Options{})
+	defer c.Close(context.Background())
+	go func() {
+		_ = waitWrite(t, f)
+		pushJSON(f, `{"id":0,"result":{"ok":true}}`)
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if _, err := c.call(ctx, RPCRequest{ID: json.Number("-0"), Method: "read"}); err != nil {
+		t.Fatalf("numeric -0/0 response identity lost: %v", err)
+	}
+}
+
+func TestCloseConcurrentReadAlwaysTerminatesPump(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		f := newFakeTransport()
+		pushJSON(f, `{"method":"notice"}`)
+		c := New(f, Options{})
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		err := c.Close(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("iteration %d close: %v", i, err)
+		}
 	}
 }

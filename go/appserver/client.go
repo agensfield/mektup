@@ -344,6 +344,7 @@ type Client struct {
 	queued        map[string]struct{}
 	completed     map[string]WriteEvidence
 	retired       map[string]struct{}
+	reused        map[string]struct{}
 	closeOne      sync.Once
 	info          atomic.Pointer[ServerInfo]
 	initMu        sync.Mutex
@@ -380,6 +381,7 @@ func New(transport Transport, options Options) *Client {
 		queued:    make(map[string]struct{}),
 		completed: make(map[string]WriteEvidence),
 		retired:   make(map[string]struct{}),
+		reused:    make(map[string]struct{}),
 		accepting: true,
 	}
 	go c.readLoop()
@@ -519,6 +521,7 @@ func (c *Client) completeReservation(key string, evidence WriteEvidence) {
 	delete(c.reserved, key)
 	delete(c.withdrawn, key)
 	delete(c.queued, key)
+	delete(c.reused, key)
 	c.mu.Unlock()
 }
 
@@ -639,8 +642,10 @@ func (c *Client) call(ctx context.Context, request RPCRequest) (*RPCResult, erro
 		return nil, &CallError{Err: fmt.Errorf("duplicate request id %s", key), Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
 	}
 	if _, exists := c.retired[key]; exists {
-		c.mu.Unlock()
-		return nil, &CallError{Err: fmt.Errorf("request id %s was already completed on this connection", key), Evidence: WriteEvidence{Phase: WriteProvenBeforeWrite, Generation: c.generation}, Generation: c.generation}
+		// A reused ID has a one-response quarantine. This keeps a late duplicate
+		// response from satisfying the new request while retaining compatibility
+		// with callers that deliberately reuse raw JSON-RPC IDs.
+		c.reused[key] = struct{}{}
 	}
 	c.reserved[key] = struct{}{}
 	c.mu.Unlock()
@@ -772,6 +777,7 @@ func (c *Client) release(key string) {
 	delete(c.reserved, key)
 	delete(c.withdrawn, key)
 	delete(c.queued, key)
+	delete(c.reused, key)
 	c.mu.Unlock()
 }
 
@@ -780,6 +786,7 @@ func (c *Client) releaseReservation(key string) {
 	delete(c.reserved, key)
 	delete(c.queued, key)
 	delete(c.withdrawn, key)
+	delete(c.reused, key)
 	c.mu.Unlock()
 }
 
@@ -922,6 +929,9 @@ func (c *Client) pump() {
 	}
 	for {
 		select {
+		case <-c.done:
+			finish(errClientClosed)
+			return
 		case cmd := <-c.commands:
 			c.signalCommandSpace()
 			switch cmd.kind {
@@ -1035,6 +1045,17 @@ func (c *Client) pump() {
 				}
 				call, exists := pending[key]
 				if !exists {
+					continue
+				}
+				c.mu.Lock()
+				_, quarantined := c.reused[key]
+				if quarantined {
+					delete(c.reused, key)
+				}
+				c.mu.Unlock()
+				if quarantined {
+					// The first response after a deliberate ID reuse is ambiguous
+					// with a late duplicate from the prior operation.
 					continue
 				}
 				delete(pending, key)
@@ -1182,8 +1203,10 @@ func decodeID(raw json.RawMessage) (RequestID, error) {
 	if len(raw) > 0 && raw[0] != '-' && (raw[0] < '0' || raw[0] > '9') {
 		return nil, errors.New("JSON-RPC request ID must be a string or signed integer")
 	}
-	if _, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
-		return json.Number(string(raw)), nil
+	if isJSONInteger(string(raw)) {
+		if _, err := strconv.ParseInt(string(raw), 10, 64); err == nil {
+			return json.Number(string(raw)), nil
+		}
 	}
 	return nil, errors.New("JSON-RPC request ID must be a signed int64")
 }
@@ -1193,10 +1216,14 @@ func normalizeID(id RequestID) ([]byte, error) {
 	case string:
 		return json.Marshal(value)
 	case json.Number:
-		if _, err := strconv.ParseInt(value.String(), 10, 64); err != nil {
+		if !isJSONInteger(value.String()) {
 			return nil, errors.New("JSON-RPC request ID must be a signed int64")
 		}
-		return []byte(value.String()), nil
+		number, err := strconv.ParseInt(value.String(), 10, 64)
+		if err != nil {
+			return nil, errors.New("JSON-RPC request ID must be a signed int64")
+		}
+		return []byte(strconv.FormatInt(number, 10)), nil
 	case int:
 		return []byte(fmt.Sprintf("%d", value)), nil
 	case int8:
@@ -1216,6 +1243,30 @@ func normalizeID(id RequestID) ([]byte, error) {
 	default:
 		return nil, errors.New("JSON-RPC request ID must be a string or integer")
 	}
+}
+
+func isJSONInteger(value string) bool {
+	if value == "0" || value == "-0" {
+		return true
+	}
+	if value == "" {
+		return false
+	}
+	start := 0
+	if value[0] == '-' {
+		start = 1
+		if len(value) == 1 || value[start] == '0' {
+			return false
+		}
+	} else if value[0] < '1' || value[0] > '9' {
+		return false
+	}
+	for _, char := range value[start:] {
+		if char < '0' || char > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func requestIDKey(id RequestID) (string, error) {
