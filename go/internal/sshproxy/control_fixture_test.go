@@ -101,6 +101,22 @@ func TestControlKnownFieldPresenceAndResultShapes(t *testing.T) {
 	}
 }
 
+func TestURIWhitespaceMatchesSchemaWhitespaceClass(t *testing.T) {
+	for _, whitespace := range []string{"\f", "\v"} {
+		t.Run(whitespace, func(t *testing.T) {
+			request := validControlRequest()
+			request.ReplyDestination.URI = "codex://local/thread/with" + whitespace + "space"
+			data, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ValidateControlRequest(data); !errors.Is(err, ErrControlValidation) {
+				t.Fatalf("URI whitespace %q accepted: %v", whitespace, err)
+			}
+		})
+	}
+}
+
 func mustJSON(t *testing.T, value ControlRequest) []byte {
 	t.Helper()
 	data, err := json.Marshal(value)

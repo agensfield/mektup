@@ -8,6 +8,7 @@ import (
 	"io"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ControlRequest is the metadata-only seam between SSH transport and the
@@ -411,7 +412,7 @@ func validTimestamp(value string) bool {
 
 func validURI(value string) bool {
 	colon := strings.Index(value, "://")
-	if colon < 1 || colon+3 >= len(value) || strings.IndexAny(value, " \t\r\n") >= 0 {
+	if colon < 1 || colon+3 >= len(value) || strings.IndexFunc(value, unicode.IsSpace) >= 0 {
 		return false
 	}
 	for i, r := range value[:colon] {
