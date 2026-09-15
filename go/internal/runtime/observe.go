@@ -315,7 +315,7 @@ func validImageDetail(object map[string]json.RawMessage) bool {
 		return true
 	}
 	if string(raw) == "null" {
-		return false
+		return true
 	}
 	value := stringField(object, "detail")
 	switch value {
@@ -352,10 +352,7 @@ func validTextElements(object map[string]json.RawMessage) bool {
 			return false
 		}
 		placeholder, present := element["placeholder"]
-		if !present {
-			return false
-		}
-		if string(placeholder) != "null" {
+		if present && string(placeholder) != "null" {
 			var value string
 			if json.Unmarshal(placeholder, &value) != nil {
 				return false
