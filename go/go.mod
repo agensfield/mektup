@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/gorilla/websocket v1.5.3
-	golang.org/x/mod v0.38.0
+	golang.org/x/mod v0.40.0
 	modernc.org/sqlite v1.59.0
 )
 
