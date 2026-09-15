@@ -170,9 +170,10 @@ func Evaluate(method string, params json.RawMessage) Decision {
 func Classify(method string, params json.RawMessage) Decision { return Evaluate(method, params) }
 
 // Gate performs all safety checks synchronously, before a dispatch callback
-// can be invoked by a semantic caller. Every class other than plain read is
-// acknowledged independently, including network-read and experimental
-// capability activation. Duplicate grants are harmless.
+// can be invoked by a semantic caller. Plain and network-backed observations
+// dispatch without a mutation acknowledgment; every mutation, auth,
+// destructive, host-write, or unknown class is acknowledged independently.
+// Duplicate grants are harmless.
 func Gate(request GateRequest) error {
 	decision := Evaluate(request.Method, request.Params)
 	grants := make(map[EffectClass]bool, len(request.Grants))
@@ -181,7 +182,10 @@ func Gate(request GateRequest) error {
 	}
 	missing := make([]EffectClass, 0, len(decision.Effects))
 	for _, effect := range decision.Effects {
-		if effect == EffectRead || grants[effect] {
+		// Plain observations and network-backed observations are both read
+		// effects. Network-read remains in the decision for receipts, but does
+		// not require a mutation acknowledgment.
+		if effect == EffectRead || effect == EffectNetworkRead || grants[effect] {
 			continue
 		}
 		if !containsEffect(missing, effect) {
@@ -349,11 +353,11 @@ func buildRegistry() map[string]Metadata {
 		"mcpServer/resource/read", "mcpServerStatus/list", "plugin/list", "plugin/installed", "plugin/read",
 		"plugin/share/list", "plugin/share/checkout", "plugin/skill/read", "plugin/reconcile", "plugin/share/save", "plugin/share/updateTargets",
 		"plugin/share/delete", "plugin/install", "plugin/uninstall", "marketplace/add", "marketplace/upgrade",
-		"app/list", "app/read", "app/installed", "fuzzyFileSearch", "externalAgentConfig/detect", "feedback/upload",
-		"thread/search", "thread/searchOccurrences", "thread/realtime/start", "thread/realtime/appendAudio", "thread/realtime/appendText",
+		"app/list", "app/read", "app/installed", "feedback/upload",
+		"thread/realtime/start", "thread/realtime/appendAudio", "thread/realtime/appendText",
 		"thread/realtime/appendSpeech", "mcpServer/tool/call", "mcpServer/oauth/login",
 		"environment/info", "environment/status", "remoteControl/pairing/start", "remoteControl/pairing/status",
-		"remoteControl/client/list", "remoteControl/client/revoke", "plugin/search", "mcpServer/tool/call",
+		"remoteControl/client/list", "remoteControl/client/revoke", "plugin/search",
 	)
 
 	setEffects(result, []EffectClass{EffectThreadWrite},
@@ -382,13 +386,10 @@ func buildRegistry() map[string]Metadata {
 	)
 
 	setEffects(result, []EffectClass{EffectAuth},
-		"account/login/start", "account/login/cancel", "account/logout", "account/read", "account/rateLimits/read",
-		"account/usage/read", "account/workspaceMessages/read", "account/rateLimitResetCredit/consume", "account/sendAddCreditsNudgeEmail",
-		"getAuthStatus", "remoteControl/enable", "remoteControl/disable", "remoteControl/pairing/start", "remoteControl/pairing/status",
-		"remoteControl/client/list", "remoteControl/client/revoke", "userVerification/status", "userVerification/enroll",
-		"userVerification/delete", "userVerification/verify", "account/bedrock/setup", "mcpServer/oauth/login",
+		"account/login/start", "account/login/cancel", "account/logout", "userVerification/enroll", "userVerification/delete",
+		"userVerification/verify", "account/bedrock/setup", "mcpServer/oauth/login",
 	)
-	setEffects(result, []EffectClass{EffectHostWrite}, "remoteControl/enable", "remoteControl/disable", "mcpServer/oauth/login")
+	setEffects(result, []EffectClass{EffectHostWrite}, "remoteControl/enable", "remoteControl/disable", "remoteControl/pairing/start", "remoteControl/client/revoke", "mcpServer/oauth/login")
 
 	setEffects(result, []EffectClass{EffectDestructive},
 		"thread/delete", "thread/rollback", "thread/revert", "marketplace/remove", "plugin/share/delete", "plugin/uninstall",
@@ -396,7 +397,7 @@ func buildRegistry() map[string]Metadata {
 		"thread/backgroundTerminals/terminate", "process/kill", "remoteControl/client/revoke", "userVerification/delete",
 	)
 	setEffects(result, []EffectClass{EffectHostWrite, EffectDestructive}, "fs/remove", "memory/reset")
-	setEffects(result, []EffectClass{EffectUnknown}, "mock/experimentalMethod")
+	setEffects(result, []EffectClass{EffectUnknown}, "mock/experimentalMethod", "account/rateLimitResetCredit/consume", "account/sendAddCreditsNudgeEmail", "mcpServer/tool/call")
 
 	// Experimental fields are kept explicit so a stable-exported method cannot
 	// accidentally send a v2 field without requesting experimentalApi.
@@ -442,7 +443,7 @@ func buildRegistry() map[string]Metadata {
 		if method == "account/rateLimitResetCredit/consume" || method == "project/create" {
 			metadata.RetrySafety = RetryIdempotencyKeyed
 		}
-		if method == "thread/unsubscribe" || method == "thread/interrupt" || method == "fs/watch" || method == "fs/unwatch" {
+		if method == "thread/unsubscribe" || method == "turn/interrupt" || method == "fs/watch" || method == "fs/unwatch" {
 			metadata.RetrySafety = RetryAfterReconciliation
 		}
 		metadata.ResponseNote = responseNote(method, metadata.Effects)

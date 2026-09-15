@@ -79,12 +79,13 @@ func TestRepresentativeEffectClasses(t *testing.T) {
 		{"thread/read", []EffectClass{EffectRead}},
 		{"thread/timeline/list", []EffectClass{EffectRead}},
 		{"model/list", []EffectClass{EffectNetworkRead}},
-		{"account/read", []EffectClass{EffectNetworkRead, EffectAuth}},
+		{"account/read", []EffectClass{EffectNetworkRead}},
 		{"turn/start", []EffectClass{EffectThreadWrite}},
 		{"thread/shellCommand", []EffectClass{EffectHostWrite}},
 		{"account/login/start", []EffectClass{EffectAuth}},
 		{"fs/remove", []EffectClass{EffectHostWrite, EffectDestructive}},
 		{"mock/experimentalMethod", []EffectClass{EffectUnknown}},
+		{"mcpServer/tool/call", []EffectClass{EffectNetworkRead, EffectUnknown}},
 	}
 	for _, test := range tests {
 		decision := Evaluate(test.method, nil)
@@ -109,6 +110,72 @@ func TestKnownMutationsNeverDefaultToPlainRead(t *testing.T) {
 		if len(decision.Effects) == 1 && decision.Effects[0] == EffectRead {
 			t.Errorf("known mutation %q was classified as plain read", method)
 		}
+	}
+}
+
+func TestLocalSearchesArePlainReads(t *testing.T) {
+	for _, method := range []string{"thread/search", "thread/searchOccurrences", "fuzzyFileSearch"} {
+		decision := Evaluate(method, nil)
+		if len(decision.Effects) != 1 || decision.Effects[0] != EffectRead {
+			t.Errorf("%s effects = %v, want [read]", method, decision.Effects)
+		}
+		if err := Gate(GateRequest{Method: method}); err != nil {
+			t.Errorf("%s read gate failed: %v", method, err)
+		}
+	}
+}
+
+func TestNetworkReadsDispatchWithoutGrantButRetainReceiptEffect(t *testing.T) {
+	for _, method := range []string{"model/list", "account/read", "remoteControl/client/list"} {
+		decision := Evaluate(method, nil)
+		if !containsEffect(decision.Effects, EffectNetworkRead) {
+			t.Errorf("%s decision lost network-read effect: %v", method, decision.Effects)
+		}
+		if err := Gate(GateRequest{Method: method}); err != nil {
+			t.Errorf("%s network read unexpectedly gated: %v", method, err)
+		}
+	}
+}
+
+func TestAuthReadsAreNotAuthMutations(t *testing.T) {
+	for _, method := range []string{
+		"account/read", "account/rateLimits/read", "account/usage/read", "account/workspaceMessages/read",
+		"getAuthStatus", "remoteControl/status/read", "remoteControl/client/list", "userVerification/status",
+	} {
+		decision := Evaluate(method, nil)
+		if containsEffect(decision.Effects, EffectAuth) {
+			t.Errorf("observational auth method %s incorrectly requires auth effect: %v", method, decision.Effects)
+		}
+		if err := Gate(GateRequest{Method: method}); err != nil {
+			t.Errorf("observational auth method %s unexpectedly gated: %v", method, err)
+		}
+	}
+	for _, method := range []string{"account/login/start", "account/logout", "account/bedrock/setup", "userVerification/enroll", "userVerification/delete", "userVerification/verify"} {
+		if !containsEffect(Evaluate(method, nil).Effects, EffectAuth) {
+			t.Errorf("auth mutation %s lost auth effect", method)
+		}
+		if err := Gate(GateRequest{Method: method}); err == nil {
+			t.Errorf("auth mutation %s passed without auth grant", method)
+		}
+	}
+}
+
+func TestMCPToolCallIsUnknownAndGated(t *testing.T) {
+	decision := Evaluate("mcpServer/tool/call", json.RawMessage(`{"server":"arbitrary","tool":"write"}`))
+	if !containsEffect(decision.Effects, EffectUnknown) || !containsEffect(decision.Effects, EffectNetworkRead) {
+		t.Fatalf("MCP tool call effects = %v, want unknown plus network-read", decision.Effects)
+	}
+	if err := Gate(GateRequest{Method: "mcpServer/tool/call", Grants: []EffectClass{EffectNetworkRead}}); err == nil {
+		t.Fatal("MCP tool call passed with network-read acknowledgment only")
+	}
+	if err := Gate(GateRequest{Method: "mcpServer/tool/call", Grants: []EffectClass{EffectUnknown}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTurnInterruptRetrySafetyOverride(t *testing.T) {
+	if got := Evaluate("turn/interrupt", nil).Metadata.RetrySafety; got != RetryAfterReconciliation {
+		t.Fatalf("turn/interrupt retry safety = %q, want %q", got, RetryAfterReconciliation)
 	}
 }
 
@@ -150,8 +217,8 @@ func TestParameterRiskCanOnlyIncrease(t *testing.T) {
 	if refresh.Experimental {
 		t.Fatal("stable refresh parameter was incorrectly treated as experimental")
 	}
-	if !containsEffect(plain.Effects, EffectAuth) || !containsEffect(refresh.Effects, EffectAuth) {
-		t.Fatalf("auth risk was lowered: plain=%v refresh=%v", plain.Effects, refresh.Effects)
+	if containsEffect(plain.Effects, EffectAuth) || containsEffect(refresh.Effects, EffectAuth) {
+		t.Fatalf("observational account read unexpectedly carries auth mutation risk: plain=%v refresh=%v", plain.Effects, refresh.Effects)
 	}
 	if !containsEffect(refresh.Effects, EffectNetworkRead) {
 		t.Fatalf("forceRefresh did not retain network-read risk: %v", refresh.Effects)
@@ -161,7 +228,7 @@ func TestParameterRiskCanOnlyIncrease(t *testing.T) {
 	}
 }
 
-func TestGateRequiresEveryNonReadClassBeforeDispatch(t *testing.T) {
+func TestGateRequiresEveryMutationClassBeforeDispatch(t *testing.T) {
 	called := false
 	dispatch := func() { called = true }
 	if err := Gate(GateRequest{Method: "thread/read"}); err != nil {
@@ -188,8 +255,8 @@ func TestGateRequiresEveryNonReadClassBeforeDispatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := Gate(GateRequest{Method: "model/list"}); err == nil {
-		t.Fatal("network-read effect passed without per-invocation grant")
+	if err := Gate(GateRequest{Method: "model/list"}); err != nil {
+		t.Fatalf("network-read should dispatch without grant: %v", err)
 	}
 	if err := Gate(GateRequest{Method: "model/list", Grants: []EffectClass{EffectNetworkRead}}); err != nil {
 		t.Fatal(err)
