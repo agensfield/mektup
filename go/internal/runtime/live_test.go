@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -143,6 +145,11 @@ type liveSendOutcome struct {
 	err    error
 }
 
+type liveHistoryResult struct {
+	items []service.ObservedItem
+	err   error
+}
+
 func logLiveSendOutcome(t *testing.T, outcome liveSendOutcome) {
 	t.Helper()
 	t.Logf("send metadata operation=%s message=%s state=%s", outcome.result.Receipt.OperationID, outcome.result.Receipt.Message.MessageID, outcome.result.Receipt.State)
@@ -153,20 +160,29 @@ func logLiveSendOutcome(t *testing.T, outcome liveSendOutcome) {
 
 func discoverLiveOriginal(ctx context.Context, timeout time.Duration, observe service.ObservationPort, target service.ResolvedTarget, resolver OriginalResolver, sendDone <-chan liveSendOutcome, expectedBody string) (service.OriginalMessage, error) {
 	deadline := time.NewTimer(timeout)
-	ticker := time.NewTicker(100 * time.Millisecond)
 	defer deadline.Stop()
-	defer ticker.Stop()
+	scanCtx, scanCancel := context.WithCancel(ctx)
+	defer scanCancel()
+	historyCh := make(chan liveHistoryResult, 1)
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			items, historyErr := observe.FullHistory(scanCtx, target)
+			select {
+			case historyCh <- liveHistoryResult{items: items, err: historyErr}:
+			case <-scanCtx.Done():
+				return
+			}
+			select {
+			case <-ticker.C:
+			case <-scanCtx.Done():
+				return
+			}
+		}
+	}()
 	sendCh := sendDone
 	for {
-		type historyResult struct {
-			items []service.ObservedItem
-			err   error
-		}
-		historyCh := make(chan historyResult, 1)
-		go func() {
-			items, historyErr := observe.FullHistory(ctx, target)
-			historyCh <- historyResult{items: items, err: historyErr}
-		}()
 		select {
 		case outcome := <-sendCh:
 			sendCh = nil
@@ -186,8 +202,6 @@ func discoverLiveOriginal(ctx context.Context, timeout time.Duration, observe se
 					}
 				}
 			}
-		case <-ticker.C:
-			continue
 		case <-ctx.Done():
 			return service.OriginalMessage{}, ctx.Err()
 		case <-deadline.C:
@@ -203,6 +217,69 @@ func TestLiveOriginalDiscoveryReportsEarlySendFailure(t *testing.T) {
 	_, err := discoverLiveOriginal(context.Background(), time.Second, &historyPort{}, service.ResolvedTarget{}, OriginalResolver{}, sendDone, "body")
 	if !errors.Is(err, sendErr) {
 		t.Fatalf("early send error = %v", err)
+	}
+}
+
+func TestLiveOriginalDiscoveryDoesNotOverlapSlowHistoryScans(t *testing.T) {
+	observe := &slowHistoryObservation{started: make(chan struct{})}
+	sendDone := make(chan liveSendOutcome, 1)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		sendDone <- liveSendOutcome{err: errors.New("early send failure")}
+	}()
+	started := time.Now()
+	_, err := discoverLiveOriginal(context.Background(), time.Second, observe, service.ResolvedTarget{}, OriginalResolver{}, sendDone, "body")
+	if err == nil || time.Since(started) > 200*time.Millisecond {
+		t.Fatalf("slow discovery did not fail promptly: elapsed=%s err=%v", time.Since(started), err)
+	}
+	select {
+	case <-observe.started:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("history worker did not start")
+	}
+	deadline := time.NewTimer(200 * time.Millisecond)
+	defer deadline.Stop()
+	for observe.inFlight.Load() != 0 {
+		select {
+		case <-deadline.C:
+			t.Fatal("slow history worker remained in flight after cancellation")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if observe.maxInFlight.Load() > 1 {
+		t.Fatalf("overlapping history scans: max=%d", observe.maxInFlight.Load())
+	}
+}
+
+type slowHistoryObservation struct {
+	inFlight    atomic.Int32
+	maxInFlight atomic.Int32
+	started     chan struct{}
+	startedOnce sync.Once
+}
+
+func (o *slowHistoryObservation) Subscribe(context.Context, service.ResolvedTarget) (service.EventStream, error) {
+	return nil, errors.New("not used")
+}
+
+func (o *slowHistoryObservation) FullHistory(ctx context.Context, _ service.ResolvedTarget) ([]service.ObservedItem, error) {
+	current := o.inFlight.Add(1)
+	for {
+		max := o.maxInFlight.Load()
+		if current <= max || o.maxInFlight.CompareAndSwap(max, current) {
+			break
+		}
+	}
+	o.startedOnce.Do(func() { close(o.started) })
+	defer o.inFlight.Add(-1)
+	timer := time.NewTimer(100 * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
 }
 
