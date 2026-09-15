@@ -154,8 +154,19 @@ func TestExecutorResultStreamsProvidedOutputAndReceipt(t *testing.T) {
 		t.Fatalf("globals were not resolved: %#v", got.Resolved)
 	}
 	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
-	if len(lines) != 2 {
-		t.Fatalf("expected event and receipt, got %q", out.String())
+	if len(lines) != 1 {
+		t.Fatalf("expected one terminal event containing receipt, got %q", out.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &event); err != nil {
+		t.Fatal(err)
+	}
+	if event["schema"] != EventSchema || event["terminal"] != true {
+		t.Fatalf("invalid lifecycle event: %#v", event)
+	}
+	data, _ := event["data"].(map[string]any)
+	if data["receipt"] == nil {
+		t.Fatalf("receipt was not embedded: %#v", event)
 	}
 }
 
@@ -202,5 +213,81 @@ func TestUUIDv7GeneratorAndEntropyFailure(t *testing.T) {
 	}
 	if strings.Contains(out.String(), "00000000-0000-4000-8000") {
 		t.Fatalf("fixed UUID fallback leaked: %q", out.String())
+	}
+	if out.Len() != 0 || !strings.Contains(errOut.String(), "unable to allocate operation identity") {
+		t.Fatalf("entropy failure emitted malformed machine output: stdout=%q stderr=%q", out.String(), errOut.String())
+	}
+}
+
+func TestOperationalJSONLHasContiguousTerminalLifecycleAndEmbeddedReceipt(t *testing.T) {
+	var out, errOut bytes.Buffer
+	a := &App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{}, Executor: executorFunc(func(context.Context, Invocation) (ExecutionResult, error) {
+		return ExecutionResult{
+			Events: []OutputEvent{
+				{Machine: map[string]any{"event": "send.accepted", "terminal": false, "ok": true, "data": map[string]any{}}},
+				{Machine: map[string]any{"event": "reply.accepted", "terminal": true, "ok": true, "data": map[string]any{}}},
+			},
+			Receipt: map[string]any{"schema": "mektup/receipt/v1", "receiptId": "rcpt_test", "state": "accepted"},
+		}, nil
+	})}
+	if code := a.Run([]string{"--json", "send", "target", "message"}); code != int(ExitSuccess) {
+		t.Fatalf("code=%d stderr=%q", code, errOut.String())
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected two lifecycle lines, got %q", out.String())
+	}
+	for index, line := range lines {
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("line %d: %v", index, err)
+		}
+		for _, field := range []string{"schema", "event", "eventId", "sequence", "operationId", "timestamp", "terminal", "ok", "warnings", "data"} {
+			if _, ok := event[field]; !ok {
+				t.Fatalf("line %d missing %s: %#v", index, field, event)
+			}
+		}
+		if event["schema"] != EventSchema || int(event["sequence"].(float64)) != index+1 {
+			t.Fatalf("line %d has invalid schema/sequence: %#v", index, event)
+		}
+		if index == 0 && event["terminal"] != false {
+			t.Fatalf("first event unexpectedly terminal: %#v", event)
+		}
+		if index == 1 {
+			if event["terminal"] != true {
+				t.Fatalf("last event not terminal: %#v", event)
+			}
+			data := event["data"].(map[string]any)
+			if data["receipt"] == nil {
+				t.Fatalf("receipt not in terminal data: %#v", event)
+			}
+		}
+	}
+}
+
+func TestOperationalJSONLRejectsLinesAfterTerminal(t *testing.T) {
+	var out, errOut bytes.Buffer
+	a := &App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{}, Executor: executorFunc(func(context.Context, Invocation) (ExecutionResult, error) {
+		return ExecutionResult{Events: []OutputEvent{
+			{Machine: map[string]any{"event": "done", "terminal": true, "ok": true}},
+			{Machine: map[string]any{"event": "late", "terminal": true, "ok": true}},
+		}}, nil
+	})}
+	if code := a.Run([]string{"--json", "inspect", "target"}); code != int(ExitInternal) || out.Len() != 0 || !strings.Contains(errOut.String(), "after a terminal event") {
+		t.Fatalf("code=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+	}
+}
+
+func TestHelpJSONUsesOfflineSchema(t *testing.T) {
+	code, stdout, _ := runTest(t, "--json", "help")
+	if code != int(ExitSuccess) {
+		t.Fatalf("code=%d", code)
+	}
+	var document map[string]any
+	if err := json.Unmarshal([]byte(stdout), &document); err != nil {
+		t.Fatal(err)
+	}
+	if document["schema"] != "mektup/help/v1" {
+		t.Fatalf("help used lifecycle schema: %#v", document)
 	}
 }

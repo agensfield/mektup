@@ -387,7 +387,7 @@ func (a *App) help(p Presentation, position []string) int {
 		}
 	}
 	if p == PresentationJSON {
-		return a.writeJSON(map[string]any{"schema": EventSchema, "event": "help", "terminal": true, "ok": true, "data": map[string]any{"text": text}})
+		return a.writeJSON(map[string]any{"schema": "mektup/help/v1", "ok": true, "topic": "help", "text": text})
 	}
 	_, _ = io.WriteString(a.Out, ensureFinalNewline(text))
 	return int(ExitSuccess)
@@ -477,22 +477,14 @@ func (a *App) writeExecutionResult(p Presentation, inv Invocation, result Execut
 		result.Exit = ExitSuccess
 	}
 	if p == PresentationJSON {
-		hasOutput := result.Receipt != nil
-		for _, event := range result.Events {
-			if event.Machine != nil {
-				hasOutput = true
-				if status := a.writeJSON(event.Machine); status != int(ExitSuccess) {
-					return status
-				}
-			}
+		events, err := a.lifecycleEvents(inv, result)
+		if err != nil {
+			return a.internalFailure(err.Error())
 		}
-		if result.Receipt != nil {
-			if status := a.writeJSON(result.Receipt); status != int(ExitSuccess) {
+		for _, event := range events {
+			if status := a.writeJSON(event); status != int(ExitSuccess) {
 				return status
 			}
-		}
-		if !hasOutput {
-			return a.finish(p, inv, &Error{Code: "internal_error", Message: "operational command returned no machine output", Exit: ExitInternal})
 		}
 		return int(result.Exit)
 	}
@@ -513,14 +505,118 @@ func (a *App) writeExecutionResult(p Presentation, inv Invocation, result Execut
 	}
 	if result.Receipt != nil {
 		hasOutput = true
-		if status := a.writeJSON(result.Receipt); status != int(ExitSuccess) {
-			return status
+		if _, err := io.WriteString(a.Out, ensureFinalNewline(receiptHuman(result.Receipt))); err != nil {
+			return a.internalFailure("unable to write receipt: " + err.Error())
 		}
 	}
 	if !hasOutput {
 		return a.finish(p, inv, &Error{Code: "internal_error", Message: "operational command returned no human output", Exit: ExitInternal})
 	}
 	return int(result.Exit)
+}
+
+// lifecycleEvents makes the executor boundary safe even while the domain
+// packages are being integrated. A receipt is data on the terminal lifecycle
+// event, never a second bare JSON line after that event.
+func (a *App) lifecycleEvents(inv Invocation, result ExecutionResult) ([]map[string]any, error) {
+	if len(result.Events) == 0 && result.Receipt == nil {
+		return nil, errors.New("operational command returned no machine output")
+	}
+	events := make([]map[string]any, 0, len(result.Events)+1)
+	for _, output := range result.Events {
+		if output.Machine == nil {
+			continue
+		}
+		encoded, err := json.Marshal(output.Machine)
+		if err != nil {
+			return nil, fmt.Errorf("invalid executor lifecycle event: %w", err)
+		}
+		var event map[string]any
+		if err := json.Unmarshal(encoded, &event); err != nil {
+			return nil, fmt.Errorf("invalid executor lifecycle event: %w", err)
+		}
+		events = append(events, event)
+	}
+	if len(events) == 0 && result.Receipt != nil {
+		events = append(events, map[string]any{"data": map[string]any{"receipt": result.Receipt}})
+	}
+	for index, event := range events {
+		if schema, ok := event["schema"].(string); ok && schema != "" && schema != EventSchema {
+			return nil, fmt.Errorf("executor event schema %q is not %s", schema, EventSchema)
+		}
+		event["schema"] = EventSchema
+		if _, ok := event["event"].(string); !ok || event["event"] == "" {
+			event["event"] = "operation.progress"
+		}
+		if _, ok := event["eventId"].(string); !ok || event["eventId"] == "" {
+			id, err := a.ID("evt_")
+			if err != nil {
+				return nil, fmt.Errorf("unable to allocate lifecycle event identity: %w", err)
+			}
+			event["eventId"] = id
+		}
+		if _, ok := event["operationId"].(string); !ok || event["operationId"] == "" {
+			id, err := a.ID("op_")
+			if err != nil {
+				return nil, fmt.Errorf("unable to allocate lifecycle operation identity: %w", err)
+			}
+			event["operationId"] = id
+		}
+		if _, ok := event["timestamp"].(string); !ok || event["timestamp"] == "" {
+			event["timestamp"] = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+		event["sequence"] = index + 1
+		if _, ok := event["terminal"].(bool); !ok {
+			event["terminal"] = false
+		}
+		if _, ok := event["ok"].(bool); !ok {
+			event["ok"] = result.Exit == ExitSuccess
+		}
+		if _, ok := event["warnings"]; !ok {
+			event["warnings"] = []any{}
+		}
+		if _, ok := event["data"].(map[string]any); !ok {
+			event["data"] = map[string]any{}
+		}
+		if terminal, _ := event["terminal"].(bool); terminal && index != len(events)-1 {
+			return nil, errors.New("executor lifecycle event appears after a terminal event")
+		}
+	}
+	last := events[len(events)-1]
+	if result.Receipt != nil {
+		data := last["data"].(map[string]any)
+		data["receipt"] = result.Receipt
+		last["terminal"] = true
+		last["event"] = "operation.completed"
+	}
+	if terminal, _ := last["terminal"].(bool); !terminal {
+		last["terminal"] = true
+	}
+	return events, nil
+}
+
+func receiptHuman(receipt any) string {
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		return "receipt emitted"
+	}
+	var object map[string]any
+	if err := json.Unmarshal(encoded, &object); err != nil {
+		return "receipt emitted"
+	}
+	parts := []string{"receipt"}
+	if id, ok := object["receiptId"].(string); ok && id != "" {
+		parts = append(parts, id)
+	}
+	if state, ok := object["state"].(string); ok && state != "" {
+		parts = append(parts, "state="+state)
+	}
+	return strings.Join(parts, " ")
+}
+
+func (a *App) internalFailure(message string) int {
+	_, _ = fmt.Fprintln(a.Err, "mektup: "+message)
+	return int(ExitInternal)
 }
 
 func (a *App) writeEvent(inv Invocation, e *Error) int {
@@ -531,17 +627,7 @@ func (a *App) writeEvent(inv Invocation, e *Error) int {
 	eventID, eventErr := a.ID("evt_")
 	operationID, operationErr := a.ID("op_")
 	if eventErr != nil || operationErr != nil {
-		fallback := map[string]any{
-			"schema": EventSchema, "event": operation, "sequence": 1,
-			"timestamp": time.Now().UTC().Format(time.RFC3339Nano), "terminal": true, "ok": false,
-			"warnings": []any{}, "data": map[string]any{"error": map[string]any{
-				"code": "internal_error", "message": "unable to allocate operation identity", "retryable": false,
-			}},
-		}
-		if status := a.writeJSON(eventWithCommand(fallback, inv)); status != int(ExitSuccess) {
-			return status
-		}
-		return int(ExitInternal)
+		return a.internalFailure("unable to allocate operation identity")
 	}
 	event := map[string]any{
 		"schema":      EventSchema,
