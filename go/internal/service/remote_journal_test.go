@@ -92,8 +92,8 @@ func TestRemoteJournalRoutesCustodyAndPreservesSeparateBodyEndpoint(t *testing.T
 	if committed.State != mektup.StateReplyAccepted || !committed.Won {
 		t.Fatalf("commit=%#v", committed)
 	}
-	if _, err := router.WaitReply(context.Background(), remoteReply, time.Second); err != nil {
-		t.Fatal(err)
+	if _, err := router.WaitReply(context.Background(), remoteReply, time.Second); err == nil {
+		t.Fatal("own custody acceptance completed a child wait")
 	}
 	if len(operations) != 4 || operations[0] != "claim" || operations[1] != "heartbeat" || operations[2] != "commit" || operations[3] != "status" {
 		t.Fatalf("operations=%v", operations)

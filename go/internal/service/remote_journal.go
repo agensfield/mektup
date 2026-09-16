@@ -320,12 +320,9 @@ func (r *RemoteJournal) WaitReply(ctx context.Context, replyID string, timeout t
 			if status.State == mektup.StateReplyOutcomeUnknown {
 				return status, nil
 			}
-			if claim.joined {
-				status.State = mektup.StateReplyDispatchClaimed
-				status.ReplyID = ""
-				return status, errors.New("joined claim has no correlated child reply")
-			}
-			return status, nil
+			status.State = mektup.StateReplyDispatchClaimed
+			status.ReplyID = ""
+			return status, errors.New("reply attempt acceptance has no correlated child reply")
 		}
 		timer := time.NewTimer(r.PollInterval)
 		select {
