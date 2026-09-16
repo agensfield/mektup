@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -162,67 +161,6 @@ func TestRemoteJournalRejectsSwappedResponseAndRequiresMapping(t *testing.T) {
 	}
 }
 
-func TestRemoteJournalPortableImportPreservesActiveOwner(t *testing.T) {
-	root := t.TempDir()
-	inner, err := journal.Open(context.Background(), journal.Options{StateDir: filepath.Join(root, "journal")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = inner.Close() })
-	store := endpoint.NewStore(filepath.Join(root, "config", "endpoints.json"), filepath.Join(root, "state"))
-	remoteRoute, _ := endpoint.SSHRoute("custody.example")
-	if err := store.Add(endpoint.Endpoint{ID: remoteCustodyEndpoint, Alias: "custody", Route: remoteRoute, Herdr: endpoint.HerdrDisabled}); err != nil {
-		t.Fatal(err)
-	}
-	bodyRoute, _ := endpoint.UnixRoute(filepath.Join(root, "body.sock"))
-	if err := store.Add(endpoint.Endpoint{ID: bodyDestinationEndpoint, Alias: "body", Route: bodyRoute, Herdr: endpoint.HerdrDisabled}); err != nil {
-		t.Fatal(err)
-	}
-	op := Operation{OperationID: remoteOperation, MessageID: remoteOriginal, SourceRoute: "codex://body/thread/source", TargetRoute: "codex://body/thread/target", Semantics: "message", ReplyRoute: "codex://body/thread/reply", ReplyEndpointID: bodyDestinationEndpoint, CustodyRoute: remoteCustodyEndpoint, CustodyStoreID: remoteCustodyStore, Digest: "sha256:" + strings.Repeat("a", 64), BodySize: 4, SourceEndpointID: bodyDestinationEndpoint, TargetEndpointID: bodyDestinationEndpoint}
-	router := &RemoteJournal{Local: &SQLiteJournal{Inner: inner, Registry: NewMemoryIdentityRegistry()}, Endpoints: store, LocalEndpointID: bodyDestinationEndpoint}
-	router.Invoke = func(_ context.Context, _ endpoint.Route, request sshproxy.ControlRequest) ([]byte, error) {
-		response := request
-		response.Kind = "result"
-		response.BodyBytes = nil
-		response.BodySHA256 = ""
-		response.ReplyStatus = ""
-		response.ReplyErrorCode = ""
-		response.AttemptOwner = ""
-		response.RequestedLease = nil
-		response.RequestedAt = ""
-		response.Lease = nil
-		switch request.Operation {
-		case "claim":
-			response.FencingToken = ""
-			response.Result = json.RawMessage(`{"disposition":"claimed","state":"reply_dispatch_claimed","fencingToken":"fence-owner","lease":{"expiresAt":"2099-01-01T00:00:00.000000001Z"}}`)
-		case "status":
-			response.FencingToken = ""
-			response.Result = json.RawMessage(`{"state":"reply_dispatch_claimed","replyId":"msg_0198f0e0-0000-7000-8000-000000000075","replyStatus":"success","bodySha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","bodyBytes":4,"commitSeq":0}`)
-		case "heartbeat":
-			response.FencingToken = ""
-			response.Result = json.RawMessage(`{"state":"reply_dispatch_claimed","lease":{"expiresAt":"2099-01-01T00:00:00.000000001Z"}}`)
-		default:
-			return nil, fmt.Errorf("unexpected operation %s", request.Operation)
-		}
-		return json.Marshal(response)
-	}
-	if _, err := router.Prepare(context.Background(), op); err != nil {
-		t.Fatal(err)
-	}
-	input := ReplyClaimInput{ReplyID: remoteReply, OriginalID: remoteOriginal, Digest: op.Digest, BodySize: 4, Status: "success", ReplyRoute: op.ReplyRoute, CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID, Owner: "owner"}
-	claim, err := router.ClaimReply(context.Background(), input)
-	if err != nil {
-		t.Fatal(err)
-	}
-	input.Owner = ""
-	if err := router.ImportPortableClaim(context.Background(), op, input, mektup.StateReplyAccepted); err != nil {
-		t.Fatal(err)
-	}
-	if err := router.Heartbeat(context.Background(), claim.ReplyID, claim.Owner, claim.Token); err != nil {
-		t.Fatalf("portable query replaced active owner authority: %v", err)
-	}
-}
-
 func TestRemoteJournalOriginalStatusUsesCanonicalReceiverSelections(t *testing.T) {
 	root := t.TempDir()
 	server, err := journal.Open(context.Background(), journal.Options{StateDir: filepath.Join(root, "server")})
@@ -349,6 +287,9 @@ func TestRemoteJournalOriginalStatusUsesCanonicalReceiverSelections(t *testing.T
 	result, err = router.OriginalStatus(context.Background(), winner)
 	if err != nil || result.Selection != "winner" || result.ReplyID != winnerClaim.ReplyID || result.CommitSeq < 1 {
 		t.Fatalf("winner result=%+v err=%v", result, err)
+	}
+	if _, err := client.Operation(context.Background(), winner.OperationID); !errors.Is(err, journal.ErrNotFound) {
+		t.Fatalf("originalStatus created a local per-reply projection: err=%v", err)
 	}
 	unknown := newOperation("op_0198f0e0-0000-7000-8000-000000000086", "msg_0198f0e0-0000-7000-8000-000000000087")
 	importOriginal(unknown)

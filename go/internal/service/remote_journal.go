@@ -60,8 +60,6 @@ type remoteClaim struct {
 	lease     *sshproxy.Lease
 	state     mektup.EvidenceState
 	joined    bool
-	portable  bool
-	validated *OperationStatus
 }
 
 type OriginalStatusResult struct {
@@ -459,127 +457,6 @@ func (r *RemoteJournal) ObserveVerifiedReply(ctx context.Context, status Operati
 	r.claims[input.ReplyID] = remoteClaim{input: input, operation: status.Operation, request: request, route: route, state: mektup.StateReplyObserved}
 	r.mu.Unlock()
 	return nil
-}
-
-// ImportPortableClaim seeds tokenless metadata for querying an existing remote
-// claim. It never creates a claim or transfers dispatch authority.
-func (r *RemoteJournal) ImportPortableClaim(ctx context.Context, op Operation, input ReplyClaimInput, state mektup.EvidenceState) error {
-	if err := r.init(); err != nil {
-		return err
-	}
-	if input.ReplyID == "" || input.OriginalID == "" {
-		return ErrRemoteCustodyBinding
-	}
-	if input.ReplyRoute == "" {
-		input.ReplyRoute = op.ReplyRoute
-	}
-	if input.CustodyRoute == "" {
-		input.CustodyRoute = op.CustodyRoute
-	}
-	if input.CustodyStoreID == "" {
-		input.CustodyStoreID = op.CustodyStoreID
-	}
-	if input.ReplyRoute == "" || input.CustodyRoute == "" || input.CustodyStoreID == "" {
-		return ErrRemoteCustodyBinding
-	}
-	route, remote, err := r.route(input.CustodyRoute)
-	if err != nil {
-		return err
-	}
-	if !remote {
-		return ErrRemoteCustodyUnavailable
-	}
-	request, err := r.request(op, input, "status", op.ReplyEndpointID)
-	if err != nil {
-		return err
-	}
-	claim := remoteClaim{input: input, operation: op, request: request, route: route, state: state, portable: true}
-	r.mu.Lock()
-	existing, exists := r.claims[input.ReplyID]
-	r.mu.Unlock()
-	if exists {
-		if replyClaimIdentityConflict(existing.input, input) {
-			return journal.ErrIdentityConflict
-		}
-		// A portable receipt is a read-only selector. Never replace an
-		// in-flight cache entry, because that entry carries the owner, lease,
-		// and fencing token needed by the sender's heartbeat/commit path.
-		observed, err := r.status(ctx, existing, false)
-		if err == nil {
-			existing.validated = &observed
-			r.mu.Lock()
-			r.claims[input.ReplyID] = existing
-			r.mu.Unlock()
-		}
-		return err
-	}
-	r.mu.Lock()
-	r.claims[input.ReplyID] = claim
-	r.mu.Unlock()
-	observed, err := r.status(ctx, claim, false)
-	if err != nil {
-		r.mu.Lock()
-		if current, ok := r.claims[input.ReplyID]; ok && current.portable {
-			delete(r.claims, input.ReplyID)
-		}
-		r.mu.Unlock()
-		return err
-	}
-	r.mu.Lock()
-	if current, ok := r.claims[input.ReplyID]; ok && current.portable {
-		observedCopy := observed
-		current.validated = &observedCopy
-		r.claims[input.ReplyID] = current
-	}
-	r.mu.Unlock()
-	return nil
-}
-
-func replyClaimIdentityConflict(existing, imported ReplyClaimInput) bool {
-	if existing.OriginalID != imported.OriginalID || existing.ReplyRoute != imported.ReplyRoute || existing.CustodyRoute != imported.CustodyRoute || existing.CustodyStoreID != imported.CustodyStoreID {
-		return true
-	}
-	if existing.Digest != "" && imported.Digest != "" && existing.Digest != imported.Digest {
-		return true
-	}
-	if (existing.BodySizeKnown || existing.BodySize != 0) && (imported.BodySizeKnown || imported.BodySize != 0) && existing.BodySize != imported.BodySize {
-		return true
-	}
-	if existing.Status != "" && imported.Status != "" && existing.Status != imported.Status {
-		return true
-	}
-	return existing.ErrorCode != "" && imported.ErrorCode != "" && existing.ErrorCode != imported.ErrorCode
-}
-
-func (r *RemoteJournal) ForgetPortableClaim(replyID string) {
-	if r == nil || replyID == "" {
-		return
-	}
-	r.mu.Lock()
-	if claim, ok := r.claims[replyID]; ok && claim.portable {
-		delete(r.claims, replyID)
-	}
-	r.mu.Unlock()
-}
-
-func (r *RemoteJournal) PersistPortableClaim(ctx context.Context, op Operation, replyID string) error {
-	r.mu.Lock()
-	claim, ok := r.claims[replyID]
-	r.mu.Unlock()
-	if !ok {
-		return ErrRemoteCustodyBinding
-	}
-	status := OperationStatus{}
-	if claim.validated != nil {
-		status = *claim.validated
-	} else {
-		var err error
-		status, err = r.status(ctx, claim, false)
-		if err != nil {
-			return err
-		}
-	}
-	return r.persistRemoteStatus(ctx, op, status)
 }
 
 func (r *RemoteJournal) PersistOriginalStatus(ctx context.Context, op Operation, result OriginalStatusResult) error {
