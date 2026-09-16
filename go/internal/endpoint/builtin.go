@@ -49,7 +49,35 @@ func canonicalPath(value string) (string, error) {
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return "", fmt.Errorf("canonicalize %q: %w", value, err)
 	}
-	return abs, nil
+	return canonicalStoredPath(abs)
+}
+
+func canonicalStoredPath(value string) (string, error) {
+	resolved, err := filepath.EvalSymlinks(value)
+	if err == nil {
+		return filepath.Clean(resolved), nil
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+	current := value
+	missing := make([]string, 0, 4)
+	for {
+		parent := filepath.Dir(current)
+		if parent == current {
+			return filepath.Clean(value), nil
+		}
+		missing = append([]string{filepath.Base(current)}, missing...)
+		current = parent
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			parts := append([]string{filepath.Clean(resolved)}, missing...)
+			return filepath.Join(parts...), nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+	}
 }
 
 func (s EndpointStore) EnsureBuiltinLocal(codexHome string) (Endpoint, error) {
@@ -217,27 +245,41 @@ func (s EndpointStore) builtinPath() string {
 }
 
 func (s EndpointStore) loadBuiltinIdentities() (builtinIdentities, error) {
-	b, err := os.ReadFile(s.builtinPath())
+	b, err := readOwnerPrivateEndpointFile(s.builtinPath())
 	if errors.Is(err, fs.ErrNotExist) {
 		return builtinIdentities{Version: 1}, nil
 	}
 	if err != nil {
 		return builtinIdentities{}, fmt.Errorf("read built-in endpoint identities: %w", err)
 	}
-	if info, statErr := os.Stat(s.builtinPath()); statErr == nil && info.Mode().Perm()&0077 != 0 {
-		return builtinIdentities{}, fmt.Errorf("%w: built-in identity mode %04o", ErrConfigPerm, info.Mode().Perm())
-	}
 	var identities builtinIdentities
 	if err := json.Unmarshal(b, &identities); err != nil || identities.Version != 1 {
 		return builtinIdentities{}, fmt.Errorf("%w: built-in identity document", ErrConfigCorrupt)
 	}
 	seenKey, seenID := map[string]bool{}, map[string]bool{}
+	validEntries := make([]builtinIdentity, 0, len(identities.Entries))
 	for _, identity := range identities.Entries {
 		if identity.Key == "" || identity.EndpointID == "" || seenKey[identity.Key] || seenID[identity.EndpointID] {
 			return builtinIdentities{}, fmt.Errorf("%w: duplicate built-in identity", ErrConfigCorrupt)
 		}
+		if !filepath.IsAbs(identity.Home) || !filepath.IsAbs(identity.Socket) || filepath.Clean(identity.Home) != identity.Home || filepath.Clean(identity.Socket) != identity.Socket || filepath.Join(identity.Home, localSocketRelative) != identity.Socket || identity.Key != identity.Home+"\x00"+identity.Socket {
+			return builtinIdentities{}, fmt.Errorf("%w: inconsistent built-in identity", ErrConfigCorrupt)
+		}
+		canonicalHome, homeErr := canonicalStoredPath(identity.Home)
+		canonicalSocket, socketErr := canonicalStoredPath(identity.Socket)
+		if homeErr != nil || socketErr != nil || canonicalHome != identity.Home || canonicalSocket != identity.Socket {
+			if _, statErr := os.Lstat(identity.Home); errors.Is(statErr, fs.ErrNotExist) {
+				// Older registries may retain identities for deleted temporary
+				// homes. Keep them unavailable rather than letting a now-visible
+				// symlinked ancestor become routing authority.
+				continue
+			}
+			return builtinIdentities{}, fmt.Errorf("%w: noncanonical built-in identity", ErrConfigCorrupt)
+		}
 		seenKey[identity.Key], seenID[identity.EndpointID] = true, true
+		validEntries = append(validEntries, identity)
 	}
+	identities.Entries = validEntries
 	return identities, nil
 }
 
@@ -250,17 +292,17 @@ func (s EndpointStore) saveBuiltinIdentities(identities builtinIdentities) error
 			return err
 		}
 	}
-	if err := os.MkdirAll(home, 0700); err != nil {
+	if err := ensureEndpointPrivateDirectory(home); err != nil {
 		return fmt.Errorf("create endpoint state home: %w", err)
-	}
-	if err := os.Chmod(home, 0700); err != nil {
-		return fmt.Errorf("protect endpoint state home: %w", err)
 	}
 	b, err := json.MarshalIndent(identities, "", "  ")
 	if err != nil {
 		return err
 	}
 	b = append(b, '\n')
+	if err := validateEndpointDocumentSize(len(b)); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(home, ".endpoint-identities-*.tmp")
 	if err != nil {
 		return err

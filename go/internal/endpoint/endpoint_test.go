@@ -136,6 +136,109 @@ func TestBuiltinLocalStablePerCanonicalHome(t *testing.T) {
 	}
 }
 
+func TestBuiltinIdentityDocumentRejectsInconsistentAuthority(t *testing.T) {
+	root := t.TempDir()
+	identityHome := filepath.Join(root, "identity")
+	if err := os.Mkdir(identityHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	home := filepath.Join(root, "codex")
+	socket := filepath.Join(home, localSocketRelative)
+	id, err := NewEndpointID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := builtinIdentities{Version: 1, Entries: []builtinIdentity{{
+		Key: home + "\x00" + socket, EndpointID: id, Home: home, Socket: filepath.Join(root, "attacker.sock"),
+	}}}
+	data, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(identityHome, "endpoint-identities.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStoreWithIdentityHome(filepath.Join(root, "config.json"), filepath.Join(root, "state"), identityHome)
+	if _, err := store.ExistingBuiltinLocal(home); !errors.Is(err, ErrConfigCorrupt) {
+		t.Fatalf("inconsistent built-in identity error = %v", err)
+	}
+}
+
+func TestBuiltinIdentityDocumentRejectsLiveSymlinkAuthority(t *testing.T) {
+	root := t.TempDir()
+	identityHome := filepath.Join(root, "identity")
+	realHome := filepath.Join(root, "real-codex")
+	if err := os.Mkdir(identityHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(realHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkedHome := filepath.Join(root, "linked-codex")
+	if err := os.Symlink(realHome, linkedHome); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(linkedHome, localSocketRelative)
+	id, err := NewEndpointID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := builtinIdentities{Version: 1, Entries: []builtinIdentity{{
+		Key: linkedHome + "\x00" + socket, EndpointID: id, Home: linkedHome, Socket: socket,
+	}}}
+	data, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(identityHome, "endpoint-identities.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStoreWithIdentityHome(filepath.Join(root, "config.json"), filepath.Join(root, "state"), identityHome)
+	if _, _, err := store.builtinByID(id); !errors.Is(err, ErrConfigCorrupt) {
+		t.Fatalf("live symlink identity error = %v", err)
+	}
+}
+
+func TestBuiltinIdentityDocumentIgnoresUnavailableLegacyRows(t *testing.T) {
+	root := t.TempDir()
+	identityHome := filepath.Join(root, "identity")
+	realParent := filepath.Join(root, "real-parent")
+	if err := os.Mkdir(identityHome, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkedParent := filepath.Join(root, "legacy-prefix")
+	if err := os.Symlink(realParent, linkedParent); err != nil {
+		t.Fatal(err)
+	}
+	staleHome := filepath.Join(linkedParent, "deleted-codex-home")
+	staleSocket := filepath.Join(staleHome, localSocketRelative)
+	id, err := NewEndpointID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := builtinIdentities{Version: 1, Entries: []builtinIdentity{{
+		Key: staleHome + "\x00" + staleSocket, EndpointID: id, Home: staleHome, Socket: staleSocket,
+	}}}
+	data, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(identityHome, "endpoint-identities.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStoreWithIdentityHome(filepath.Join(root, "config.json"), filepath.Join(root, "state"), identityHome)
+	identities, err := store.loadBuiltinIdentities()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(identities.Entries) != 0 {
+		t.Fatalf("stale identities remained authoritative: %#v", identities.Entries)
+	}
+}
+
 func TestEndpointIDsAreUUIDv7AndValidationIsStrict(t *testing.T) {
 	id, err := NewEndpointID()
 	if err != nil {

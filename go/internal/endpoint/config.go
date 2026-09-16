@@ -73,15 +73,12 @@ func (s EndpointStore) Load() (Config, error) {
 	if s.ConfigPath == "" {
 		return Config{Version: configVersion}, nil
 	}
-	b, err := os.ReadFile(s.ConfigPath)
+	b, err := readOwnerPrivateEndpointFile(s.ConfigPath)
 	if errors.Is(err, fs.ErrNotExist) {
 		return Config{Version: configVersion}, nil
 	}
 	if err != nil {
 		return Config{}, fmt.Errorf("read endpoint config: %w", err)
-	}
-	if info, statErr := os.Stat(s.ConfigPath); statErr == nil && info.Mode().Perm()&0077 != 0 {
-		return Config{}, fmt.Errorf("%w: mode %04o", ErrConfigPerm, info.Mode().Perm())
 	}
 	var cfg Config
 	if err := json.Unmarshal(b, &cfg); err != nil {
@@ -146,17 +143,17 @@ func (s EndpointStore) Save(cfg Config) error {
 		return err
 	}
 	dir := filepath.Dir(s.ConfigPath)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := ensureEndpointPrivateDirectory(dir); err != nil {
 		return fmt.Errorf("create endpoint config directory: %w", err)
-	}
-	if err := os.Chmod(dir, 0700); err != nil {
-		return fmt.Errorf("protect endpoint config directory: %w", err)
 	}
 	b, err := json.MarshalIndent(cfg, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode endpoint config: %w", err)
 	}
 	b = append(b, '\n')
+	if err := validateEndpointDocumentSize(len(b)); err != nil {
+		return err
+	}
 	tmp, err := os.CreateTemp(dir, ".endpoints-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create endpoint config temporary file: %w", err)
