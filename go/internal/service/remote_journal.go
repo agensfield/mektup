@@ -498,14 +498,17 @@ func (r *RemoteJournal) ImportPortableClaim(ctx context.Context, op Operation, i
 	existing, exists := r.claims[input.ReplyID]
 	r.mu.Unlock()
 	if exists {
-		if existing.input.OriginalID != input.OriginalID || existing.input.ReplyRoute != input.ReplyRoute || existing.input.CustodyRoute != input.CustodyRoute || existing.input.CustodyStoreID != input.CustodyStoreID {
+		if replyClaimIdentityConflict(existing.input, input) {
 			return journal.ErrIdentityConflict
 		}
-		observed, err := r.status(ctx, claim, false)
+		// A portable receipt is a read-only selector. Never replace an
+		// in-flight cache entry, because that entry carries the owner, lease,
+		// and fencing token needed by the sender's heartbeat/commit path.
+		observed, err := r.status(ctx, existing, false)
 		if err == nil {
-			claim.validated = &observed
+			existing.validated = &observed
 			r.mu.Lock()
-			r.claims[input.ReplyID] = claim
+			r.claims[input.ReplyID] = existing
 			r.mu.Unlock()
 		}
 		return err
@@ -530,6 +533,22 @@ func (r *RemoteJournal) ImportPortableClaim(ctx context.Context, op Operation, i
 	}
 	r.mu.Unlock()
 	return nil
+}
+
+func replyClaimIdentityConflict(existing, imported ReplyClaimInput) bool {
+	if existing.OriginalID != imported.OriginalID || existing.ReplyRoute != imported.ReplyRoute || existing.CustodyRoute != imported.CustodyRoute || existing.CustodyStoreID != imported.CustodyStoreID {
+		return true
+	}
+	if existing.Digest != "" && imported.Digest != "" && existing.Digest != imported.Digest {
+		return true
+	}
+	if (existing.BodySizeKnown || existing.BodySize != 0) && (imported.BodySizeKnown || imported.BodySize != 0) && existing.BodySize != imported.BodySize {
+		return true
+	}
+	if existing.Status != "" && imported.Status != "" && existing.Status != imported.Status {
+		return true
+	}
+	return existing.ErrorCode != "" && imported.ErrorCode != "" && existing.ErrorCode != imported.ErrorCode
 }
 
 func (r *RemoteJournal) ForgetPortableClaim(replyID string) {

@@ -710,15 +710,27 @@ func (r applicationImportResolver) ResolveWaitReference(ctx context.Context, _ c
 		if projectionErr != nil || !portableAuthorityEqual(receipt, projected) {
 			return "", &cli.Error{Code: "message_identity_conflict", Message: "portable receipt conflicts with durable operation identity", Effect: "rejected", Exit: cli.ExitRejected}
 		}
-		if claim, ok, claimErr := portableReplyClaim(stored, service.Operation{MessageID: stored.Message.MessageID, ReplyRoute: stored.Source.Resolved, CustodyRoute: routes.custody.ID, CustodyStoreID: routes.custodyStore}); claimErr != nil {
+		storedOperation := portableOperation(stored, routes)
+		importedClaim, importedHasClaim, importedClaimErr := portableReplyClaim(receipt, storedOperation)
+		if importedClaimErr != nil {
+			return "", importedClaimErr
+		}
+		if storedClaim, storedHasClaim, claimErr := portableReplyClaim(stored, storedOperation); claimErr != nil {
 			return "", claimErr
-		} else if ok && r.remote != nil && routes.custody.Route.Kind == endpoint.RouteSSH {
-			op := portableOperation(stored, routes)
-			if err := r.remote.ImportPortableClaim(ctx, op, claim, stored.State); err != nil {
-				return "", portableControlError(err)
+		} else if importedHasClaim && storedHasClaim && importedClaim.ReplyID != storedClaim.ReplyID {
+			return "", &cli.Error{Code: "message_identity_conflict", Message: "portable reply evidence conflicts with durable original winner", Effect: "rejected", Exit: cli.ExitRejected}
+		} else if r.remote != nil && routes.custody.Route.Kind == endpoint.RouteSSH {
+			status, statusErr := r.remote.OriginalStatus(ctx, storedOperation)
+			if statusErr != nil {
+				return "", portableControlError(statusErr)
 			}
-			if err := r.remote.PersistPortableClaim(ctx, op, claim.ReplyID); err != nil {
-				return "", portableControlError(err)
+			if status.Selection != "pending" {
+				if (storedHasClaim && !portableClaimMatchesStatus(storedClaim, status)) || (importedHasClaim && !portableClaimMatchesStatus(importedClaim, status)) {
+					return "", &cli.Error{Code: "message_identity_conflict", Message: "portable reply evidence conflicts with authoritative original status", Effect: "rejected", Exit: cli.ExitRejected}
+				}
+				if err := r.remote.PersistOriginalStatus(ctx, storedOperation, status); err != nil {
+					return "", portableControlError(err)
+				}
 			}
 		}
 		return stored.OperationID, nil
@@ -730,45 +742,46 @@ func (r applicationImportResolver) ResolveWaitReference(ctx context.Context, _ c
 	if claimErr != nil {
 		return "", claimErr
 	}
-	if hasClaim {
-		if r.remote == nil {
-			return "", portableRouteError(errors.New("portable custody control is unavailable"))
-		}
-		if err := r.remote.ImportPortableClaim(ctx, op, claim, receipt.State); err != nil {
-			return "", portableControlError(err)
-		}
-	} else {
-		if r.remote == nil || routes.custody.Route.Kind != endpoint.RouteSSH {
-			return "", portableRouteError(errors.New("portable custody originalStatus requires a mapped remote control endpoint"))
-		}
-		status, err := r.remote.OriginalStatus(ctx, op)
-		if err != nil {
-			return "", portableControlError(err)
-		}
-		projectionState := mektup.StateAccepted
-		if status.Selection == "pending" {
-			projectionState = mektup.StatePrepared
-		}
-		if err := r.ensurePortableOperation(ctx, op, projectionState); err != nil {
-			return "", err
-		}
-		if err := r.remote.PersistOriginalStatus(ctx, op, status); err != nil {
-			return "", portableControlError(err)
-		}
-		return op.OperationID, nil
+	if r.remote == nil || routes.custody.Route.Kind != endpoint.RouteSSH {
+		return "", portableRouteError(errors.New("portable custody originalStatus requires a mapped remote control endpoint"))
 	}
-	if err := r.ensurePortableOperation(ctx, op, receipt.State); err != nil {
-		if hasClaim && r.remote != nil {
-			r.remote.ForgetPortableClaim(claim.ReplyID)
-		}
+	// A reply ID carried by an export is evidence to cross-check, never a
+	// selector. The custody owner chooses the first committed original-scoped
+	// winner, including when the export names a later reply.
+	status, err := r.remote.OriginalStatus(ctx, op)
+	if err != nil {
+		return "", portableControlError(err)
+	}
+	if hasClaim && !portableClaimMatchesStatus(claim, status) && status.Selection != "pending" {
+		return "", &cli.Error{Code: "message_identity_conflict", Message: "portable reply evidence conflicts with authoritative original status", Effect: "rejected", Exit: cli.ExitRejected}
+	}
+	projectionState := mektup.StateAccepted
+	if status.Selection == "pending" {
+		projectionState = mektup.StatePrepared
+	}
+	if err := r.ensurePortableOperation(ctx, op, projectionState); err != nil {
 		return "", err
 	}
-	if hasClaim && r.remote != nil {
-		if err := r.remote.PersistPortableClaim(ctx, op, claim.ReplyID); err != nil {
-			return "", portableControlError(err)
-		}
+	if err := r.remote.PersistOriginalStatus(ctx, op, status); err != nil {
+		return "", portableControlError(err)
 	}
 	return op.OperationID, nil
+}
+
+func portableClaimMatchesStatus(claim service.ReplyClaimInput, status service.OriginalStatusResult) bool {
+	if claim.ReplyID != status.ReplyID {
+		return false
+	}
+	if claim.Status != "" && claim.Status != status.Status {
+		return false
+	}
+	if claim.Digest != "" && claim.Digest != status.Digest {
+		return false
+	}
+	if (claim.BodySizeKnown || claim.BodySize != 0) && claim.BodySize != status.BodySize {
+		return false
+	}
+	return claim.ErrorCode == "" || claim.ErrorCode == status.ErrorCode
 }
 
 type portableRoutes struct {
