@@ -7,6 +7,7 @@
 package application
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -25,11 +26,16 @@ import (
 	"github.com/agensfield/mektup/go/internal/cli"
 	"github.com/agensfield/mektup/go/internal/codexapi"
 	"github.com/agensfield/mektup/go/internal/connection"
+	"github.com/agensfield/mektup/go/internal/controlreceiver"
 	"github.com/agensfield/mektup/go/internal/doctor"
 	"github.com/agensfield/mektup/go/internal/endpoint"
 	"github.com/agensfield/mektup/go/internal/executor"
 	"github.com/agensfield/mektup/go/internal/journal"
+	"github.com/agensfield/mektup/go/internal/messageexecutor"
 	"github.com/agensfield/mektup/go/internal/rawrpc"
+	"github.com/agensfield/mektup/go/internal/receipts"
+	"github.com/agensfield/mektup/go/internal/runtime"
+	"github.com/agensfield/mektup/go/internal/service"
 	"github.com/agensfield/mektup/go/internal/sshproxy"
 	"github.com/agensfield/mektup/go/internal/storage"
 	"modernc.org/sqlite"
@@ -47,9 +53,18 @@ type Options struct {
 	ArtifactDir  string
 	IdentityHome string
 
-	Connection connection.Options
-	SSHConfig  sshproxy.Config
-	SSHFactory sshproxy.ProcessFactory
+	Connection          connection.Options
+	SSHConfig           sshproxy.Config
+	SSHFactory          sshproxy.ProcessFactory
+	SessionFactory      runtime.SessionFactory
+	HerdrRunner         endpoint.CommandRunner
+	HerdrEndpointRunner endpoint.EndpointCommandRunner
+	Registry            controlreceiver.FileRegistry
+	CustodyStoreID      string
+	CurrentThreadID     string
+	AgentMode           bool
+	ThreadStateProbe    runtime.ThreadStateProbe
+	HumanGate           receipts.HumanGate
 
 	DialerForRoute func(endpoint.Route, bool) connection.ClientDialer
 }
@@ -70,6 +85,7 @@ func New(options Options) *Environment { return &Environment{options: options} }
 func NewEnvironment(options Options) *Environment { return New(options) }
 
 var _ cli.Executor = (*Environment)(nil)
+var _ cli.StreamingExecutor = (*Environment)(nil)
 
 // Execute opens only the resources needed by the production executor for this
 // invocation. No path is taken that starts a daemon.
@@ -99,7 +115,85 @@ func (e *Environment) Execute(ctx context.Context, inv cli.Invocation) (result c
 			}
 		}
 	}()
+	if resources.messaging != nil {
+		return resources.messaging.Execute(ctx, inv)
+	}
 	return executor.New(resources.Ports()).Execute(ctx, inv)
+}
+
+// ExecuteStream keeps the application resources alive while a messaging
+// acceptance callback emits before the correlated wait. Non-messaging
+// commands remain owned by the established executor.
+func (e *Environment) ExecuteStream(ctx context.Context, inv cli.Invocation, emit func(cli.ExecutionResult) error) error {
+	if !isMessaging(inv) {
+		result, err := e.Execute(ctx, inv)
+		if err != nil {
+			return err
+		}
+		result.Streaming = true
+		return emit(result)
+	}
+	if e == nil {
+		return &cli.Error{Code: "internal_error", Message: "application environment is closed", Effect: "not_sent", Exit: cli.ExitInternal}
+	}
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.closed {
+		return &cli.Error{Code: "internal_error", Message: "application environment is closed", Effect: "not_sent", Exit: cli.ExitInternal}
+	}
+	resources, err := e.openResources(ctx, inv)
+	if err != nil {
+		return err
+	}
+	if resources.messaging == nil {
+		_ = resources.Close()
+		return &cli.Error{Code: "internal_error", Message: "messaging executor was not composed", Effect: "not_sent", Exit: cli.ExitInternal}
+	}
+	closed := false
+	last := cli.ExecutionResult{}
+	closeResources := func(result cli.ExecutionResult) (cli.ExecutionResult, error) {
+		if closed {
+			return result, nil
+		}
+		closed = true
+		updated, closeErr := resources.CloseWithResult(ctx, result)
+		last = updated
+		return updated, closeErr
+	}
+	streamErr := resources.messaging.ExecuteStream(ctx, inv, func(result cli.ExecutionResult) error {
+		last = result
+		if executionResultTerminal(result) {
+			updated, _ := closeResources(result)
+			result = updated
+		}
+		return emit(result)
+	})
+	if !closed {
+		_, closeErr := closeResources(last)
+		if streamErr == nil && closeErr != nil {
+			streamErr = closeErr
+		}
+	}
+	return streamErr
+}
+
+func executionResultTerminal(result cli.ExecutionResult) bool {
+	if len(result.RawJSON) > 0 {
+		return true
+	}
+	for _, event := range result.Events {
+		encoded, err := json.Marshal(event.Machine)
+		if err != nil {
+			continue
+		}
+		var object map[string]any
+		if json.Unmarshal(encoded, &object) == nil {
+			if terminal, ok := object["terminal"].(bool); ok && terminal {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Close prevents future invocations. Resources are invocation-scoped and are
@@ -180,9 +274,11 @@ func (e *CleanupError) Unwrap() error {
 }
 
 type resources struct {
-	journal  *journal.Journal
-	artifact *artifact.Store
-	ports    resourcePorts
+	journal   *journal.Journal
+	artifact  *artifact.Store
+	pool      *runtime.ConnectionPool
+	messaging *messageexecutor.Executor
+	ports     resourcePorts
 }
 
 func (r *resources) Ports() executor.Ports { return r.ports.Ports }
@@ -197,6 +293,13 @@ func (r *resources) CloseWithResult(ctx context.Context, result cli.ExecutionRes
 		return result, nil
 	}
 	var joined error
+	if r.pool != nil {
+		if err := r.pool.Close(ctx); err != nil {
+			cleanupErr := &CleanupError{Resource: "runtime connection pool", Err: err}
+			result = preserveCleanupResult(result, cleanupErr)
+			joined = errors.Join(joined, cleanupErr)
+		}
+	}
 	if r.artifact != nil {
 		if err := r.artifact.Close(); err != nil {
 			cleanupErr := &CleanupError{Resource: "artifact store", Err: err}
@@ -304,10 +407,242 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 		ports.Receipts = receipts
 		ports.ReadReceipts = receipts
 	}
-	return &resources{journal: j, artifact: artifacts, ports: resourcePorts{Ports: ports}}, nil
+	var pool *runtime.ConnectionPool
+	var messaging *messageexecutor.Executor
+	if isMessaging(inv) {
+		if j == nil {
+			return nil, errors.New("messaging requires a writable local journal")
+		}
+		pool, messaging, err = e.composeMessaging(ctx, inv, j, store, artifacts, input)
+		if err != nil {
+			if artifacts != nil {
+				_ = artifacts.Close()
+			}
+			_ = j.Close()
+			return nil, err
+		}
+	}
+	return &resources{journal: j, artifact: artifacts, pool: pool, messaging: messaging, ports: resourcePorts{Ports: ports}}, nil
+}
+
+func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, j *journal.Journal, store endpoint.EndpointStore, artifacts *artifact.Store, input executor.ReaderInput) (*runtime.ConnectionPool, *messageexecutor.Executor, error) {
+	codexHome := firstNonEmpty(inv.Resolved.CodexHome, e.options.CodexHome)
+	stateProbe := e.options.ThreadStateProbe
+	herdr := endpoint.NewHerdrResolver(e.options.HerdrRunner)
+	herdr.EndpointRunner = e.options.HerdrEndpointRunner
+	sessionFactory := e.options.SessionFactory
+	if sessionFactory == nil {
+		sessionFactory = applicationSessionFactory{options: e.options.Connection, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute}
+	}
+	pool := runtime.NewConnectionPool(sessionFactory, func(id string) (endpoint.Endpoint, error) { return store.ResolveEndpointID(id, codexHome) })
+	if stateProbe == nil {
+		stateProbe = pool.ProbeThreadState
+	}
+	observe := &runtime.ObservationAdapter{Pool: pool}
+	resolverFor := func(operation cli.Invocation) runtime.ResolverAdapter {
+		current := firstNonEmpty(operation.Resolved.CurrentThreadID, e.options.CurrentThreadID)
+		custodyStore := firstNonEmpty(e.options.CustodyStoreID, j.StoreID())
+		return runtime.ResolverAdapter{Store: store, Herdr: herdr, EndpointOverride: operation.Resolved.Endpoint, CodexHome: codexHome, CurrentThreadID: current, ReplyTo: operation.Option("reply-to"), CustodyStoreID: custodyStore, StateProbe: stateProbe}
+	}
+	localJournal, err := runtime.NewJournalAdapter(j, nil)
+	if err != nil {
+		_ = pool.Close(ctx)
+		return nil, nil, err
+	}
+	localEndpoint, localErr := store.ResolveExistingEndpoint("local", codexHome)
+	if localErr != nil {
+		// ResolveSource will establish the local identity for operations that
+		// need it; the remote journal only needs this value to distinguish a
+		// local custody route from SSH custody.
+		localEndpoint = endpoint.Endpoint{}
+	}
+	remoteJournal := &service.RemoteJournal{Local: &localJournal, Endpoints: store, LocalEndpointID: localEndpoint.ID}
+	serviceFactory := func(serviceCtx context.Context, operation cli.Invocation) (messageexecutor.MessagingService, error) {
+		resolver := resolverFor(operation)
+		return &service.Service{Resolver: resolver, Delivery: &runtime.DeliveryAdapter{Pool: pool}, Journal: remoteJournal, Observe: observe}, nil
+	}
+	originalFactory := func(originalCtx context.Context, operation cli.Invocation) (service.OriginalResolver, error) {
+		resolver := resolverFor(operation)
+		source, err := resolver.ResolveSource(originalCtx, operation.Option("reply-to"))
+		if err != nil {
+			return nil, err
+		}
+		return runtime.OriginalResolver{Observe: observe, Target: service.ResolvedTarget{EndpointID: source.EndpointID, URI: source.URI, ThreadID: threadIDFromURI(source.URI), Loaded: true, Persistent: true}}, nil
+	}
+	prepareCustody := func(prepareCtx context.Context, operation cli.Invocation) error {
+		resolver := resolverFor(operation)
+		source, err := resolver.ResolveSource(prepareCtx, operation.Option("reply-to"))
+		if err != nil {
+			return &cli.Error{Code: "reply_route_required", Message: "reply custody source could not be established", Effect: "not_sent", Exit: cli.ExitUsage, Details: map[string]any{"cause": err.Error()}}
+		}
+		ep, err := store.ResolveEndpointID(source.EndpointID, codexHome)
+		if err != nil {
+			return &cli.Error{Code: "reply_route_unavailable", Message: "reply custody endpoint is unavailable", Effect: "not_sent", Exit: cli.ExitRejected, Details: map[string]any{"cause": err.Error()}}
+		}
+		if ep.Route.Kind != endpoint.RouteUnix {
+			return nil
+		}
+		registry := e.options.Registry
+		if registry.Path == "" {
+			registry, err = controlreceiver.NewDefaultRegistry()
+			if err != nil {
+				return err
+			}
+		}
+		if err := controlreceiver.RegisterLocalJournal(prepareCtx, registry, store, codexHome, source.EndpointID, j); err != nil {
+			return &cli.Error{Code: "reply_route_unavailable", Message: "local reply custody registration failed", Effect: "not_sent", Exit: cli.ExitRejected, Details: map[string]any{"cause": err.Error()}}
+		}
+		remoteJournal.LocalEndpointID = source.EndpointID
+		return nil
+	}
+	storeReceipts := receipts.Store{Journal: receiptJournal{Journal: j}}
+	historyFactory := func(context.Context, cli.Invocation, mektup.Receipt) (receipts.HistoryPort, error) {
+		return runtimeHistory{observe: observe}, nil
+	}
+	inspectorFactory := func(_ context.Context, operation cli.Invocation) (receipts.TargetInspector, error) {
+		return runtimeInspector{resolver: resolverFor(operation), observe: observe}, nil
+	}
+	var gateFactory messageexecutor.HumanGateFactory
+	if e.options.HumanGate != nil {
+		gateFactory = func(context.Context, cli.Invocation) (receipts.HumanGate, error) { return e.options.HumanGate, nil }
+	}
+	importResolver := applicationImportResolver{observe: observe, store: store, codexHome: codexHome, resolverFor: resolverFor}
+	return pool, messageexecutor.New(messageexecutor.Ports{Service: serviceFactory, Original: originalFactory, Receipts: &storeReceipts, Input: input, Artifacts: func(context.Context, cli.Invocation) (receipts.SpillWriter, error) {
+		if artifacts == nil {
+			return nil, nil
+		}
+		return artifactSpillWriter{store: artifacts}, nil
+	}, History: historyFactory, Inspector: inspectorFactory, HumanGate: gateFactory, ImportResolver: importResolver, PrepareCustody: prepareCustody}), nil
+}
+
+type receiptJournal struct{ *journal.Journal }
+
+type artifactSpillWriter struct{ store *artifact.Store }
+
+func (w artifactSpillWriter) WriteSpill(ctx context.Context, body []byte, digest string) (string, error) {
+	if w.store == nil {
+		return "", errors.New("application artifact store is unavailable")
+	}
+	name := "receipt-" + strings.TrimPrefix(digest, "sha256:")
+	receipt, err := w.store.Spill(ctx, name, bytes.NewReader(body), artifact.Options{MediaType: "text/plain", SensitiveOutputPossible: true})
+	if err != nil {
+		return "", err
+	}
+	return receipt.Path, nil
+}
+
+type applicationSessionFactory struct {
+	options        connection.Options
+	sshConfig      sshproxy.Config
+	sshFactory     sshproxy.ProcessFactory
+	dialerForRoute func(endpoint.Route, bool) connection.ClientDialer
+}
+
+func (f applicationSessionFactory) Open(ctx context.Context, ep endpoint.Endpoint) (runtime.Session, error) {
+	options := f.options
+	if f.dialerForRoute != nil {
+		options.ClientDialer = f.dialerForRoute(ep.Route, options.ExperimentalAPI)
+	} else if ep.Route.Kind == endpoint.RouteSSH {
+		config := f.sshConfig
+		if config.Host == "" {
+			config.Host = ep.Route.SSHHost
+		}
+		options.ClientDialer = connection.NewSSHClientDialer(config, f.sshFactory)
+	}
+	return (runtime.ConnectionFactory{Options: options}).Open(ctx, ep)
+}
+
+type runtimeHistory struct{ observe *runtime.ObservationAdapter }
+
+func (h runtimeHistory) FullHistory(ctx context.Context, endpointID, threadID string) ([]receipts.HistoryItem, error) {
+	items, err := h.observe.FullHistory(ctx, service.ResolvedTarget{EndpointID: endpointID, ThreadID: threadID, URI: "codex://pinned/thread/" + threadID, Loaded: true, Persistent: true})
+	if err != nil {
+		return nil, err
+	}
+	history := make([]receipts.HistoryItem, 0, len(items))
+	for _, item := range items {
+		envelope, parseErr := mektup.ParseEnvelopeString(item.Text)
+		if parseErr != nil {
+			continue
+		}
+		history = append(history, receipts.HistoryItem{EndpointID: endpointID, ThreadID: threadID, TurnID: item.TurnID, ItemID: item.NativeItemID, MessageID: envelope.MessageID, ClientMessageID: item.ClientMessageID, InReplyTo: envelope.InReplyTo, Body: []byte(envelope.Body), PayloadSHA256: envelope.PayloadSHA256})
+	}
+	return history, nil
+}
+
+type runtimeInspector struct {
+	resolver runtime.ResolverAdapter
+	observe  *runtime.ObservationAdapter
+}
+
+func (i runtimeInspector) Inspect(ctx context.Context, selector string) (receipts.TargetIdentity, error) {
+	target, err := i.resolver.Resolve(ctx, selector)
+	if err != nil {
+		return receipts.TargetIdentity{}, err
+	}
+	return receipts.TargetIdentity{EndpointID: target.EndpointID, ThreadID: target.ThreadID, Requested: selector, Resolved: target.URI, Loaded: target.Loaded, Status: "resolved"}, nil
+}
+
+type applicationImportResolver struct {
+	observe     *runtime.ObservationAdapter
+	store       endpoint.EndpointStore
+	codexHome   string
+	resolverFor func(cli.Invocation) runtime.ResolverAdapter
+}
+
+func (r applicationImportResolver) ResolveOriginal(ctx context.Context, inv cli.Invocation, imported receipts.Imported) (service.OriginalResolver, error) {
+	if !imported.Trusted && imported.Receipt.Message.MessageID == "" {
+		return nil, errors.New("portable receipt has no exact message identity")
+	}
+	identity := imported.Receipt.Target
+	if identity.EndpointID == "" || identity.ThreadID == "" || identity.Resolved == "" {
+		return nil, errors.New("portable receipt lacks an exact target route")
+	}
+	ep, err := r.store.ResolveEndpointID(identity.EndpointID, r.codexHome)
+	if err != nil {
+		return nil, fmt.Errorf("portable receipt endpoint is not locally established: %w", err)
+	}
+	address, err := mektup.ParseThreadURI(identity.Resolved)
+	if err != nil || address.ThreadID != identity.ThreadID {
+		return nil, errors.New("portable receipt target thread identity is inconsistent")
+	}
+	if address.Endpoint != ep.Alias {
+		mapped, mapErr := r.store.ResolveEndpoint(address.Endpoint, r.codexHome)
+		if mapErr != nil || mapped.ID != ep.ID {
+			return nil, errors.New("portable receipt target alias is not pinned to the configured endpoint")
+		}
+	}
+	return runtime.OriginalResolver{Observe: r.observe, Target: service.ResolvedTarget{EndpointID: ep.ID, ThreadID: identity.ThreadID, URI: identity.Resolved, Loaded: true, Persistent: true}}, nil
+}
+
+func (r applicationImportResolver) ResolveWaitReference(_ context.Context, _ cli.Invocation, imported receipts.Imported) (string, error) {
+	if imported.Receipt.OperationID == "" {
+		return "", errors.New("portable receipt lacks an operation identity")
+	}
+	return imported.Receipt.OperationID, nil
+}
+
+func threadIDFromURI(uri string) string {
+	parsed, err := mektup.ParseThreadURI(uri)
+	if err != nil {
+		return ""
+	}
+	return parsed.ThreadID
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func needsJournal(inv cli.Invocation) bool {
+	if isMessaging(inv) {
+		return true
+	}
 	switch inv.Command {
 	case "search", "rpc":
 		return true
@@ -324,7 +659,18 @@ func needsJournal(inv cli.Invocation) bool {
 	}
 }
 
-func needsArtifacts(inv cli.Invocation) bool { return inv.Command == "rpc" }
+func isMessaging(inv cli.Invocation) bool {
+	switch inv.Command {
+	case "send", "reply", "wait", "inspect", "receipt":
+		return true
+	default:
+		return false
+	}
+}
+
+func needsArtifacts(inv cli.Invocation) bool {
+	return inv.Command == "rpc" || isMessaging(inv) && inv.Command == "receipt" && len(inv.Position) > 0 && inv.Position[0] == "show" && hasOption(inv, "content")
+}
 
 func hasOption(inv cli.Invocation, name string) bool { return len(inv.Options[name]) != 0 }
 

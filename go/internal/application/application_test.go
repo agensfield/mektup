@@ -19,11 +19,14 @@ import (
 	mektup "github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/appserver"
 	"github.com/agensfield/mektup/go/internal/cli"
+	"github.com/agensfield/mektup/go/internal/codexapi"
 	"github.com/agensfield/mektup/go/internal/connection"
+	"github.com/agensfield/mektup/go/internal/controlreceiver"
 	"github.com/agensfield/mektup/go/internal/endpoint"
 	"github.com/agensfield/mektup/go/internal/executor"
 	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/rawrpc"
+	"github.com/agensfield/mektup/go/internal/runtime"
 	_ "modernc.org/sqlite"
 )
 
@@ -552,5 +555,51 @@ func TestReadFileBoundedSupportsExplicitAbsoluteParamsPath(t *testing.T) {
 	data, err := readFileBounded(context.Background(), path, 1024)
 	if err != nil || string(data) != `{"ok":true}` {
 		t.Fatalf("data=%s err=%v", data, err)
+	}
+}
+
+type messagingFakeSession struct{ endpointID string }
+
+func (s messagingFakeSession) EndpointID() string { return s.endpointID }
+func (messagingFakeSession) StartOrSteer(context.Context, string, string, string) (runtime.TurnResult, error) {
+	return runtime.TurnResult{TurnID: "turn_01999999-9999-7999-8999-999999999999", Evidence: "fake accepted"}, nil
+}
+func (messagingFakeSession) Resume(context.Context, string) error      { return nil }
+func (messagingFakeSession) Unsubscribe(context.Context, string) error { return nil }
+func (messagingFakeSession) History(context.Context, string) ([]codexapi.Turn, error) {
+	return nil, nil
+}
+func (messagingFakeSession) NextEvent(context.Context) (appserver.Event, error) {
+	return appserver.Event{}, io.EOF
+}
+func (messagingFakeSession) Detach(context.Context) error                       { return nil }
+func (messagingFakeSession) ThreadExists(context.Context, string) (bool, error) { return true, nil }
+
+func TestMessagingCompositionRegistersOnlyReplyCustody(t *testing.T) {
+	root := t.TempDir()
+	codexHome := filepath.Join(root, "codex")
+	if err := os.MkdirAll(filepath.Join(codexHome, "app-server-control"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "app-server-control", "app-server-control.sock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	registryPath := filepath.Join(root, "control-registry.json")
+	env := New(Options{CodexHome: codexHome, ConfigPath: filepath.Join(root, "endpoints.json"), StateDir: filepath.Join(root, "state"), IdentityHome: filepath.Join(root, "identity"), Registry: controlreceiver.FileRegistry{Path: registryPath}, CurrentThreadID: "source-thread", ThreadStateProbe: func(context.Context, string, string) (bool, bool, error) { return false, true, nil }, SessionFactory: runtime.SessionFactoryFunc(func(_ context.Context, ep endpoint.Endpoint) (runtime.Session, error) {
+		return messagingFakeSession{endpointID: ep.ID}, nil
+	})})
+	app := &cli.App{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}, Executor: env, Env: []string{"MEKTUP_AGENT=1", "CODEX_HOME=" + codexHome, "CODEX_THREAD_ID=source-thread", "MEKTUP_CONFIG=" + filepath.Join(root, "endpoints.json"), "MEKTUP_STATE_DIR=" + filepath.Join(root, "state")}}
+	target := "codex://local/thread/target-thread"
+	if code := app.Run([]string{"send", target, "one-way"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("one-way send exit=%d", code)
+	}
+	if _, err := os.Stat(registryPath); !os.IsNotExist(err) {
+		t.Fatalf("one-way send registered custody: %v", err)
+	}
+	if code := app.Run([]string{"send", target, "replyable", "--request-reply"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("reply-requesting send exit=%d", code)
+	}
+	if _, err := os.Stat(registryPath); err != nil {
+		t.Fatalf("reply-requesting send did not register custody: %v", err)
 	}
 }

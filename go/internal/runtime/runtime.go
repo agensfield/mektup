@@ -43,6 +43,10 @@ type itemHistorySession interface {
 	ItemsHistory(context.Context, string) ([]codexapi.ItemEntry, error)
 }
 
+type threadStateSession interface {
+	ThreadExists(context.Context, string) (bool, error)
+}
+
 // TurnResult is deliberately smaller than codexapi's response. The adapter
 // only needs the associated turn and raw acceptance evidence.
 type TurnResult struct {
@@ -151,6 +155,36 @@ func (p *ConnectionPool) session(ctx context.Context, target service.ResolvedTar
 		cancel()
 	}
 	return session, err
+}
+
+// ProbeThreadState proves persistence with an authoritative thread/read call.
+// Loaded is intentionally reported false because thread/read does not prove
+// in-memory hydration; callers therefore take the conservative resume path.
+func (p *ConnectionPool) ProbeThreadState(ctx context.Context, endpointID, threadID string) (bool, bool, error) {
+	if p == nil || p.Lookup == nil {
+		return false, false, errors.New("runtime: thread-state lookup is unavailable")
+	}
+	ep, err := p.Lookup(endpointID)
+	if err != nil {
+		return false, false, err
+	}
+	target := service.ResolvedTarget{EndpointID: endpointID, URI: codexURI(ep.Alias, threadID), ThreadID: threadID, Loaded: false, Persistent: true}
+	session, err := p.session(ctx, target)
+	if err != nil {
+		return false, false, err
+	}
+	reader, ok := session.(threadStateSession)
+	if !ok {
+		return false, false, errors.New("runtime: session cannot authoritatively probe thread state")
+	}
+	exists, err := reader.ThreadExists(ctx, threadID)
+	if err != nil {
+		return false, false, err
+	}
+	if !exists {
+		return false, false, errors.New("runtime: pinned thread does not exist")
+	}
+	return false, true, nil
 }
 
 func (p *ConnectionPool) openEndpoint(ctx context.Context, target service.ResolvedTarget) (Session, error) {
@@ -451,6 +485,11 @@ func (s *connectionSession) History(ctx context.Context, threadID string) ([]cod
 		return nil, err
 	}
 	return result.Data, nil
+}
+
+func (s *connectionSession) ThreadExists(ctx context.Context, threadID string) (bool, error) {
+	_, err := s.api.ThreadRead(ctx, codexapi.ThreadReadOptions{ThreadID: threadID})
+	return err == nil, err
 }
 
 func (s *connectionSession) ItemsHistory(ctx context.Context, threadID string) ([]codexapi.ItemEntry, error) {

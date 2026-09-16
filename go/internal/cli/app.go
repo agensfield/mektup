@@ -192,12 +192,15 @@ type Globals struct {
 // config/state files. Flags win over dedicated environment variables, then
 // built-in defaults are used.
 type ResolvedGlobals struct {
-	Output       Presentation
-	Endpoint     string
-	Config       string
-	StateDir     string
-	ConfigSource PathSource
-	StateSource  PathSource
+	Output          Presentation
+	Endpoint        string
+	Config          string
+	StateDir        string
+	ConfigSource    PathSource
+	StateSource     PathSource
+	CodexHome       string
+	CurrentThreadID string
+	AgentMode       bool
 }
 
 // PathSource records which input won path precedence. It is intentionally
@@ -284,7 +287,7 @@ func resolveGlobals(inv Invocation, env map[string]string) (Invocation, *Error) 
 	if err != nil {
 		return inv, normalizeError(err)
 	}
-	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, Config: config, StateDir: state, ConfigSource: configSource, StateSource: stateSource}
+	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, Config: config, StateDir: state, ConfigSource: configSource, StateSource: stateSource, CodexHome: strings.TrimSpace(env["CODEX_HOME"]), CurrentThreadID: strings.TrimSpace(env["CODEX_THREAD_ID"]), AgentMode: env["MEKTUP_AGENT"] == "1"}
 	return inv, nil
 }
 

@@ -38,7 +38,12 @@ func run(ctx context.Context, args []string, input io.Reader, output, errorOutpu
 	app.In = input
 	app.Out = output
 	app.Err = errorOutput
-	environment := application.New(application.Options{Input: input})
+	environment := application.New(application.Options{
+		Input:           input,
+		CodexHome:       os.Getenv("CODEX_HOME"),
+		CurrentThreadID: os.Getenv("CODEX_THREAD_ID"),
+		AgentMode:       os.Getenv("MEKTUP_AGENT") == "1",
+	})
 	app.Executor = environment
 	code := app.RunContext(ctx, args)
 	if err := environment.Close(); err != nil {

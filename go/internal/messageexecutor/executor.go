@@ -46,6 +46,7 @@ type ReceiptImportResolver interface {
 	ResolveOriginal(context.Context, cli.Invocation, receipts.Imported) (service.OriginalResolver, error)
 	ResolveWaitReference(context.Context, cli.Invocation, receipts.Imported) (string, error)
 }
+type CustodyPreparer func(context.Context, cli.Invocation) error
 
 type ReceiptStore interface {
 	List(context.Context, receipts.ListOptions) ([]mektup.Receipt, error)
@@ -66,6 +67,7 @@ type Ports struct {
 	Inspector      InspectorFactory
 	HumanGate      HumanGateFactory
 	ImportResolver ReceiptImportResolver
+	PrepareCustody CustodyPreparer
 	Actor          string
 }
 
@@ -259,6 +261,11 @@ func (e *Executor) sendInvocation(ctx context.Context, inv cli.Invocation) (Mess
 	if err != nil {
 		return nil, service.SendRequest{}, err
 	}
+	if request.RequestReply && e.ports.PrepareCustody != nil {
+		if err := e.ports.PrepareCustody(ctx, inv); err != nil {
+			return nil, service.SendRequest{}, err
+		}
+	}
 	svc, err := e.service(ctx, inv)
 	if err != nil {
 		return nil, service.SendRequest{}, err
@@ -296,6 +303,11 @@ func (e *Executor) replyInvocation(ctx context.Context, inv cli.Invocation) (Mes
 	request.WaitTimeout, err = duration(inv, "wait-timeout")
 	if err != nil {
 		return nil, nil, service.ReplyRequest{}, err
+	}
+	if request.Wait && e.ports.PrepareCustody != nil {
+		if err := e.ports.PrepareCustody(ctx, inv); err != nil {
+			return nil, nil, service.ReplyRequest{}, err
+		}
 	}
 	svc, err := e.service(ctx, inv)
 	if err != nil {
