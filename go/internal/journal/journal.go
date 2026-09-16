@@ -540,6 +540,24 @@ func migrateV1ToV4(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration)
 }
 
 func rebuildV1CoreTables(ctx context.Context, tx *sql.Tx) error {
+	hasWinners, err := migrationTableExists(ctx, tx, "reply_winners")
+	if err != nil {
+		return err
+	}
+	hasObservations, err := migrationTableExists(ctx, tx, "observations")
+	if err != nil {
+		return err
+	}
+	if hasObservations {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE observations RENAME TO observations_v1_legacy`); err != nil {
+			return fmt.Errorf("journal migration v1 constraints: %w", err)
+		}
+	}
+	if hasWinners {
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE reply_winners RENAME TO reply_winners_v1_legacy`); err != nil {
+			return fmt.Errorf("journal migration v1 constraints: %w", err)
+		}
+	}
 	for _, stmt := range []string{
 		`ALTER TABLE attempts RENAME TO attempts_v1_legacy`,
 		`ALTER TABLE reply_claims RENAME TO reply_claims_v1_legacy`,
@@ -567,22 +585,58 @@ func rebuildV1CoreTables(ctx context.Context, tx *sql.Tx) error {
  accepted_at INTEGER, commit_seq INTEGER, error_code TEXT NOT NULL DEFAULT '',
  UNIQUE(reply_id, original_id)
 )`,
+		`CREATE TABLE reply_winners (
+ original_id TEXT PRIMARY KEY, reply_id TEXT NOT NULL REFERENCES reply_claims(reply_id),
+ committed_at INTEGER NOT NULL, commit_seq INTEGER NOT NULL
+)`,
+		`CREATE TABLE observations (
+ reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE,
+ native_item_id TEXT NOT NULL, observed_at INTEGER NOT NULL, digest TEXT NOT NULL
+)`,
 		`INSERT INTO operations(operation_id,message_id,source_route,target_route,semantics,reply_route,custody_route,custody_store_id,digest,body_size,state,created_at,updated_at,dispatch_started_at,terminal_at,error_code)
  SELECT operation_id,message_id,source_route,target_route,semantics,reply_route,custody_route,custody_store_id,digest,body_size,state,created_at,updated_at,dispatch_started_at,terminal_at,error_code FROM operations_v1_legacy`,
 		`INSERT INTO attempts(operation_id,state,created_at,updated_at,owner,token,lease_until)
  SELECT operation_id,state,created_at,updated_at,owner,token,lease_until FROM attempts_v1_legacy`,
 		`INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,accepted_at,commit_seq,error_code)
  SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,accepted_at,commit_seq,error_code FROM reply_claims_v1_legacy`,
-		`DROP TABLE attempts_v1_legacy`,
-		`DROP TABLE reply_claims_v1_legacy`,
-		`DROP TABLE operations_v1_legacy`,
-		`CREATE INDEX IF NOT EXISTS reply_claims_original ON reply_claims(original_id)`,
 	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("journal migration v1 constraints: %w", err)
 		}
 	}
+	if hasWinners {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO reply_winners(original_id,reply_id,committed_at,commit_seq) SELECT original_id,reply_id,committed_at,commit_seq FROM reply_winners_v1_legacy`); err != nil {
+			return fmt.Errorf("journal migration v1 constraints: %w", err)
+		}
+	}
+	if hasObservations {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO observations(reply_id,native_item_id,observed_at,digest) SELECT reply_id,native_item_id,observed_at,digest FROM observations_v1_legacy`); err != nil {
+			return fmt.Errorf("journal migration v1 constraints: %w", err)
+		}
+	}
+	for _, item := range []struct {
+		present bool
+		name    string
+	}{{hasObservations, "observations_v1_legacy"}, {hasWinners, "reply_winners_v1_legacy"}, {true, "attempts_v1_legacy"}, {true, "reply_claims_v1_legacy"}, {true, "operations_v1_legacy"}} {
+		if !item.present {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, "DROP TABLE "+item.name); err != nil {
+			return fmt.Errorf("journal migration v1 constraints: %w", err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS reply_claims_original ON reply_claims(original_id)`); err != nil {
+		return fmt.Errorf("journal migration v1 constraints: %w", err)
+	}
 	return nil
+}
+
+func migrationTableExists(ctx context.Context, tx *sql.Tx, name string) (bool, error) {
+	var count int
+	if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", name).Scan(&count); err != nil {
+		return false, fmt.Errorf("journal migration v1 constraints: %w", err)
+	}
+	return count == 1, nil
 }
 
 func migrateV2ToV4(ctx context.Context, tx *sql.Tx) error {

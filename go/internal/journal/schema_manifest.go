@@ -270,15 +270,19 @@ func extractCheckExpressions(sqlText string) map[string]struct{} {
 	checks := make(map[string]struct{})
 	lower := strings.ToLower(sqlText)
 	for offset := 0; offset < len(lower); {
-		relative := strings.Index(lower[offset:], "check")
-		if relative < 0 {
-			break
-		}
-		start := offset + relative
-		offset = start + len("check")
-		if start > 0 && isSchemaIdentifierByte(lower[start-1]) || offset < len(lower) && isSchemaIdentifierByte(lower[offset]) {
+		if next, ok := skipSchemaComment(sqlText, offset); ok {
+			offset = next
 			continue
 		}
+		if isSchemaQuote(sqlText[offset]) {
+			offset = skipSchemaQuoted(sqlText, offset)
+			continue
+		}
+		if !strings.HasPrefix(lower[offset:], "check") || offset > 0 && isSchemaIdentifierByte(lower[offset-1]) || offset+len("check") < len(lower) && isSchemaIdentifierByte(lower[offset+len("check")]) {
+			offset++
+			continue
+		}
+		offset += len("check")
 		for offset < len(lower) && (lower[offset] == ' ' || lower[offset] == '\t' || lower[offset] == '\r' || lower[offset] == '\n') {
 			offset++
 		}
@@ -287,25 +291,22 @@ func extractCheckExpressions(sqlText string) map[string]struct{} {
 		}
 		expressionStart := offset + 1
 		depth := 1
-		quoted := false
 		for offset++; offset < len(sqlText) && depth > 0; offset++ {
+			if next, ok := skipSchemaComment(sqlText, offset); ok {
+				offset = next - 1
+				continue
+			}
+			if isSchemaQuote(sqlText[offset]) {
+				offset = skipSchemaQuoted(sqlText, offset) - 1
+				continue
+			}
 			switch sqlText[offset] {
-			case '\'':
-				if quoted && offset+1 < len(sqlText) && sqlText[offset+1] == '\'' {
-					offset++
-					continue
-				}
-				quoted = !quoted
 			case '(':
-				if !quoted {
-					depth++
-				}
+				depth++
 			case ')':
-				if !quoted {
-					depth--
-					if depth == 0 {
-						checks[normalizeCheckExpression(sqlText[expressionStart:offset])] = struct{}{}
-					}
+				depth--
+				if depth == 0 {
+					checks[normalizeCheckExpression(sqlText[expressionStart:offset])] = struct{}{}
 				}
 			}
 		}
@@ -314,7 +315,81 @@ func extractCheckExpressions(sqlText string) map[string]struct{} {
 }
 
 func normalizeCheckExpression(value string) string {
-	return strings.ToLower(strings.Join(strings.Fields(value), ""))
+	var normalized strings.Builder
+	for offset := 0; offset < len(value); {
+		if next, ok := skipSchemaComment(value, offset); ok {
+			offset = next
+			continue
+		}
+		if isSchemaQuote(value[offset]) {
+			next := skipSchemaQuoted(value, offset)
+			normalized.WriteString(value[offset:next])
+			offset = next
+			continue
+		}
+		if value[offset] == ' ' || value[offset] == '\t' || value[offset] == '\r' || value[offset] == '\n' {
+			offset++
+			continue
+		}
+		c := value[offset]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		normalized.WriteByte(c)
+		offset++
+	}
+	return normalized.String()
+}
+
+func skipSchemaComment(value string, offset int) (int, bool) {
+	if offset+1 >= len(value) {
+		return offset, false
+	}
+	if value[offset] == '-' && value[offset+1] == '-' {
+		offset += 2
+		for offset < len(value) && value[offset] != '\n' {
+			offset++
+		}
+		return offset, true
+	}
+	if value[offset] == '/' && value[offset+1] == '*' {
+		offset += 2
+		for offset+1 < len(value) && !(value[offset] == '*' && value[offset+1] == '/') {
+			offset++
+		}
+		if offset+1 < len(value) {
+			offset += 2
+		} else {
+			offset = len(value)
+		}
+		return offset, true
+	}
+	return offset, false
+}
+
+func isSchemaQuote(value byte) bool {
+	return value == '\'' || value == '"' || value == '`' || value == '['
+}
+
+func skipSchemaQuoted(value string, offset int) int {
+	open := value[offset]
+	close := open
+	if open == '[' {
+		close = ']'
+	}
+	offset++
+	for offset < len(value) {
+		if value[offset] != close {
+			offset++
+			continue
+		}
+		if open != '[' && offset+1 < len(value) && value[offset+1] == close {
+			offset += 2
+			continue
+		}
+		return offset + 1
+	}
+	return len(value)
 }
 
 func isSchemaIdentifierByte(value byte) bool {
