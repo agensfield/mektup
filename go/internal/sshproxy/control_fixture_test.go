@@ -95,6 +95,44 @@ func TestControlClaimResultLeaseTimestampsAreStrict(t *testing.T) {
 	}
 }
 
+func TestControlObserveIsTokenlessNativeEvidence(t *testing.T) {
+	valid := []byte(`{"schema":"mektup/control/v1","kind":"request","operation":"observe","operationId":"op_0198f0e0-0000-7000-8000-000000000025","replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007","originalMessageId":"msg_0198f0e0-0000-7000-8000-000000000003","custody":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","storeId":"store_0198f0e0-0000-7000-8000-000000000002"},"replyDestination":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","threadId":"thread-local-001","uri":"codex://local/thread/thread-local-001"},"bodyBytes":15,"bodySha256":"sha256:914b169093c4dd7ec24080529845bb0660de553a835a200852e86c145470967f","replyStatus":"success","nativeItemId":"item-reply-001"}`)
+	if _, err := ValidateControlRequest(valid); err != nil {
+		t.Fatalf("valid observe rejected: %v", err)
+	}
+	for name, mutation := range map[string]struct {
+		field string
+		value any
+	}{
+		"missing nativeItemId": {field: "nativeItemId"},
+		"empty nativeItemId":   {field: "nativeItemId", value: ""},
+		"wrong nativeItemId":   {field: "nativeItemId", value: 42},
+		"fencingToken":         {field: "fencingToken", value: "fence-01"},
+		"lease":                {field: "lease", value: map[string]any{"expiresAt": "2026-09-15T03:00:31.900000Z"}},
+		"requestedLease":       {field: "requestedLease", value: map[string]any{"durationMs": 1000}},
+		"attemptOwner":         {field: "attemptOwner", value: "owner"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var raw map[string]any
+			if err := json.Unmarshal(valid, &raw); err != nil {
+				t.Fatal(err)
+			}
+			if name == "missing nativeItemId" {
+				delete(raw, mutation.field)
+			} else {
+				raw[mutation.field] = mutation.value
+			}
+			data, err := json.Marshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ValidateControlRequest(data); !errors.Is(err, ErrControlValidation) {
+				t.Fatalf("invalid observe shape accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestControlKnownFieldPresenceAndResultShapes(t *testing.T) {
 	for _, test := range []struct {
 		name   string

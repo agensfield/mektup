@@ -2,14 +2,14 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://agensfield.dev/mektup/contracts/control-v1.schema.json",
   "title": "Mektup custody control document v1",
-  "description": "Mektup specification revision 1.0.3 metadata-only stdin protocol for the fenced reply custody receiver. A claim request cannot choose a fencing token or current lease; a claim result uses an explicit claimed|existing union. Heartbeat, commit, and abandon requests must present the issued values. Receipt identity is optional because operation plus original/reply message identity is the custody authority. This protocol never carries a local path, executable path, shell fragment, or reply body.",
+  "description": "Mektup specification revision 1.0.4 metadata-only stdin protocol for fenced custody claim, observation, and reconciliation. Observe is tokenless native-item evidence and never carries dispatch authority. A claim request cannot choose a fencing token or current lease; a claim result uses an explicit claimed|existing union. Heartbeat, commit, and abandon requests must present the issued values. Receipt identity is optional because operation plus original/reply message identity is the custody authority. This protocol never carries a local path, executable path, shell fragment, or reply body.",
   "type": "object",
   "required": ["schema", "kind", "operation", "operationId", "replyMessageId", "originalMessageId", "custody", "replyDestination"],
   "properties": {
     "schema": { "const": "mektup/control/v1" },
     "kind": { "enum": ["request", "result"] },
     "operation": {
-      "enum": ["claim", "heartbeat", "commit", "abandon", "status", "reconcile"]
+      "enum": ["claim", "heartbeat", "commit", "abandon", "status", "reconcile", "observe"]
     },
     "operationId": { "$ref": "common-v1.schema.json#/$defs/operationId" },
     "receiptId": { "$ref": "common-v1.schema.json#/$defs/receiptId" },
@@ -59,6 +59,7 @@
     },
     "attemptOwner": { "type": "string", "minLength": 1 },
     "requestedAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+    "nativeItemId": { "type": "string", "minLength": 1 },
     "result": {
       "type": "object",
       "properties": {
@@ -92,6 +93,26 @@
       },
       "then": {
         "required": ["bodyBytes", "bodySha256", "replyStatus", "attemptOwner"]
+      }
+    },
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "request" },
+          "operation": { "const": "observe" }
+        }
+      },
+      "then": {
+        "required": ["nativeItemId"],
+        "not": {
+          "anyOf": [
+            { "required": ["fencingToken"] },
+            { "required": ["lease"] },
+            { "required": ["requestedLease"] },
+            { "required": ["attemptOwner"] }
+          ]
+        }
       }
     },
     {
@@ -165,6 +186,32 @@
                 }
               }
             ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "result" },
+          "operation": { "const": "observe" }
+        }
+      },
+      "then": {
+        "required": ["result"],
+        "not": {
+          "anyOf": [
+            { "required": ["fencingToken"] },
+            { "required": ["lease"] },
+            { "required": ["requestedLease"] },
+            { "required": ["attemptOwner"] }
+          ]
+        },
+        "properties": {
+          "result": {
+            "required": ["state"],
+            "not": { "anyOf": [{ "required": ["fencingToken"] }, { "required": ["lease"] }] }
           }
         }
       }

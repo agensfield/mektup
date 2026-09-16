@@ -596,7 +596,7 @@ func validateControlFixture(data []byte) error {
 	if err != nil {
 		return err
 	}
-	if op != "claim" && op != "heartbeat" && op != "commit" && op != "abandon" && op != "status" && op != "reconcile" {
+	if op != "claim" && op != "heartbeat" && op != "commit" && op != "abandon" && op != "status" && op != "reconcile" && op != "observe" {
 		return fmt.Errorf("invalid control operation %q", op)
 	}
 	for _, item := range []struct{ name, prefix string }{{"operationId", mektup.OperationIDPrefix}, {"replyMessageId", mektup.MessageIDPrefix}, {"originalMessageId", mektup.MessageIDPrefix}} {
@@ -643,6 +643,17 @@ func validateControlFixture(data []byte) error {
 		}
 		if _, has := value["result"]; has {
 			return errors.New("claim request cannot carry result")
+		}
+	}
+	if kind == "request" && op == "observe" {
+		native, ok := value["nativeItemId"].(string)
+		if !ok || native == "" {
+			return errors.New("observe requires nativeItemId")
+		}
+		for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner"} {
+			if _, present := value[field]; present {
+				return fmt.Errorf("observe forbids %s", field)
+			}
 		}
 	}
 	if kind == "request" && (op == "heartbeat" || op == "commit" || op == "abandon") {
@@ -717,31 +728,70 @@ func validateControlFixture(data []byte) error {
 				}
 			}
 		}
+		if op == "observe" {
+			state, ok := result["state"].(string)
+			if !ok || !mektup.EvidenceState(state).Valid() {
+				return errors.New("observe result requires valid state")
+			}
+			for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner"} {
+				if _, present := value[field]; present {
+					return fmt.Errorf("observe result forbids %s", field)
+				}
+			}
+			for _, field := range []string{"fencingToken", "lease"} {
+				if _, present := result[field]; present {
+					return fmt.Errorf("observe result forbids %s", field)
+				}
+			}
+		}
 	}
-	if kind == "request" && (op == "claim" || op == "heartbeat" || op == "commit" || op == "abandon") {
-		if n, ok := value["bodyBytes"].(float64); !ok || n < 0 {
+	if kind == "request" && (op == "claim" || op == "heartbeat" || op == "commit" || op == "abandon" || op == "observe") {
+		_, bodyBytesPresent := value["bodyBytes"]
+		if bodyBytesPresent {
+			if n, ok := value["bodyBytes"].(float64); !ok || n < 0 || n != float64(uint64(n)) {
+				return errors.New("bodyBytes must be a nonnegative integer")
+			}
+		} else if op != "observe" {
 			return errors.New("bodyBytes is required")
 		}
-		body, ok := value["bodySha256"].(string)
-		if !ok || !validDigest(body) {
+		if body, present := value["bodySha256"]; present {
+			text, ok := body.(string)
+			if !ok || !validDigest(text) {
+				return errors.New("bodySha256 is invalid")
+			}
+		} else if op != "observe" {
 			return errors.New("bodySha256 is required")
 		}
-		if status, ok := value["replyStatus"].(string); !ok || (status != "success" && status != "error") {
+		if status, present := value["replyStatus"]; present {
+			text, ok := status.(string)
+			if !ok || (text != "success" && text != "error") {
+				return errors.New("replyStatus is invalid")
+			}
+		} else if op != "observe" {
 			return errors.New("replyStatus is required")
 		}
-		if owner, ok := value["attemptOwner"].(string); !ok || owner == "" {
+		if owner, present := value["attemptOwner"]; present && op != "observe" {
+			if text, ok := owner.(string); !ok || text == "" {
+				return errors.New("attemptOwner is invalid")
+			}
+		} else if op != "observe" {
 			return errors.New("attemptOwner is required")
+		}
+		if errorCode, present := value["replyErrorCode"]; present {
+			if text, ok := errorCode.(string); !ok || text == "" {
+				return errors.New("replyErrorCode is invalid")
+			}
 		}
 	}
 	return nil
 }
 
 func validateScenarioDocuments(s scenariosDocument, t transitionsDocument) error {
-	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.3" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
+	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.4" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
 		return errors.New("scenarios document metadata is incomplete")
 	}
-	if t.SpecVersion != "1.0.3" {
-		return errors.New("transitions document spec revision is not 1.0.3")
+	if t.SpecVersion != "1.0.4" {
+		return errors.New("transitions document spec revision is not 1.0.4")
 	}
 	states := map[string]bool{"none": true}
 	for _, state := range t.States {
@@ -833,7 +883,7 @@ func validateProfile(p profile, byEvent map[string]transition) error {
 
 func expectedExit(p profile) int {
 	switch p.Terminal.Event {
-	case "send.accepted", "reply.accepted", "thread.read.completed":
+	case "send.accepted", "reply.accepted", "reply.observed", "thread.read.completed":
 		return mektup.ExitSuccess
 	case "operation.rejected":
 		return int(cli.ExitCodeForError(string(mektup.ErrDeliveryRejected)))

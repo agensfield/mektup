@@ -1,6 +1,6 @@
-# Mektup v1 language-neutral contracts (spec revision 1.0.3)
+# Mektup v1 language-neutral contracts (spec revision 1.0.4)
 
-The locked product specification revision is 1.0.3. The wire schema identifiers
+The locked product specification revision is 1.0.4. The wire schema identifiers
 remain versioned as `.../v1`; the revision is contract metadata, not a new wire
 schema family.
 
@@ -24,7 +24,9 @@ routes, with an optional requested lease duration. The authoritative receiver
 returns an explicit claim result union: `disposition: claimed` includes the
 current fencing token and lease, while `disposition: existing` includes state
 and optional non-authority status/winner metadata and forbids both token and
-lease. Heartbeat, commit, and abandon must present both values. `receiptId` is optional on
+lease. Heartbeat, commit, and abandon must present both values. The `observe`
+operation carries exact native item evidence without dispatch authority and
+returns tokenless state/status/winner metadata. `receiptId` is optional on
 control documents, including status/reconcile, because custody authority is the
 operation plus original/reply message identity rather than a local receipt
 handle.

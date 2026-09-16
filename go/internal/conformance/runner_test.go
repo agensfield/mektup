@@ -17,7 +17,7 @@ func TestRunFromRepositoryAndEmitDeterministicEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(summary.Fixtures) != 29 || len(summary.Scenarios) != 110 {
+	if len(summary.Fixtures) != 49 || len(summary.Scenarios) != 117 {
 		t.Fatalf("unexpected coverage: fixtures=%d scenarios=%d", len(summary.Fixtures), len(summary.Scenarios))
 	}
 	seen := make(map[string]bool, len(summary.Scenarios))
@@ -33,7 +33,7 @@ func TestRunFromRepositoryAndEmitDeterministicEvidence(t *testing.T) {
 		"endpoint.remote-control-cannot-rewrite-mapping",
 	} {
 		if !seen[id] {
-			t.Fatalf("missing spec 1.0.3 scenario %q", id)
+			t.Fatalf("missing spec 1.0.4 scenario %q", id)
 		}
 	}
 	var first, second bytes.Buffer
@@ -218,7 +218,7 @@ func TestManifestAndScenarioDecodeUnknownAdditiveFields(t *testing.T) {
 	if err := json.Unmarshal(augmented, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Schema != "mektup/conformance/v1/scenarios" || decoded.SpecVersion != "1.0.3" || len(decoded.Scenarios) != 110 {
+	if decoded.Schema != "mektup/conformance/v1/scenarios" || decoded.SpecVersion != "1.0.4" || len(decoded.Scenarios) != 117 {
 		t.Fatalf("additive scenario field changed stable content: %#v", decoded.Schema)
 	}
 }

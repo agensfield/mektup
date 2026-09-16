@@ -36,6 +36,7 @@ type ControlRequest struct {
 	Lease             *Lease          `json:"lease,omitempty"`
 	AttemptOwner      string          `json:"attemptOwner,omitempty"`
 	RequestedAt       string          `json:"requestedAt,omitempty"`
+	NativeItemID      string          `json:"nativeItemId,omitempty"`
 	Result            json.RawMessage `json:"result,omitempty"`
 }
 
@@ -106,6 +107,13 @@ func ValidateControlRequest(data []byte) (ControlRequest, error) {
 			}
 		}
 	}
+	if req.Operation == "observe" {
+		for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner"} {
+			if _, present := raw[field]; present {
+				return ControlRequest{}, fmt.Errorf("%w: observe cannot contain %s, including null", ErrControlValidation, field)
+			}
+		}
+	}
 	if req.Kind == "request" && (req.Operation == "heartbeat" || req.Operation == "commit" || req.Operation == "abandon") {
 		if _, present := raw["requestedLease"]; present {
 			return ControlRequest{}, fmt.Errorf("%w: %s cannot contain requestedLease, including null", ErrControlValidation, req.Operation)
@@ -130,7 +138,7 @@ func validateKnownFields(raw map[string]json.RawMessage) error {
 		{"kind", func(v string) bool { return v == "request" || v == "result" }},
 		{"operation", func(v string) bool {
 			switch v {
-			case "claim", "heartbeat", "commit", "abandon", "status", "reconcile":
+			case "claim", "heartbeat", "commit", "abandon", "status", "reconcile", "observe":
 				return true
 			}
 			return false
@@ -145,6 +153,7 @@ func validateKnownFields(raw map[string]json.RawMessage) error {
 		{"fencingToken", func(v string) bool { return v != "" }},
 		{"attemptOwner", func(v string) bool { return v != "" }},
 		{"requestedAt", validTimestamp},
+		{"nativeItemId", func(v string) bool { return v != "" }},
 	}
 	for _, item := range stringChecks {
 		if value, present := raw[item.field]; present {
@@ -324,11 +333,11 @@ func (r ControlRequest) Validate() error {
 	if r.ReplyStatus != "" && r.ReplyStatus != "success" && r.ReplyStatus != "error" {
 		return fmt.Errorf("%w: invalid reply status", ErrControlValidation)
 	}
-	if r.Operation != "claim" && r.Operation != "status" && r.Operation != "reconcile" && r.RequestedLease != nil {
+	if r.Operation != "claim" && r.Operation != "status" && r.Operation != "reconcile" && r.Operation != "observe" && r.RequestedLease != nil {
 		return fmt.Errorf("%w: %s cannot contain requestedLease", ErrControlValidation, r.Operation)
 	}
 	switch r.Operation {
-	case "claim", "heartbeat", "commit", "abandon", "status", "reconcile":
+	case "claim", "heartbeat", "commit", "abandon", "status", "reconcile", "observe":
 	default:
 		return fmt.Errorf("%w: unsupported operation %q", ErrControlValidation, r.Operation)
 	}
@@ -382,6 +391,18 @@ func (r ControlRequest) Validate() error {
 			default:
 				return fmt.Errorf("%w: unsupported claim result disposition %q", ErrControlValidation, result.Disposition)
 			}
+		} else if r.Operation == "observe" {
+			var result struct {
+				State string `json:"state"`
+			}
+			if err := json.Unmarshal(r.Result, &result); err != nil || !mektup.EvidenceState(result.State).Valid() {
+				return fmt.Errorf("%w: observe result requires valid state", ErrControlValidation)
+			}
+			for _, field := range []string{"fencingToken", "lease"} {
+				if _, present := resultObject[field]; present {
+					return fmt.Errorf("%w: observe result forbids %s", ErrControlValidation, field)
+				}
+			}
 		}
 		return nil
 	}
@@ -402,6 +423,10 @@ func (r ControlRequest) Validate() error {
 			}
 		}
 	case "status", "reconcile":
+	case "observe":
+		if r.NativeItemID == "" || r.FencingToken != "" || r.Lease != nil || r.RequestedLease != nil || r.AttemptOwner != "" {
+			return fmt.Errorf("%w: observe requires native item evidence without dispatch authority", ErrControlValidation)
+		}
 	}
 	return nil
 }
