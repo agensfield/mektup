@@ -56,7 +56,7 @@ func (s Store) Inspect(ctx context.Context, target string, inspector TargetInspe
 	if err != nil {
 		return InspectResult{}, err
 	}
-	var related []mektup.Receipt
+	related := make([]mektup.Receipt, 0)
 	if options.ReceiptLimit > 0 {
 		related, err = s.Journal.ListReceipts(ctx, journal.ReceiptQuery{EndpointID: identity.EndpointID, ThreadID: identity.ThreadID, Limit: options.ReceiptLimit})
 		if err != nil {
