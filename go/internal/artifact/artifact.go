@@ -500,7 +500,10 @@ func checkSpillTarget(root *os.Root, name string) error {
 // reuseExisting verifies the winner of a concurrent no-force spill. It opens
 // the final component without following symlinks, checks owner-private regular
 // file identity, then hashes the opened file and confirms the path still names
-// that same file before returning a fresh complete receipt.
+// that same file before returning a fresh complete receipt. Metadata drift is
+// retried a small number of times because the publishing writer removes its
+// temporary hard link immediately after Link succeeds; content/type/path
+// mismatches still fail closed.
 func (s *Store) reuseExisting(ctx context.Context, name string, expectedBytes int64, expectedDigest []byte, opts Options) (Receipt, error) {
 	var zero Receipt
 	f, err := openExistingNoFollow(s.fs, name)
@@ -511,58 +514,79 @@ func (s *Store) reuseExisting(ctx context.Context, name string, expectedBytes in
 		return zero, fmt.Errorf("artifact: inspect existing destination: %w", err)
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return zero, fmt.Errorf("artifact: stat existing destination: %w", err)
+	const maxAttempts = 3
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			if err := ctx.Err(); err != nil {
+				return zero, fmt.Errorf("artifact: %w: %w", ErrCorrupt, err)
+			}
+		}
+		info, err := f.Stat()
+		if err != nil {
+			return zero, fmt.Errorf("artifact: stat existing destination: %w", err)
+		}
+		if !info.Mode().IsRegular() {
+			return zero, ErrNonRegular
+		}
+		if info.Mode().Perm() != 0o600 {
+			return zero, ErrWrongMode
+		}
+		if info.Size() != expectedBytes {
+			return zero, fmt.Errorf("artifact: %w: %w: size %d != %d", ErrExists, ErrConflict, info.Size(), expectedBytes)
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return zero, fmt.Errorf("artifact: reset existing destination: %w", err)
+		}
+		before := fileFingerprintOf(info)
+		h := sha256.New()
+		readBytes, err := copyBounded(ctx, h, f, expectedBytes)
+		if err != nil {
+			return zero, fmt.Errorf("artifact: %w: %w: %w", ErrExists, ErrCorrupt, err)
+		}
+		if readBytes != expectedBytes || !equalBytes(h.Sum(nil), expectedDigest) {
+			return zero, fmt.Errorf("artifact: %w: %w", ErrExists, ErrConflict)
+		}
+		afterInfo, err := f.Stat()
+		if err != nil {
+			return zero, fmt.Errorf("artifact: verify existing destination: %w", err)
+		}
+		if !sameFileFingerprint(before, fileFingerprintOf(afterInfo)) {
+			if attempt+1 < maxAttempts {
+				continue
+			}
+			return zero, fmt.Errorf("artifact: %w: file changed during verification", ErrConflict)
+		}
+		finalInfo, err := s.fs.Lstat(name)
+		if err != nil {
+			return zero, fmt.Errorf("artifact: verify existing destination: %w", err)
+		}
+		if finalInfo.Mode()&os.ModeSymlink != 0 {
+			return zero, ErrSymlink
+		}
+		if !finalInfo.Mode().IsRegular() {
+			return zero, ErrNonRegular
+		}
+		if finalInfo.Mode().Perm() != 0o600 || !os.SameFile(info, finalInfo) {
+			return zero, fmt.Errorf("artifact: %w: %w", ErrExists, ErrConflict)
+		}
+		if !sameFileFingerprint(before, fileFingerprintOf(finalInfo)) {
+			if attempt+1 < maxAttempts {
+				continue
+			}
+			return zero, fmt.Errorf("artifact: %w: file changed during verification", ErrConflict)
+		}
+		if opts.MediaType == "" {
+			opts.MediaType = DefaultMediaType
+		}
+		return Receipt{
+			Path: targetPath(s.root, name), Bytes: expectedBytes,
+			SHA256:    "sha256:" + hex.EncodeToString(expectedDigest),
+			MediaType: opts.MediaType, Complete: true,
+			RetentionEligible: opts.RetentionEligible, SensitiveOutputPossible: opts.SensitiveOutputPossible,
+			CreatedAt: time.Now().UTC(),
+		}, nil
 	}
-	if !info.Mode().IsRegular() {
-		return zero, ErrNonRegular
-	}
-	if info.Mode().Perm() != 0o600 {
-		return zero, ErrWrongMode
-	}
-	if info.Size() != expectedBytes {
-		return zero, fmt.Errorf("artifact: %w: %w: size %d != %d", ErrExists, ErrConflict, info.Size(), expectedBytes)
-	}
-	before := fileFingerprintOf(info)
-	h := sha256.New()
-	readBytes, err := copyBounded(ctx, h, f, expectedBytes)
-	if err != nil {
-		return zero, fmt.Errorf("artifact: %w: %w: %w", ErrExists, ErrCorrupt, err)
-	}
-	if readBytes != expectedBytes || !equalBytes(h.Sum(nil), expectedDigest) {
-		return zero, fmt.Errorf("artifact: %w: %w", ErrExists, ErrConflict)
-	}
-	afterInfo, err := f.Stat()
-	if err != nil {
-		return zero, fmt.Errorf("artifact: verify existing destination: %w", err)
-	}
-	if !sameFileFingerprint(before, fileFingerprintOf(afterInfo)) {
-		return zero, fmt.Errorf("artifact: %w: file changed during verification", ErrConflict)
-	}
-	finalInfo, err := s.fs.Lstat(name)
-	if err != nil {
-		return zero, fmt.Errorf("artifact: verify existing destination: %w", err)
-	}
-	if finalInfo.Mode()&os.ModeSymlink != 0 {
-		return zero, ErrSymlink
-	}
-	if !finalInfo.Mode().IsRegular() {
-		return zero, ErrNonRegular
-	}
-	if finalInfo.Mode().Perm() != 0o600 || !os.SameFile(info, finalInfo) || !sameFileFingerprint(before, fileFingerprintOf(finalInfo)) {
-		return zero, fmt.Errorf("artifact: %w: %w", ErrExists, ErrConflict)
-	}
-	if opts.MediaType == "" {
-		opts.MediaType = DefaultMediaType
-	}
-	return Receipt{
-		Path: targetPath(s.root, name), Bytes: expectedBytes,
-		SHA256:    "sha256:" + hex.EncodeToString(expectedDigest),
-		MediaType: opts.MediaType, Complete: true,
-		RetentionEligible: opts.RetentionEligible, SensitiveOutputPossible: opts.SensitiveOutputPossible,
-		CreatedAt: time.Now().UTC(),
-	}, nil
+	return zero, fmt.Errorf("artifact: %w: verification attempts exhausted", ErrConflict)
 }
 
 func targetPath(root, name string) string { return filepath.Join(root, filepath.FromSlash(name)) }
