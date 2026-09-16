@@ -186,6 +186,25 @@ stream_max_retries = 0
 		t.Fatal(err)
 	}
 	waitDone(t, secondDone, "second observer detach")
+
+	approval, err := adapter.Subscribe(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvalDone := drainObservedStream(approval)
+	admin.request(t, ctx, "approval-turn", "turn/start", map[string]any{
+		"threadId": threadID,
+		"input":    []map[string]any{{"type": "text", "text": "run the requested command"}},
+		"model":    "mock-model",
+	})
+	waitForOutput(t, &clientLog, "commandExecution approval requested for thread "+threadID)
+	admin.waitNotification(t, ctx, "serverRequest/resolved")
+	admin.waitNotification(t, ctx, "turn/completed")
+	waitForBlockers(t, blockers, ep.ID, threadID, 3, 2)
+	if err := approval.Close(); err != nil {
+		t.Fatal(err)
+	}
+	waitDone(t, approvalDone, "approval observer detach")
 	_ = stdin.Close()
 
 	text := clientLog.String()
@@ -210,6 +229,7 @@ stream_max_retries = 0
 		}
 	}
 	assertSentinelAbsent(t, stateDir)
+	assertTextAbsent(t, stateDir, "mektup-approval-payload")
 	t.Logf("daemon=%s version=%s sha256=%s initialize=%s", codexBinary, executableVersion(t, codexBinary), fileSHA256(t, codexBinary), initialize)
 	t.Logf("official_client=%s version=%s sha256=%s", officialClient, executableVersion(t, officialClient), fileSHA256(t, officialClient))
 }
@@ -334,6 +354,23 @@ func fileSHA256(t *testing.T, name string) string {
 		t.Fatal(err)
 	}
 	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func assertTextAbsent(t *testing.T, directory, forbidden string) {
+	t.Helper()
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		content, readErr := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if readErr == nil && strings.Contains(string(content), forbidden) {
+			t.Fatalf("forbidden callback payload persisted in %s", entry.Name())
+		}
+	}
 }
 
 func executableVersion(t *testing.T, name string) string {

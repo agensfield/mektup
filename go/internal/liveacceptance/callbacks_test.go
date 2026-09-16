@@ -273,6 +273,22 @@ func newCallbackResponsesServer(t *testing.T) *httptest.Server {
 				completedEvent("resp-1"),
 			)
 			return
+		case 3:
+			writeSSE(w,
+				map[string]any{"type": "response.output_item.done", "item": map[string]any{"type": "message", "role": "assistant", "id": "msg-1", "content": []map[string]any{{"type": "output_text", "text": "thanks"}}}},
+				completedEvent("resp-2"),
+			)
+			return
+		case 4:
+			arguments, _ := json.Marshal(map[string]any{
+				"cmd": "printf mektup-approval-payload", "sandbox_permissions": "require_escalated", "justification": "Mektup callback acceptance",
+			})
+			writeSSE(w,
+				map[string]any{"type": "response.created", "response": map[string]any{"id": "resp-3"}},
+				map[string]any{"type": "response.output_item.done", "item": map[string]any{"type": "function_call", "call_id": "approval-call", "name": "exec_command", "arguments": string(arguments)}},
+				completedEvent("resp-3"),
+			)
+			return
 		}
 		writeSSE(w,
 			map[string]any{
@@ -282,7 +298,7 @@ func newCallbackResponsesServer(t *testing.T) *httptest.Server {
 					"content": []map[string]any{{"type": "output_text", "text": "thanks"}},
 				},
 			},
-			completedEvent("resp-2"),
+			completedEvent("resp-4"),
 		)
 	}))
 }
