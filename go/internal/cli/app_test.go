@@ -155,6 +155,82 @@ func TestPresentationPrecedenceAndConservativeDetection(t *testing.T) {
 	}
 }
 
+func TestPresentationTerminatorMatchesParseBoundary(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       []string
+		env        []string
+		wantJSON   bool
+		wantTarget string
+		wantBody   string
+	}{
+		{
+			name:       "agent trailing human remains body",
+			args:       []string{"send", "target", "--", "--human"},
+			env:        []string{"MEKTUP_AGENT=1"},
+			wantJSON:   true,
+			wantTarget: "target",
+			wantBody:   "--human",
+		},
+		{
+			name:       "trailing json remains target",
+			args:       []string{"send", "--", "--json"},
+			env:        []string{},
+			wantTarget: "--json",
+		},
+		{
+			name:       "explicit json before terminator wins",
+			args:       []string{"--json", "send", "target", "--", "--human"},
+			env:        []string{"MEKTUP_AGENT=1"},
+			wantJSON:   true,
+			wantTarget: "target",
+			wantBody:   "--human",
+		},
+		{
+			name:       "explicit human before terminator wins",
+			args:       []string{"--human", "send", "target", "--", "--json"},
+			env:        []string{"MEKTUP_AGENT=1"},
+			wantTarget: "target",
+			wantBody:   "--json",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var seen Invocation
+			executor := executorFunc(func(_ context.Context, inv Invocation) (ExecutionResult, error) {
+				seen = inv
+				return ExecutionResult{
+					Events:  []OutputEvent{{Machine: map[string]any{"event": "send.completed", "ok": true}, Human: "human result"}},
+					Receipt: map[string]any{"receiptId": "rcpt_03999999-9999-7999-8999-999999999999", "state": "accepted"},
+				}, nil
+			})
+			var out, errOut bytes.Buffer
+			app := &App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: test.env, Executor: executor}
+			if code := app.Run(test.args); code != int(ExitSuccess) {
+				t.Fatalf("exit=%d stdout=%q stderr=%q", code, out.String(), errOut.String())
+			}
+			if len(seen.Position) < 1 || seen.Position[0] != test.wantTarget {
+				t.Fatalf("position=%#v, want target %q", seen.Position, test.wantTarget)
+			}
+			if test.wantBody != "" && (len(seen.Position) < 2 || seen.Position[1] != test.wantBody) {
+				t.Fatalf("position=%#v, want body %q", seen.Position, test.wantBody)
+			}
+			if test.wantJSON {
+				var event map[string]any
+				if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &event); err != nil {
+					t.Fatalf("JSON presentation lost after terminator: %q: %v", out.String(), err)
+				}
+				data, ok := event["data"].(map[string]any)
+				if !ok || data["receipt"] == nil {
+					t.Fatalf("JSONL receipt missing from post-write result: %#v", event)
+				}
+			} else if !strings.Contains(out.String(), "human result") {
+				t.Fatalf("human presentation was not retained: %q", out.String())
+			}
+		})
+	}
+}
+
 func TestPayloadSourcesAndRawReplyGates(t *testing.T) {
 	cases := [][]string{
 		{"send", "target", "message", "--stdin"},

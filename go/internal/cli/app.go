@@ -948,6 +948,9 @@ func ensureFinalNewline(s string) string {
 
 func scanPresentation(args []string) (jsonMode, humanMode bool) {
 	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
 		switch arg {
 		case "--json":
 			jsonMode = true
