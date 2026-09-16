@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
+
+	"github.com/agensfield/mektup/go/internal/sshproxy"
 )
 
 var (
@@ -37,22 +40,67 @@ func (f EndpointCommandRunnerFunc) RunEndpoint(ctx context.Context, endpoint End
 	return f(ctx, endpoint, argv)
 }
 
-type ExecRunner struct{}
+// ExecRunner is the bounded local Herdr command adapter. It accepts only the
+// fixed argv forms emitted by HerdrResolver and never invokes a shell. The
+// optional factory exists for deterministic lifecycle tests; production uses
+// the system executable resolved by LookPath.
+type ExecRunner struct {
+	Factory        sshproxy.ProcessFactory
+	StartupTimeout time.Duration
+	CommandTimeout time.Duration
+	CleanupTimeout time.Duration
+	OutputLimit    int64
+	StderrLimit    int64
+}
 
-func (ExecRunner) Run(ctx context.Context, argv []string) ([]byte, error) {
-	if len(argv) == 0 || argv[0] == "" {
-		return nil, errors.New("empty command argv")
+func (r ExecRunner) Run(ctx context.Context, argv []string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	path, err := exec.LookPath(argv[0])
+	if err := ctx.Err(); err != nil {
+		return nil, &HerdrRunnerFailure{Kind: HerdrRunnerCanceled, Err: err}
+	}
+	remote, err := validateHerdrCommand(argv)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %v", ErrResolverUnavailable, err)
+		return nil, err
 	}
-	cmd := exec.CommandContext(ctx, path, argv[1:]...)
-	out, err := cmd.Output()
+	return runLocalHerdr(ctx, r, remote)
+}
+
+func runLocalHerdr(ctx context.Context, runner ExecRunner, argv []string) ([]byte, error) {
+	cfg := (HerdrRunnerConfig{
+		StartupTimeout: runner.StartupTimeout, CommandTimeout: runner.CommandTimeout,
+		CleanupTimeout: runner.CleanupTimeout, OutputLimit: runner.OutputLimit, StderrLimit: runner.StderrLimit,
+	}).normalized()
+	factory := runner.Factory
+	if factory == nil {
+		path, err := exec.LookPath(argv[0])
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrResolverUnavailable, err)
+		}
+		argv = append([]string{path}, argv[1:]...)
+		factory = sshproxy.DefaultProcessFactory()
+	}
+	process, err := factory.New(append([]string(nil), argv...))
 	if err != nil {
-		return nil, fmt.Errorf("%w: herdr agent query failed: %v", ErrResolverUnavailable, err)
+		return nil, &HerdrRunnerFailure{Kind: HerdrRunnerSpawnFailure, Err: err}
 	}
-	return out, nil
+	if process == nil {
+		return nil, &HerdrRunnerFailure{Kind: HerdrRunnerSpawnFailure, Err: errors.New("process factory returned nil process")}
+	}
+	stdin, err := process.StdinPipe()
+	if err != nil {
+		return cleanupHerdrProcess(process, nil, nil, nil, cfg.CleanupTimeout, &HerdrRunnerFailure{Kind: HerdrRunnerSpawnFailure, Err: err})
+	}
+	stdout, err := process.StdoutPipe()
+	if err != nil {
+		return cleanupHerdrProcess(process, stdin, nil, nil, cfg.CleanupTimeout, &HerdrRunnerFailure{Kind: HerdrRunnerSpawnFailure, Err: err})
+	}
+	stderr, err := process.StderrPipe()
+	if err != nil {
+		return cleanupHerdrProcess(process, stdin, stdout, nil, cfg.CleanupTimeout, &HerdrRunnerFailure{Kind: HerdrRunnerSpawnFailure, Err: err})
+	}
+	return runHerdrProcess(ctx, process, stdin, stdout, stderr, cfg)
 }
 
 type HerdrResolver struct {
