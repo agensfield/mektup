@@ -341,9 +341,12 @@ type auditCapture struct {
 	invocation string
 	buf        bytes.Buffer
 	max        int64
+	sealed     bool
 	final      *logging.AuditReceipt
 	err        error
 }
+
+var errAuditCaptureSealed = errors.New("audit capture is already finalized")
 
 func (a *auditCapture) Observe(direction appserver.FrameDirection, frame appserver.Frame) error {
 	if a == nil {
@@ -359,6 +362,9 @@ func (a *auditCapture) Observe(direction appserver.FrameDirection, frame appserv
 	defer a.mu.Unlock()
 	if a.err != nil {
 		return a.err
+	}
+	if a.sealed {
+		return errAuditCaptureSealed
 	}
 	if int64(a.buf.Len()+len(record)) > a.max {
 		a.err = logging.ErrTooLarge
@@ -382,6 +388,7 @@ func (a *auditCapture) Finalize(ctx context.Context) (logging.AuditReceipt, erro
 		a.mu.Unlock()
 		return receipt, err
 	}
+	a.sealed = true
 	body := append([]byte(nil), a.buf.Bytes()...)
 	a.mu.Unlock()
 	receipt, err := a.logger.Audit(ctx, logging.AuditOptions{InvocationID: a.invocation, Body: bytes.NewReader(body), MaxBytes: a.max})
@@ -526,13 +533,13 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 		config := logging.DefaultConfig(filepath.Join(stateDir, "logs"))
 		logger, err = logging.New(config)
 		if err != nil {
-			if j != nil {
-				_ = j.Close()
-			}
-			if artifacts != nil {
-				_ = artifacts.Close()
-			}
 			if inv.Global.Audit {
+				if j != nil {
+					_ = j.Close()
+				}
+				if artifacts != nil {
+					_ = artifacts.Close()
+				}
 				return nil, fmt.Errorf("initialize audit logging: %w", err)
 			}
 			e.debug(inv, "logging_setup_failed", map[string]string{"error": err.Error()})

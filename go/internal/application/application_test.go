@@ -117,6 +117,17 @@ func TestAuditCaptureFinalizesExactFramedTrafficAndOverlimitIsAbsent(t *testing.
 	if err != nil || !strings.Contains(string(data), "outbound text") || !strings.Contains(string(data), "inbound text") || !strings.Contains(string(data), "keep-in-audit") {
 		t.Fatalf("audit body=%s err=%v", data, err)
 	}
+	if err := capture.Observe(appserver.FrameInbound, appserver.Frame{Type: appserver.FrameText, Payload: []byte(`{"late":true}`)}); !errors.Is(err, errAuditCaptureSealed) {
+		t.Fatalf("observe after finalize error = %v", err)
+	}
+	again, err := capture.Finalize(context.Background())
+	if err != nil || again != receipt {
+		t.Fatalf("second finalize receipt=%+v err=%v, want %+v", again, err, receipt)
+	}
+	data, err = os.ReadFile(receipt.Path)
+	if err != nil || bytes.Contains(data, []byte(`"late":true`)) {
+		t.Fatalf("finalized audit changed after late frame: %s err=%v", data, err)
+	}
 	tinyLogger, err := logging.New(logging.Config{Dir: t.TempDir(), AuditMaxBytes: 4})
 	if err != nil {
 		t.Fatal(err)
@@ -127,6 +138,34 @@ func TestAuditCaptureFinalizesExactFramedTrafficAndOverlimitIsAbsent(t *testing.
 	}
 	if _, err := os.Stat(filepath.Join(tinyLogger.Config().Dir, "audit", "audit-too-large.audit")); !os.IsNotExist(err) {
 		t.Fatalf("overlimit audit artifact exists: %v", err)
+	}
+}
+
+func TestOptionalLoggingFailureDoesNotCloseJournal(t *testing.T) {
+	root := t.TempDir()
+	stateDir := filepath.Join(root, "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "logs"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := New(Options{CodexHome: filepath.Join(root, "codex"), IdentityHome: filepath.Join(root, "identity")})
+	resources, err := env.openResources(context.Background(), cli.Invocation{Command: "rpc", Resolved: cli.ResolvedGlobals{StateDir: stateDir, Config: filepath.Join(root, "endpoints.json")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resources.Close()
+	op := journal.Operation{
+		OperationID: "op_0198f0e0-0000-7000-8000-000000000124",
+		MessageID:   "msg_0198f0e0-0000-7000-8000-000000000125",
+		SourceRoute: "codex://source/thread/source",
+		TargetRoute: "codex://target/thread/target",
+		Semantics:   "rpc",
+		Digest:      "sha256:" + strings.Repeat("a", 64),
+	}
+	if _, err := resources.journal.Prepare(context.Background(), op); err != nil {
+		t.Fatalf("journal was closed after optional logger failure: %v", err)
 	}
 }
 
