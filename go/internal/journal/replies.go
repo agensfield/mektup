@@ -551,6 +551,132 @@ func (j *Journal) RecordObservedWinner(ctx context.Context, originalID, replyID,
 	})
 }
 
+// RecordObservedReplyAndWinner applies an authoritative winner projection and
+// the newly observed candidate in one transaction. The caller may safely use
+// this for untrusted remote results: any identity conflict rolls back every
+// claim, observation, winner, and event mutation.
+func (j *Journal) RecordObservedReplyAndWinner(ctx context.Context, candidate ClaimInput, nativeItemID, endpointID, controlRoute string, winnerReplyID, winnerDigest, winnerStatus, winnerErrorCode, winnerNativeID string, winnerCommitSeq int64, winnerBodySize int64) error {
+	if candidate.ReplyID == "" || candidate.OriginalID == "" || candidate.Digest == "" || candidate.BodySize < 0 || (candidate.Status != "success" && candidate.Status != "error") || candidate.ReplyRoute == "" || candidate.CustodyRoute == "" || candidate.CustodyStoreID == "" || nativeItemID == "" || winnerReplyID == "" || winnerDigest == "" || (winnerStatus != "success" && winnerStatus != "error") || winnerCommitSeq < 1 || winnerBodySize < 0 {
+		return fmt.Errorf("journal: invalid observed projection")
+	}
+	now := j.nowUnix()
+	return j.withTx(ctx, func(tx *sql.Tx) error {
+		if candidate.ReplyID == winnerReplyID && (candidate.Digest != winnerDigest || candidate.BodySize != winnerBodySize || candidate.Status != winnerStatus || candidate.ErrorCode != winnerErrorCode || winnerNativeID != nativeItemID) {
+			return ErrIdentityConflict
+		}
+		var route, custody, storeID string
+		if err := tx.QueryRow("SELECT reply_route,custody_route,custody_store_id FROM operations WHERE message_id=?", candidate.OriginalID).Scan(&route, &custody, &storeID); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrNotFound
+			}
+			return err
+		}
+		if route != candidate.ReplyRoute || custody != candidate.CustodyRoute || storeID != candidate.CustodyStoreID {
+			return ErrIdentityConflict
+		}
+		var currentWinner string
+		errWinner := tx.QueryRow("SELECT reply_id FROM reply_winners WHERE original_id=?", candidate.OriginalID).Scan(&currentWinner)
+		if errWinner != nil && errWinner != sql.ErrNoRows {
+			return errWinner
+		}
+		if errWinner == nil && currentWinner != winnerReplyID {
+			return ErrIdentityConflict
+		}
+		var existing ReplyClaim
+		err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_error_code,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", candidate.ReplyID), &existing)
+		if err == nil && (existing.OriginalID != candidate.OriginalID || existing.Digest != candidate.Digest || existing.BodySize != candidate.BodySize || existing.Status != candidate.Status || existing.ReplyErrorCode != candidate.ErrorCode || existing.ReplyRoute != candidate.ReplyRoute || existing.CustodyRoute != candidate.CustodyRoute || existing.CustodyStoreID != candidate.CustodyStoreID) {
+			return ErrIdentityConflict
+		}
+		if err != nil && err != sql.ErrNoRows {
+			return err
+		}
+		// Install or strengthen the authoritative winner first, still inside tx.
+		var winner ReplyClaim
+		werr := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_error_code,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", winnerReplyID), &winner)
+		winnerState := StateReplyAccepted
+		if winnerNativeID != "" {
+			winnerState = StateReplyObserved
+		}
+		if werr == sql.ErrNoRows {
+			if _, err := tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,accepted_at,commit_seq,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", winnerReplyID, candidate.OriginalID, winnerDigest, winnerBodySize, winnerStatus, candidate.ReplyRoute, candidate.CustodyRoute, candidate.CustodyStoreID, "", "", int64(0), string(winnerState), now, now, now, winnerCommitSeq, winnerErrorCode); err != nil {
+				return err
+			}
+			eventKind := "reply.accepted"
+			if winnerState == StateReplyObserved {
+				eventKind = "reply.observed"
+			}
+			if err := emit(tx, eventKind, "", winnerReplyID, winnerState, now); err != nil {
+				return err
+			}
+		} else if werr != nil {
+			return werr
+		} else if winner.OriginalID != candidate.OriginalID || winner.Digest != winnerDigest || winner.BodySize != winnerBodySize || winner.Status != winnerStatus || winner.ReplyErrorCode != winnerErrorCode || winner.ReplyRoute != candidate.ReplyRoute || winner.CustodyRoute != candidate.CustodyRoute || winner.CustodyStoreID != candidate.CustodyStoreID {
+			return ErrIdentityConflict
+		} else {
+			priorWinnerState := winner.State
+			state := winner.State
+			if winnerNativeID != "" {
+				state = StateReplyObserved
+			} else if state != StateReplyObserved {
+				state = StateReplyAccepted
+			}
+			if _, err := tx.Exec("UPDATE reply_claims SET state=?,token='',lease_until=0,accepted_at=?,commit_seq=?,updated_at=? WHERE reply_id=?", string(state), now, winnerCommitSeq, now, winnerReplyID); err != nil {
+				return err
+			}
+			if state != priorWinnerState {
+				eventKind := "reply.accepted"
+				if state == StateReplyObserved {
+					eventKind = "reply.observed"
+				}
+				if err := emit(tx, eventKind, "", winnerReplyID, state, now); err != nil {
+					return err
+				}
+			}
+		}
+		if errWinner == sql.ErrNoRows {
+			if _, err := tx.Exec("INSERT INTO reply_winners(original_id,reply_id,committed_at,commit_seq) VALUES(?,?,?,?)", candidate.OriginalID, winnerReplyID, now, winnerCommitSeq); err != nil {
+				return err
+			}
+		} else if _, err := tx.Exec("UPDATE reply_winners SET committed_at=?,commit_seq=? WHERE original_id=? AND reply_id=?", now, winnerCommitSeq, candidate.OriginalID, winnerReplyID); err != nil {
+			return err
+		}
+		if winnerNativeID != "" {
+			if err := validateObservationIdentityTx(tx, winnerReplyID, winnerNativeID, winnerDigest, endpointID, controlRoute); err != nil {
+				return err
+			}
+			if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest,endpoint_id,control_route) VALUES(?,?,?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET observed_at=excluded.observed_at", winnerReplyID, winnerNativeID, now, winnerDigest, endpointID, controlRoute); err != nil {
+				return err
+			}
+		}
+		if err == sql.ErrNoRows && winnerReplyID != candidate.ReplyID {
+			if _, err := tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", candidate.ReplyID, candidate.OriginalID, candidate.Digest, candidate.BodySize, candidate.Status, candidate.ReplyRoute, candidate.CustodyRoute, candidate.CustodyStoreID, "", "", int64(0), string(StateReplyObserved), now, now, candidate.ErrorCode); err != nil {
+				return err
+			}
+			if err := emit(tx, "reply.observed", "", candidate.ReplyID, StateReplyObserved, now); err != nil {
+				return err
+			}
+		} else if err == nil {
+			priorCandidateState := existing.State
+			if existing.State != StateReplyObserved && existing.State != StateReplyAccepted && existing.State != StateReplyOutcomeUnknown {
+				return ErrInvalidTransition
+			}
+			if _, err := tx.Exec("UPDATE reply_claims SET state=?,token='',lease_until=0,accepted_at=?,updated_at=? WHERE reply_id=?", string(StateReplyObserved), now, now, candidate.ReplyID); err != nil {
+				return err
+			}
+			if priorCandidateState != StateReplyObserved {
+				if err := emit(tx, "reply.observed", "", candidate.ReplyID, StateReplyObserved, now); err != nil {
+					return err
+				}
+			}
+		}
+		if err := validateObservationIdentityTx(tx, candidate.ReplyID, nativeItemID, candidate.Digest, endpointID, controlRoute); err != nil {
+			return err
+		}
+		_, err = tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest,endpoint_id,control_route) VALUES(?,?,?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET observed_at=excluded.observed_at", candidate.ReplyID, nativeItemID, now, candidate.Digest, endpointID, controlRoute)
+		return err
+	})
+}
+
 // ObserveReplyWithProvenance records exact configured destination identity
 // alongside the native evidence. The route is metadata only and never a
 // path/executable authority.

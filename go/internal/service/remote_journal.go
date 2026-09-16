@@ -11,6 +11,7 @@ import (
 
 	mektup "github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/internal/endpoint"
+	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/sshproxy"
 )
 
@@ -326,10 +327,10 @@ func (r *RemoteJournal) ObserveVerifiedReply(ctx context.Context, status Operati
 	if err != nil {
 		return err
 	}
-	if err := r.Local.Inner.RecordObservedWinner(ctx, status.MessageID, result.WinnerReplyID, result.WinnerDigest, result.WinnerStatus, result.WinnerErrorCode, input.ReplyRoute, input.CustodyRoute, input.CustodyStoreID, result.WinnerNativeID, status.ReplyEndpointID, status.CustodyRoute, result.WinnerCommitSeq, result.WinnerBodySize); err != nil {
-		return err
+	if result.WinnerReplyID == input.ReplyID && (result.WinnerDigest != input.Digest || result.WinnerBodySize != input.BodySize || result.WinnerStatus != input.Status || result.WinnerErrorCode != input.ErrorCode || result.WinnerNativeID != item.NativeItemID) {
+		return journal.ErrIdentityConflict
 	}
-	if err := r.Local.RecordObservedReply(ctx, input, item.NativeItemID, status.ReplyEndpointID, status.CustodyRoute); err != nil {
+	if err := r.Local.Inner.RecordObservedReplyAndWinner(ctx, journal.ClaimInput{ReplyID: input.ReplyID, OriginalID: input.OriginalID, Digest: input.Digest, BodySize: input.BodySize, Status: input.Status, ErrorCode: input.ErrorCode, ReplyRoute: input.ReplyRoute, CustodyRoute: input.CustodyRoute, CustodyStoreID: input.CustodyStoreID}, item.NativeItemID, status.ReplyEndpointID, status.CustodyRoute, result.WinnerReplyID, result.WinnerDigest, result.WinnerStatus, result.WinnerErrorCode, result.WinnerNativeID, result.WinnerCommitSeq, result.WinnerBodySize); err != nil {
 		return err
 	}
 	r.mu.Lock()
@@ -384,10 +385,10 @@ func (r *RemoteJournal) observeRemote(ctx context.Context, claim remoteClaim, na
 	if err != nil {
 		return err
 	}
-	if err := r.Local.Inner.RecordObservedWinner(ctx, claim.input.OriginalID, result.WinnerReplyID, result.WinnerDigest, result.WinnerStatus, result.WinnerErrorCode, claim.input.ReplyRoute, claim.input.CustodyRoute, claim.input.CustodyStoreID, result.WinnerNativeID, request.ReplyDestination.EndpointID, request.Custody.EndpointID, result.WinnerCommitSeq, result.WinnerBodySize); err != nil {
-		return err
+	if result.WinnerReplyID == claim.input.ReplyID && (result.WinnerDigest != claim.input.Digest || result.WinnerBodySize != claim.input.BodySize || result.WinnerStatus != claim.input.Status || result.WinnerErrorCode != claim.input.ErrorCode || result.WinnerNativeID != nativeID) {
+		return journal.ErrIdentityConflict
 	}
-	if err := r.Local.RecordObservedReply(ctx, claim.input, nativeID, request.ReplyDestination.EndpointID, request.Custody.EndpointID); err != nil {
+	if err := r.Local.Inner.RecordObservedReplyAndWinner(ctx, journal.ClaimInput{ReplyID: claim.input.ReplyID, OriginalID: claim.input.OriginalID, Digest: claim.input.Digest, BodySize: claim.input.BodySize, Status: claim.input.Status, ErrorCode: claim.input.ErrorCode, ReplyRoute: claim.input.ReplyRoute, CustodyRoute: claim.input.CustodyRoute, CustodyStoreID: claim.input.CustodyStoreID}, nativeID, request.ReplyDestination.EndpointID, request.Custody.EndpointID, result.WinnerReplyID, result.WinnerDigest, result.WinnerStatus, result.WinnerErrorCode, result.WinnerNativeID, result.WinnerCommitSeq, result.WinnerBodySize); err != nil {
 		return err
 	}
 	r.mu.Lock()
