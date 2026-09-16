@@ -1,6 +1,7 @@
 package rawrpc
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -208,6 +209,33 @@ func TestOversizedServerErrorDataSpillsWithDigestAndNoDuplicateBlob(t *testing.T
 	contents, err := os.ReadFile(rawErr.Server.DataArtifact.Path)
 	if err != nil || string(contents) != string(data) {
 		t.Fatalf("spilled server data = %q err=%v", contents, err)
+	}
+}
+
+func TestOversizedServerErrorMessageSpillsCompleteEvidenceWithoutInlineDuplicate(t *testing.T) {
+	message := strings.Repeat("m", 128)
+	data := json.RawMessage(`{"detail":"keep"}`)
+	store, err := artifact.NewStore(filepath.Join(t.TempDir(), "artifacts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &appserver.ServerError{ID: "rpc-message", Code: -32603, Message: message, Data: data, Generation: 11}
+	caller := &recordingCaller{err: &appserver.CallError{Server: server, Evidence: appserver.WriteEvidence{Phase: appserver.WriteComplete, Generation: 11}, Generation: 11}}
+	_, err = Execute(context.Background(), caller, Request{Method: "thread/read", Output: OutputOptions{InlineLimit: 16, Store: store}})
+	rawErr := requireRawError(t, err)
+	if rawErr.Code != mektup.ErrDeliveryRejected || rawErr.Server == nil || rawErr.Server.Message != "" || rawErr.Server.Data != nil || rawErr.Server.EvidenceArtifact == nil {
+		t.Fatalf("oversized server message = %+v", rawErr)
+	}
+	if rawErr.Server.MessageBytes != int64(len(message)) || rawErr.Server.MessageSHA256 == "" || rawErr.Server.EvidenceBytes == 0 || rawErr.Server.EvidenceSHA256 == "" || !rawErr.Server.EvidenceArtifact.Complete {
+		t.Fatalf("server evidence retention = %+v", rawErr.Server)
+	}
+	nested, ok := rawErr.Details["serverError"].(map[string]any)
+	if !ok || nested["message"] != nil || nested["evidenceArtifact"] == nil {
+		t.Fatalf("stable details duplicated oversized message: %#v", rawErr.Details["serverError"])
+	}
+	contents, err := os.ReadFile(rawErr.Server.EvidenceArtifact.Path)
+	if err != nil || !bytes.Contains(contents, []byte(message)) || !bytes.Contains(contents, data) {
+		t.Fatalf("spilled server evidence = %q err=%v", contents, err)
 	}
 }
 

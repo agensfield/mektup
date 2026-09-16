@@ -126,14 +126,19 @@ type Response struct {
 // ServerErrorEvidence preserves the JSON-RPC error fields without replacing
 // the stable Mektup error code. Data is copied, never decoded and re-encoded.
 type ServerErrorEvidence struct {
-	ID           appserver.RequestID `json:"id,omitempty"`
-	Code         int64               `json:"code"`
-	Message      string              `json:"message"`
-	Data         json.RawMessage     `json:"data,omitempty"`
-	DataBytes    int64               `json:"dataBytes,omitempty"`
-	DataSHA256   string              `json:"dataSHA256,omitempty"`
-	DataArtifact *artifact.Receipt   `json:"dataArtifact,omitempty"`
-	Generation   uint64              `json:"generation,omitempty"`
+	ID               appserver.RequestID `json:"id,omitempty"`
+	Code             int64               `json:"code"`
+	Message          string              `json:"message,omitempty"`
+	MessageBytes     int64               `json:"messageBytes,omitempty"`
+	MessageSHA256    string              `json:"messageSHA256,omitempty"`
+	Data             json.RawMessage     `json:"data,omitempty"`
+	DataBytes        int64               `json:"dataBytes,omitempty"`
+	DataSHA256       string              `json:"dataSHA256,omitempty"`
+	DataArtifact     *artifact.Receipt   `json:"dataArtifact,omitempty"`
+	EvidenceBytes    int64               `json:"evidenceBytes,omitempty"`
+	EvidenceSHA256   string              `json:"evidenceSHA256,omitempty"`
+	EvidenceArtifact *artifact.Receipt   `json:"evidenceArtifact,omitempty"`
+	Generation       uint64              `json:"generation,omitempty"`
 }
 
 // Error is a stable Mektup terminal error with optional untouched app-server
@@ -330,7 +335,7 @@ func classifyCallError(ctx context.Context, plan Plan, cause error) error {
 	var serverEvidence *ServerErrorEvidence
 	if callErr.Server != nil {
 		serverEvidence = &ServerErrorEvidence{ID: callErr.Server.ID, Code: callErr.Server.Code, Message: callErr.Server.Message, Generation: callErr.Server.Generation}
-		retentionErr := retainServerErrorData(ctx, serverEvidence, callErr.Server.Data, plan.Request.Output)
+		retentionErr := retainServerError(ctx, serverEvidence, callErr.Server.Data, plan.Request.Output)
 		details["serverError"] = serverEvidenceDetails(serverEvidence)
 		if retentionErr != nil {
 			details["serverErrorRetention"] = retentionErr.Error()
@@ -395,27 +400,69 @@ func retainResult(ctx context.Context, response *Response, raw json.RawMessage, 
 	return nil
 }
 
-func retainServerErrorData(ctx context.Context, evidence *ServerErrorEvidence, raw json.RawMessage, options OutputOptions) error {
-	if len(raw) == 0 {
-		return nil
+func retainServerError(ctx context.Context, evidence *ServerErrorEvidence, raw json.RawMessage, options OutputOptions) error {
+	messageDigest := sha256.Sum256([]byte(evidence.Message))
+	evidence.MessageBytes = int64(len(evidence.Message))
+	evidence.MessageSHA256 = "sha256:" + hex.EncodeToString(messageDigest[:])
+	if len(raw) != 0 {
+		dataDigest := sha256.Sum256(raw)
+		evidence.DataBytes = int64(len(raw))
+		evidence.DataSHA256 = "sha256:" + hex.EncodeToString(dataDigest[:])
 	}
-	digest := sha256.Sum256(raw)
-	evidence.DataBytes = int64(len(raw))
-	evidence.DataSHA256 = "sha256:" + hex.EncodeToString(digest[:])
+
 	limit := options.InlineLimit
 	if limit == 0 {
 		limit = DefaultInlineLimit
 	}
 	if options.Path == "" && limit < 1 {
-		return fmt.Errorf("raw RPC server error data inline output limit must be positive")
+		return fmt.Errorf("raw RPC server error inline output limit must be positive")
 	}
-	if options.Path == "" && int64(len(raw)) <= limit {
+	inlineBytes := int64(len(evidence.Message) + len(raw))
+	if options.Path == "" && inlineBytes <= limit {
 		evidence.Data = append(json.RawMessage(nil), raw...)
 		return nil
 	}
+
+	// A message that does not fit inline cannot remain duplicated across the
+	// stable details and nested server evidence. Preserve the complete error as
+	// one sensitive artifact and leave only its digest/size metadata inline.
+	if int64(len(evidence.Message)) > limit {
+		document, err := json.Marshal(struct {
+			ID      appserver.RequestID `json:"id,omitempty"`
+			Code    int64               `json:"code"`
+			Message string              `json:"message"`
+			Data    json.RawMessage     `json:"data,omitempty"`
+		}{ID: evidence.ID, Code: evidence.Code, Message: evidence.Message, Data: raw})
+		if err != nil {
+			return fmt.Errorf("encode raw RPC server error evidence: %w", err)
+		}
+		digest := sha256.Sum256(document)
+		evidence.EvidenceBytes = int64(len(document))
+		evidence.EvidenceSHA256 = "sha256:" + hex.EncodeToString(digest[:])
+		spillOptions := options
+		if spillOptions.Name == "" {
+			spillOptions.Name = "raw-rpc-error-" + hex.EncodeToString(digest[:]) + ".json"
+		}
+		receipt, err := writeArtifact(ctx, document, spillOptions, spillOptions.Name)
+		if err != nil {
+			return err
+		}
+		evidence.Message = ""
+		evidence.Data = nil
+		evidence.EvidenceArtifact = &receipt
+		return nil
+	}
+
+	// The message fits within the caller's inline budget, but the combined
+	// evidence does not. Retain the exact data separately without weakening the
+	// message bound.
+	if len(raw) == 0 {
+		return nil
+	}
+	dataDigest := sha256.Sum256(raw)
 	spillOptions := options
 	if spillOptions.Name == "" {
-		spillOptions.Name = "raw-rpc-error-" + hex.EncodeToString(digest[:]) + ".json"
+		spillOptions.Name = "raw-rpc-error-data-" + hex.EncodeToString(dataDigest[:]) + ".json"
 	}
 	receipt, err := writeArtifact(ctx, raw, spillOptions, spillOptions.Name)
 	if err != nil {
@@ -444,7 +491,7 @@ func writeArtifact(ctx context.Context, raw json.RawMessage, options OutputOptio
 }
 
 func serverEvidenceDetails(evidence *ServerErrorEvidence) map[string]any {
-	details := map[string]any{"id": evidence.ID, "code": evidence.Code, "message": evidence.Message}
+	details := map[string]any{"id": evidence.ID, "code": evidence.Code, "messageBytes": evidence.MessageBytes, "messageSHA256": evidence.MessageSHA256}
 	if evidence.Generation != 0 {
 		details["generation"] = evidence.Generation
 	}
@@ -454,6 +501,13 @@ func serverEvidenceDetails(evidence *ServerErrorEvidence) map[string]any {
 	}
 	if evidence.DataArtifact != nil {
 		details["dataArtifact"] = evidence.DataArtifact
+	}
+	if evidence.EvidenceBytes != 0 {
+		details["evidenceBytes"] = evidence.EvidenceBytes
+		details["evidenceSHA256"] = evidence.EvidenceSHA256
+	}
+	if evidence.EvidenceArtifact != nil {
+		details["evidenceArtifact"] = evidence.EvidenceArtifact
 	}
 	return details
 }

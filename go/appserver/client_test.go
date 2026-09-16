@@ -168,7 +168,7 @@ func TestRawResultServerErrorAndIDs(t *testing.T) {
 	}()
 	_, err = c.call(context.Background(), RPCRequest{ID: "err", Method: "bad"})
 	var callErr *CallError
-	if !errors.As(err, &callErr) || callErr.Server == nil || callErr.Server.Code != -32603 || string(callErr.Server.Data) != `{"x":1}` {
+	if !errors.As(err, &callErr) || callErr.Server == nil || callErr.Server.Code != -32603 || string(callErr.Server.Data) != `{"x":1}` || !strings.Contains(string(callErr.Server.Raw), `"message":"nope"`) || callErr.Server.WireBytes == 0 {
 		t.Fatalf("server error = %T %+v", err, err)
 	}
 	_ = c.Close(context.Background())

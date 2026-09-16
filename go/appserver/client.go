@@ -156,6 +156,8 @@ type ServerError struct {
 	Code       int64
 	Message    string
 	Data       json.RawMessage
+	Raw        json.RawMessage
+	WireBytes  int64
 	Generation uint64
 }
 
@@ -1350,7 +1352,7 @@ func decodeMessage(payload []byte) (decodedMessage, error) {
 		if e.Code == nil || e.Message == nil {
 			return decodedMessage{}, errors.New("JSON-RPC error requires code and message")
 		}
-		return decodedMessage{kind: messageResponse, id: id, serverErr: &ServerError{ID: id, Code: *e.Code, Message: *e.Message, Data: e.Data}}, nil
+		return decodedMessage{kind: messageResponse, id: id, serverErr: &ServerError{ID: id, Code: *e.Code, Message: *e.Message, Data: e.Data, Raw: append(json.RawMessage(nil), raw...), WireBytes: int64(len(payload))}}, nil
 	}
 	result := append(json.RawMessage(nil), obj["result"]...)
 	return decodedMessage{kind: messageResponse, id: id, result: result}, nil

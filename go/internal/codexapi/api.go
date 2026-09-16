@@ -53,6 +53,9 @@ type ServerError struct {
 	Message string
 	Data    json.RawMessage
 	Raw     json.RawMessage
+	// WireBytes is the complete JSON-RPC response size observed before the
+	// adapter split error fields into separately retained values.
+	WireBytes int64
 }
 
 func (e *ServerError) Error() string {
@@ -765,6 +768,13 @@ func (c *Client) callDecode(ctx context.Context, method string, params any, deco
 		return err
 	}
 	if serverErr != nil {
+		responseBytes := serverErr.WireBytes
+		if responseBytes == 0 {
+			responseBytes = int64(len(serverErr.Raw))
+		}
+		if responseBytes > MaxSemanticResponseBytes {
+			return fmt.Errorf("%w: %d bytes exceeds %d", ErrResponseTooLarge, responseBytes, MaxSemanticResponseBytes)
+		}
 		return serverErr
 	}
 	if len(raw) > MaxSemanticResponseBytes {

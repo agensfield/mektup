@@ -202,6 +202,19 @@ func TestSemanticResponseByteBoundPrecedesDecodeAndRawCopies(t *testing.T) {
 	}
 }
 
+func TestSemanticResponseByteBoundAlsoRejectsServerErrors(t *testing.T) {
+	server := &ServerError{
+		Code:      -32603,
+		Message:   "oversized",
+		Raw:       json.RawMessage(`{"code":-32603,"message":"oversized"}`),
+		WireBytes: MaxSemanticResponseBytes + 1,
+	}
+	client := New(&recordingCaller{err: server}, Options{})
+	if _, err := client.ThreadList(context.Background(), ThreadListOptions{}); !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("oversized server error = %v, want ErrResponseTooLarge", err)
+	}
+}
+
 func TestTurnsRequireExplicitItemsViewAndBoundResponse(t *testing.T) {
 	r := &recordingCaller{result: json.RawMessage(`{"data":[],"nextCursor":null,"backwardsCursor":null}`)}
 	if _, err := New(r, Options{}).ThreadTurns(context.Background(), TurnsOptions{ThreadID: "thread"}); err == nil {

@@ -388,6 +388,13 @@ func (c *Connection) Call(ctx context.Context, method string, params json.RawMes
 		return nil, nil, err
 	}
 	if out.ServerError != nil {
+		responseBytes := out.ServerError.WireBytes
+		if responseBytes == 0 {
+			responseBytes = int64(len(out.ServerError.Raw))
+		}
+		if responseBytes > codexapi.MaxSemanticResponseBytes {
+			return nil, nil, fmt.Errorf("%w: %d bytes exceeds %d", codexapi.ErrResponseTooLarge, responseBytes, codexapi.MaxSemanticResponseBytes)
+		}
 		return nil, out.ServerError, nil
 	}
 	return out.Result, nil, nil
@@ -461,16 +468,20 @@ func serverErrorFrom(err error) *codexapi.ServerError {
 		return nil
 	}
 	data := append(json.RawMessage(nil), low.Server.Data...)
-	raw, marshalErr := json.Marshal(struct {
-		ID      any             `json:"id"`
-		Code    int64           `json:"code"`
-		Message string          `json:"message"`
-		Data    json.RawMessage `json:"data,omitempty"`
-	}{ID: low.Server.ID, Code: low.Server.Code, Message: low.Server.Message, Data: data})
-	if marshalErr != nil {
-		raw = nil
+	raw := append(json.RawMessage(nil), low.Server.Raw...)
+	if len(raw) == 0 {
+		var marshalErr error
+		raw, marshalErr = json.Marshal(struct {
+			ID      any             `json:"id"`
+			Code    int64           `json:"code"`
+			Message string          `json:"message"`
+			Data    json.RawMessage `json:"data,omitempty"`
+		}{ID: low.Server.ID, Code: low.Server.Code, Message: low.Server.Message, Data: data})
+		if marshalErr != nil {
+			raw = nil
+		}
 	}
-	return &codexapi.ServerError{Code: low.Server.Code, Message: low.Server.Message, Data: data, Raw: raw}
+	return &codexapi.ServerError{Code: low.Server.Code, Message: low.Server.Message, Data: data, Raw: raw, WireBytes: low.Server.WireBytes}
 }
 
 // Events exposes the appserver's bounded observer stream. Consumers must
