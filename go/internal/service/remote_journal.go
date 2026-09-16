@@ -14,8 +14,9 @@ import (
 )
 
 var (
-	ErrRemoteCustodyUnavailable = errors.New("service: remote custody is unavailable")
-	ErrRemoteCustodyBinding     = errors.New("service: remote custody relationship is not bound")
+	ErrRemoteCustodyUnavailable     = errors.New("service: remote custody is unavailable")
+	ErrRemoteCustodyBinding         = errors.New("service: remote custody relationship is not bound")
+	ErrRemoteObservationUnsupported = errors.New("service: remote native observation is unsupported by control v1")
 )
 
 // ControlInvoker is the transport seam. Production uses SSHControlInvoker;
@@ -41,6 +42,8 @@ type RemoteJournal struct {
 	Now             func() time.Time
 
 	mu         sync.Mutex
+	initMu     sync.Mutex
+	ready      bool
 	operations map[string]Operation
 	claims     map[string]remoteClaim
 }
@@ -51,11 +54,22 @@ type remoteClaim struct {
 	request   sshproxy.ControlRequest
 	route     endpoint.Route
 	lease     *sshproxy.Lease
+	state     mektup.EvidenceState
 }
 
+func (c remoteClaim) activeOwner() bool { return c.input.Owner != "" && c.lease != nil }
+
 func (r *RemoteJournal) init() error {
-	if r == nil || r.Local == nil {
+	if r == nil {
+		return errors.New("service: nil remote journal")
+	}
+	r.initMu.Lock()
+	defer r.initMu.Unlock()
+	if r.Local == nil {
 		return errors.New("service: nil local journal")
+	}
+	if r.ready {
+		return nil
 	}
 	if r.Invoke == nil {
 		r.Invoke = SSHControlInvoker
@@ -66,12 +80,15 @@ func (r *RemoteJournal) init() error {
 	if r.PollInterval <= 0 {
 		r.PollInterval = 100 * time.Millisecond
 	}
+	r.mu.Lock()
 	if r.operations == nil {
 		r.operations = make(map[string]Operation)
 	}
 	if r.claims == nil {
 		r.claims = make(map[string]remoteClaim)
 	}
+	r.mu.Unlock()
+	r.ready = true
 	return nil
 }
 
@@ -129,7 +146,17 @@ func (r *RemoteJournal) ClaimReply(ctx context.Context, input ReplyClaimInput) (
 		return ReplyClaim{}, err
 	}
 	if !remote {
-		return r.Local.ClaimReply(ctx, input)
+		claim, err := r.Local.ClaimReply(ctx, input)
+		if err != nil {
+			return ReplyClaim{}, err
+		}
+		r.mu.Lock()
+		current, exists := r.claims[input.ReplyID]
+		if !exists || !current.activeOwner() || !claim.Joined {
+			r.claims[input.ReplyID] = remoteClaim{input: input, operation: op, state: mektup.EvidenceState(claim.State)}
+		}
+		r.mu.Unlock()
+		return claim, nil
 	}
 	request, err := r.request(op, input, "claim")
 	if err != nil {
@@ -144,7 +171,10 @@ func (r *RemoteJournal) ClaimReply(ctx context.Context, input ReplyClaimInput) (
 		return ReplyClaim{}, err
 	}
 	r.mu.Lock()
-	r.claims[input.ReplyID] = remoteClaim{input: input, operation: op, request: request, route: route, lease: claimLease(response)}
+	current, exists := r.claims[input.ReplyID]
+	if !(exists && current.activeOwner() && claim.Joined) {
+		r.claims[input.ReplyID] = remoteClaim{input: input, operation: op, request: request, route: route, lease: claimLease(response), state: mektup.EvidenceState(claim.State)}
+	}
 	r.mu.Unlock()
 	return claim, nil
 }
@@ -173,6 +203,7 @@ func (r *RemoteJournal) Heartbeat(ctx context.Context, replyID, owner, token str
 	r.mu.Lock()
 	current := r.claims[replyID]
 	current.lease = lease
+	current.state = mektup.StateReplyDispatchClaimed
 	r.claims[replyID] = current
 	r.mu.Unlock()
 	return nil
@@ -195,7 +226,15 @@ func (r *RemoteJournal) CommitReply(ctx context.Context, replyID, owner, token s
 	if err != nil {
 		return ReplyClaim{}, err
 	}
-	return decodeMutationResult(response, claim.input, false)
+	result, err := decodeMutationResult(response, claim.input, false)
+	if err == nil {
+		r.mu.Lock()
+		current := r.claims[replyID]
+		current.state = result.State
+		r.claims[replyID] = current
+		r.mu.Unlock()
+	}
+	return result, err
 }
 
 func (r *RemoteJournal) AbandonReply(ctx context.Context, replyID, owner, token string) error {
@@ -223,8 +262,10 @@ func (r *RemoteJournal) ObserveReply(ctx context.Context, replyID, nativeID, dig
 	if !remote {
 		return r.Local.ObserveReply(ctx, replyID, nativeID, digest)
 	}
-	_, err = r.status(ctx, claim, false)
-	return err
+	if claim.state == mektup.StateReplyAccepted || claim.state == mektup.StateReplyObserved {
+		return nil
+	}
+	return ErrRemoteObservationUnsupported
 }
 
 func (r *RemoteJournal) ReconcileReplyObservation(ctx context.Context, replyID, nativeID, digest string) error {
@@ -235,8 +276,10 @@ func (r *RemoteJournal) ReconcileReplyObservation(ctx context.Context, replyID, 
 	if !remote {
 		return r.Local.ReconcileReplyObservation(ctx, replyID, nativeID, digest)
 	}
-	_, err = r.status(ctx, claim, true)
-	return err
+	if claim.state == mektup.StateReplyAccepted || claim.state == mektup.StateReplyObserved {
+		return nil
+	}
+	return ErrRemoteObservationUnsupported
 }
 
 func (r *RemoteJournal) WaitReply(ctx context.Context, replyID string, timeout time.Duration) (OperationStatus, error) {
@@ -245,7 +288,7 @@ func (r *RemoteJournal) WaitReply(ctx context.Context, replyID string, timeout t
 		return OperationStatus{}, err
 	}
 	if !remote {
-		return r.Local.Lookup(ctx, replyID)
+		return r.Local.WaitReply(ctx, replyID, timeout)
 	}
 	waitCtx := ctx
 	if timeout > 0 {
@@ -276,6 +319,14 @@ func (r *RemoteJournal) WaitReply(ctx context.Context, replyID string, timeout t
 func (r *RemoteJournal) operationFor(ctx context.Context, messageID string) (Operation, error) {
 	r.mu.Lock()
 	op, ok := r.operations[messageID]
+	if !ok {
+		for _, candidate := range r.operations {
+			if candidate.InReplyTo == messageID {
+				op, ok = candidate, true
+				break
+			}
+		}
+	}
 	r.mu.Unlock()
 	if ok {
 		return op, nil
@@ -378,10 +429,25 @@ func decodeLeaseResult(response sshproxy.ControlRequest) (*sshproxy.Lease, error
 	var result struct {
 		Lease *sshproxy.Lease `json:"lease"`
 	}
-	if err := json.Unmarshal(response.Result, &result); err != nil || result.Lease == nil {
+	if err := json.Unmarshal(response.Result, &result); err != nil || result.Lease == nil || !validRemoteLease(*result.Lease) {
 		return nil, sshproxy.ErrControlValidation
 	}
 	return result.Lease, nil
+}
+
+func validRemoteLease(lease sshproxy.Lease) bool {
+	if !validRemoteTimestamp(lease.ExpiresAt) {
+		return false
+	}
+	return (lease.AcquiredAt == "" || validRemoteTimestamp(lease.AcquiredAt)) && (lease.HeartbeatAt == "" || validRemoteTimestamp(lease.HeartbeatAt))
+}
+
+func validRemoteTimestamp(value string) bool {
+	if len(value) < len("2006-01-02T15:04:05.0Z") || len(value) <= 19 || value[19] != '.' {
+		return false
+	}
+	_, err := time.Parse(time.RFC3339Nano, value)
+	return err == nil
 }
 func claimLease(response sshproxy.ControlRequest) *sshproxy.Lease {
 	var result struct {
@@ -392,10 +458,18 @@ func claimLease(response sshproxy.ControlRequest) *sshproxy.Lease {
 }
 func decodeMutationResult(response sshproxy.ControlRequest, input ReplyClaimInput, joined bool) (ReplyClaim, error) {
 	var result struct {
-		State mektup.EvidenceState `json:"state"`
-		Won   bool                 `json:"won"`
+		State        mektup.EvidenceState `json:"state"`
+		Won          bool                 `json:"won"`
+		WakeRecorded bool                 `json:"wakeRecorded"`
 	}
-	if err := json.Unmarshal(response.Result, &result); err != nil || !result.State.Valid() {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(response.Result, &raw); err != nil {
+		return ReplyClaim{}, sshproxy.ErrControlValidation
+	}
+	if _, ok := raw["wakeRecorded"]; !ok {
+		return ReplyClaim{}, sshproxy.ErrControlValidation
+	}
+	if err := json.Unmarshal(response.Result, &result); err != nil || !result.State.Valid() || !result.WakeRecorded || (result.State != mektup.StateReplyAccepted && result.State != mektup.StateReplyObserved) {
 		return ReplyClaim{}, sshproxy.ErrControlValidation
 	}
 	return ReplyClaim{ReplyID: input.ReplyID, OriginalID: input.OriginalID, Digest: input.Digest, BodySize: input.BodySize, Status: input.Status, ReplyRoute: input.ReplyRoute, CustodyRoute: input.CustodyRoute, CustodyStoreID: input.CustodyStoreID, Owner: input.Owner, State: result.State, Joined: joined, Won: result.Won}, nil
@@ -403,6 +477,8 @@ func decodeMutationResult(response sshproxy.ControlRequest, input ReplyClaimInpu
 
 func (r *RemoteJournal) status(ctx context.Context, claim remoteClaim, reconcile bool) (OperationStatus, error) {
 	op := claim.operation
+	op.MessageID = claim.input.ReplyID
+	op.InReplyTo = claim.input.OriginalID
 	request := claim.request
 	if reconcile {
 		request.Operation = "reconcile"
@@ -424,5 +500,5 @@ func (r *RemoteJournal) status(ctx context.Context, claim remoteClaim, reconcile
 	if err := json.Unmarshal(response.Result, &result); err != nil || !result.State.Valid() {
 		return OperationStatus{}, sshproxy.ErrControlValidation
 	}
-	return OperationStatus{Operation: op, State: result.State, ReplyID: claim.input.ReplyID, ReplyStatus: result.ReplyStatus, ReplyDigest: claim.input.Digest, ReplyBodySize: claim.input.BodySize}, nil
+	return OperationStatus{Operation: op, State: result.State, ReplyStatus: result.ReplyStatus, ReplyDigest: claim.input.Digest, ReplyBodySize: claim.input.BodySize}, nil
 }
