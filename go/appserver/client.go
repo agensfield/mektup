@@ -20,6 +20,8 @@ import (
 const (
 	defaultQueueCapacity = 64
 	defaultHandshakeWait = 10 * time.Second
+	defaultByteBudget    = 64 << 20
+	defaultMaxFrameBytes = 16 << 20
 )
 
 // FrameType identifies the useful subset of WebSocket frames. Control frames
@@ -265,6 +267,8 @@ type Options struct {
 	EventCapacity             int
 	HandshakeTimeout          time.Duration
 	WriterCapacity            int
+	ReadByteBudget            int64
+	EventByteBudget           int64
 }
 
 func (o Options) normalized() Options {
@@ -282,6 +286,12 @@ func (o Options) normalized() Options {
 	}
 	if o.HandshakeTimeout <= 0 {
 		o.HandshakeTimeout = defaultHandshakeWait
+	}
+	if o.ReadByteBudget <= 0 {
+		o.ReadByteBudget = defaultByteBudget
+	}
+	if o.EventByteBudget <= 0 {
+		o.EventByteBudget = defaultByteBudget
 	}
 	return o
 }
@@ -353,11 +363,17 @@ type Client struct {
 	activeKey     string
 	activeRequest bool
 	activeCancel  context.CancelFunc
+	budgetMu      sync.Mutex
+	readBytes     int64
+	eventBytes    int64
+	readBudget    int64
+	eventBudget   int64
 }
 
 type readResult struct {
 	frame Frame
 	err   error
+	bytes int64
 }
 
 // New constructs and starts a client pump. Call Initialize before operational
@@ -372,15 +388,17 @@ func New(transport Transport, options Options) *Client {
 		commandSpace: make(chan struct{}, 1),
 		reads:        make(chan readResult, maxInt(options.EventCapacity, defaultQueueCapacity)),
 		// Reserve two slots for terminal gap/disconnect evidence.
-		events:    make(chan Event, options.EventCapacity+2),
-		done:      make(chan struct{}),
-		closed:    make(chan struct{}),
-		reserved:  make(map[string]struct{}),
-		withdrawn: make(map[string]struct{}),
-		queued:    make(map[string]struct{}),
-		completed: make(map[string]WriteEvidence),
-		retired:   make(map[string]struct{}),
-		accepting: true,
+		events:      make(chan Event, options.EventCapacity+2),
+		done:        make(chan struct{}),
+		closed:      make(chan struct{}),
+		reserved:    make(map[string]struct{}),
+		withdrawn:   make(map[string]struct{}),
+		queued:      make(map[string]struct{}),
+		completed:   make(map[string]WriteEvidence),
+		retired:     make(map[string]struct{}),
+		accepting:   true,
+		readBudget:  options.ReadByteBudget,
+		eventBudget: options.EventByteBudget,
 	}
 	go c.readLoop()
 	go c.pump()
@@ -392,6 +410,71 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+var errReadByteBudget = errors.New("raw frame byte budget exceeded")
+var errFrameTooLarge = errors.New("WebSocket frame exceeds app-server limit")
+
+func (c *Client) reserveReadBytes(size int64) bool {
+	c.budgetMu.Lock()
+	defer c.budgetMu.Unlock()
+	if size < 0 || size > c.readBudget-c.readBytes {
+		return false
+	}
+	c.readBytes += size
+	return true
+}
+
+func (c *Client) releaseReadBytes(size int64) {
+	if size <= 0 {
+		return
+	}
+	c.budgetMu.Lock()
+	c.readBytes -= size
+	if c.readBytes < 0 {
+		c.readBytes = 0
+	}
+	c.budgetMu.Unlock()
+}
+
+func (c *Client) reserveEventBytes(size int64) bool {
+	c.budgetMu.Lock()
+	defer c.budgetMu.Unlock()
+	if size < 0 || size > c.eventBudget-c.eventBytes {
+		return false
+	}
+	c.eventBytes += size
+	return true
+}
+
+func (c *Client) releaseEventBytes(size int64) {
+	if size <= 0 {
+		return
+	}
+	c.budgetMu.Lock()
+	c.eventBytes -= size
+	if c.eventBytes < 0 {
+		c.eventBytes = 0
+	}
+	c.budgetMu.Unlock()
+}
+
+func eventPayloadBytes(event Event) int64 {
+	switch event.Kind {
+	case EventNotification:
+		if event.Notification == nil {
+			return 0
+		}
+		return int64(len(event.Notification.Method) + len(event.Notification.Params))
+	case EventServerRequest:
+		if event.Request == nil {
+			return 0
+		}
+		id, _ := json.Marshal(event.Request.ID)
+		return int64(len(event.Request.Method) + len(event.Request.Params) + len(id))
+	default:
+		return 0
+	}
 }
 
 var errClientClosed = io.ErrClosedPipe
@@ -828,11 +911,28 @@ func (c *Client) readLoop() {
 			}
 			return
 		}
+		size := int64(len(frame.Payload))
+		if size > defaultMaxFrameBytes {
+			select {
+			case c.reads <- readResult{err: errFrameTooLarge}:
+			case <-c.done:
+			}
+			return
+		}
+		if !c.reserveReadBytes(size) {
+			select {
+			case c.reads <- readResult{err: errReadByteBudget}:
+			case <-c.done:
+			}
+			return
+		}
 		select {
-		case c.reads <- readResult{frame: frame}:
+		case c.reads <- readResult{frame: frame, bytes: size}:
 		case <-c.done:
+			c.releaseReadBytes(size)
 			return
 		default:
+			c.releaseReadBytes(size)
 			// The reader itself is bounded. A full read queue is a proven event
 			// gap, and the pump will turn it into explicit gap/disconnect evidence.
 			select {
@@ -857,15 +957,22 @@ func (c *Client) pump() {
 		if disconnected {
 			return false
 		}
+		size := eventPayloadBytes(event)
+		if !c.reserveEventBytes(size) {
+			dropped++
+			return false
+		}
 		select {
 		case c.events <- event:
 		default:
 			if event.Kind == EventDisconnected {
 				// Keep terminal disconnect evidence by evicting one non-terminal
 				// event where possible. A gap is then emitted on the next read.
+				c.releaseEventBytes(size)
 				dropped++
 				return false
 			}
+			c.releaseEventBytes(size)
 			dropped++
 			return false
 		}
@@ -929,18 +1036,27 @@ func (c *Client) pump() {
 			}
 		}
 	drained:
-		// Terminal evidence must not disappear behind a full bounded queue. Two
-		// reserved slots are maintained by evicting queued events and folding
-		// them into an explicit gap count.
+		for len(c.reads) > 0 {
+			queued := <-c.reads
+			c.releaseReadBytes(queued.bytes)
+		}
+		// Terminal evidence must not disappear behind a full bounded queue. Clear
+		// every retained event and release its byte reservation before publishing
+		// the terminal gap/disconnect markers.
 		evicted := uint64(0)
-		for len(c.events) > cap(c.events)-2 {
-			<-c.events
+		for len(c.events) > 0 {
+			event := <-c.events
+			c.releaseEventBytes(eventPayloadBytes(event))
 			evicted++
 		}
 		totalDropped := dropped + evicted
 		if totalDropped > 0 {
 			c.events <- Event{Kind: EventGap, Gap: &Gap{Dropped: totalDropped, Generation: c.generation, Reason: "bounded event queue overflow or terminal displacement"}}
 		}
+		c.budgetMu.Lock()
+		c.readBytes = 0
+		c.eventBytes = 0
+		c.budgetMu.Unlock()
 		c.events <- Event{Kind: EventDisconnected, Disconnected: &Disconnected{Err: err, Generation: c.generation}}
 		disconnected = true
 	}
@@ -1015,7 +1131,15 @@ func (c *Client) pump() {
 						c.release(cmd.key)
 						cmd.ack <- cancelOutcome{phase: WriteProvenBeforeWrite, ok: true}
 					} else {
+						// A completed write with no response must not leave pending
+						// state and reservations alive indefinitely. Close this
+						// generation after preserving conservative may-have-written
+						// evidence and retiring the ID.
+						delete(pending, cmd.key)
+						c.releaseUnknownReservation(cmd.key, true)
 						cmd.ack <- cancelOutcome{phase: WriteMayHaveWritten, ok: false}
+						finish(errors.New("request canceled after write; outcome unknown"))
+						return
 					}
 				} else if evidence, completed := c.completedEvidence(cmd.key); completed {
 					cmd.ack <- cancelOutcome{phase: evidence.Phase, completed: true, ok: false}
@@ -1034,6 +1158,7 @@ func (c *Client) pump() {
 				return
 			}
 		case incoming := <-c.reads:
+			c.releaseReadBytes(incoming.bytes)
 			if incoming.err != nil {
 				finish(incoming.err)
 				return
@@ -1294,6 +1419,7 @@ func (c *Client) NextEvent(ctx context.Context) (Event, error) {
 		if !ok {
 			return Event{}, io.EOF
 		}
+		c.releaseEventBytes(eventPayloadBytes(event))
 		return event, nil
 	case <-ctx.Done():
 		return Event{}, ctx.Err()

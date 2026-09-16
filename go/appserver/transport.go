@@ -13,7 +13,7 @@ import (
 
 const unixHandshakeURL = "ws://localhost/rpc"
 
-const maxWebSocketMessageSize = 128 << 20
+const maxWebSocketMessageSize = 16 << 20
 
 // NetDialContext is the narrow socket seam used by the WebSocket handshake.
 // The URL and HTTP Upgrade remain owned by this package; implementations only
