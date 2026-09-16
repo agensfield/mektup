@@ -384,3 +384,16 @@ func TestDecodeObserveResultAllowsErrorWinnerWithoutCode(t *testing.T) {
 		t.Fatalf("integer bodyBytes zero rejected: %v", err)
 	}
 }
+
+func TestDecodeOriginalStatusPendingAllowsAdditiveMetadata(t *testing.T) {
+	result, err := decodeCanonicalOriginalStatus(json.RawMessage(`{"selection":"pending","traceId":"future-extension"}`))
+	if err != nil || result.Selection != "pending" {
+		t.Fatalf("additive pending metadata rejected: result=%+v err=%v", result, err)
+	}
+	for _, field := range []string{"state", "bodyBytes", "replyMessageId", "fencingToken"} {
+		data := []byte(`{"selection":"pending","` + field + `":"forbidden"}`)
+		if _, err := decodeCanonicalOriginalStatus(data); err == nil {
+			t.Fatalf("pending known field %s accepted", field)
+		}
+	}
+}

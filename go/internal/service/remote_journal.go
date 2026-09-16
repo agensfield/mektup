@@ -646,8 +646,18 @@ func decodeCanonicalOriginalStatus(data json.RawMessage) (OriginalStatusResult, 
 		return OriginalStatusResult{}, sshproxy.ErrControlValidation
 	}
 	if selection == "pending" {
-		if len(raw) != 1 {
-			return OriginalStatusResult{}, sshproxy.ErrControlValidation
+		// The wire contract is forward-compatible with additive result
+		// metadata. Reject every known field that could smuggle selected
+		// evidence or authority, while preserving unknown extensions.
+		for _, field := range []string{
+			"body", "bodyText", "bodyContent", "replyBody",
+			"fencingToken", "lease", "requestedLease", "attemptOwner",
+			"replyMessageId", "replyStatus", "replyErrorCode", "status",
+			"bodyBytes", "bodySha256", "commitSeq", "eventSeq", "nativeItemId", "state",
+		} {
+			if _, present := raw[field]; present {
+				return OriginalStatusResult{}, sshproxy.ErrControlValidation
+			}
 		}
 		return OriginalStatusResult{Selection: selection}, nil
 	}
