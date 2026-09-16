@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -242,6 +243,19 @@ func TestSendPreflightsMeasuredEnvelopeBeforeJournalOrWrite(t *testing.T) {
 	}
 	if se.Details["inputChars"].(int) <= MaxInputChars || se.Details["inputBytes"].(int) == 0 || se.Details["envelopeOverheadBytes"].(int) == 0 {
 		t.Fatalf("missing measured size evidence: %#v", se.Details)
+	}
+}
+
+func TestPreflightCharacterBoundaryIsIndependentOfUTF8Bytes(t *testing.T) {
+	atLimit := strings.Repeat("ş", MaxInputChars)
+	if len(atLimit) <= MaxInputBytes {
+		t.Fatalf("fixture bytes=%d, want above compatibility byte measurement %d", len(atLimit), MaxInputBytes)
+	}
+	if err := preflight([]byte(atLimit), atLimit); err != nil {
+		t.Fatalf("exact %d-character input rejected by byte size: %v", MaxInputChars, err)
+	}
+	if err := preflight([]byte(atLimit+"ş"), atLimit+"ş"); err == nil {
+		t.Fatalf("%d-character input accepted", MaxInputChars+1)
 	}
 }
 
