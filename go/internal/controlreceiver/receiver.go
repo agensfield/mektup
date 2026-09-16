@@ -143,6 +143,17 @@ func (r Receiver) Receive(ctx context.Context, data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if request.Operation == "originalStatus" {
+		var document map[string]json.RawMessage
+		if err := json.Unmarshal(encoded, &document); err != nil {
+			return nil, err
+		}
+		delete(document, "replyMessageId")
+		encoded, err = json.Marshal(document)
+		if err != nil {
+			return nil, err
+		}
+	}
 	limit := r.MaxOutput
 	if limit <= 0 {
 		limit = maxControlOutput
@@ -170,7 +181,7 @@ func (r Receiver) validateOriginal(ctx context.Context, j *journal.Journal, req 
 		}
 		return fmt.Errorf("%w: original operation unavailable: %v", ErrRelationshipMismatch, err)
 	}
-	if op.CustodyRoute != req.Custody.EndpointID || op.CustodyStoreID != storeID || op.ReplyRoute == "" || op.ReplyRoute != req.ReplyDestination.URI || op.ReplyEndpointID == "" || op.ReplyEndpointID != req.ReplyDestination.EndpointID || op.ReplyThreadID == "" || op.ReplyThreadID != req.ReplyDestination.ThreadID {
+	if op.OperationID != req.OperationID || op.CustodyRoute != req.Custody.EndpointID || op.CustodyStoreID != storeID || op.ReplyRoute == "" || op.ReplyRoute != req.ReplyDestination.URI || op.ReplyEndpointID == "" || op.ReplyEndpointID != req.ReplyDestination.EndpointID || op.ReplyThreadID == "" || op.ReplyThreadID != req.ReplyDestination.ThreadID {
 		return ErrRelationshipMismatch
 	}
 	return nil
@@ -354,7 +365,7 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 		switch status.Selection {
 		case "winner":
 			result["replyMessageId"] = status.Claim.ReplyID
-			result["status"] = status.Claim.Status
+			result["replyStatus"] = status.Claim.Status
 			result["bodyBytes"] = status.Claim.BodySize
 			result["bodySha256"] = status.Claim.Digest
 			result["state"] = status.Claim.State
@@ -367,7 +378,7 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 			}
 		case "terminal_unknown":
 			result["replyMessageId"] = status.Claim.ReplyID
-			result["status"] = status.Claim.Status
+			result["replyStatus"] = status.Claim.Status
 			result["bodyBytes"] = status.Claim.BodySize
 			result["bodySha256"] = status.Claim.Digest
 			result["state"] = status.Claim.State

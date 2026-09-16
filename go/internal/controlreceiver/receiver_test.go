@@ -181,7 +181,17 @@ func TestReceiverOriginalStatusIsTokenlessAndWinnerFirst(t *testing.T) {
 	q.ReplyStatus = ""
 	q.AttemptOwner = ""
 	q.ReplyErrorCode = ""
-	response, err := receiver.Receive(context.Background(), mustMarshal(t, q))
+	raw := mustMarshal(t, q)
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	delete(document, "replyMessageId")
+	raw, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := receiver.Receive(context.Background(), raw)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,11 +203,57 @@ func TestReceiverOriginalStatusIsTokenlessAndWinnerFirst(t *testing.T) {
 	if err := json.Unmarshal(parsed.Result, &result); err != nil {
 		t.Fatal(err)
 	}
-	if result["selection"] != "winner" || result["replyMessageId"] != replyID {
+	if result["selection"] != "winner" || result["replyMessageId"] != replyID || result["replyStatus"] != "success" {
 		t.Fatalf("originalStatus result %#v", result)
 	}
 	if _, ok := result["fencingToken"]; ok {
 		t.Fatal("originalStatus leaked token")
+	}
+}
+
+func TestReceiverOriginalStatusRejectsReplyIDPresenceAndOperationMismatch(t *testing.T) {
+	j, _ := openReceiverJournal(t, time.Minute)
+	prepareOriginal(t, j)
+	receiver := Receiver{Registry: staticResolver{store: Store{Journal: j, StoreID: j.StoreID(), EndpointID: receiverEndpoint, CloseFunc: func() error { return nil }}}, LocalEndpointID: receiverEndpoint, Destination: localDestination()}
+	var err error
+	base := request(j)
+	base.Operation = "originalStatus"
+	base.BodyBytes = nil
+	base.BodySHA256 = ""
+	base.ReplyStatus = ""
+	base.AttemptOwner = ""
+	base.ReplyErrorCode = ""
+	for name, replyValue := range map[string]any{"empty": "", "null": nil, "nonempty": replyID} {
+		t.Run(name, func(t *testing.T) {
+			raw := mustMarshal(t, base)
+			var document map[string]any
+			if err := json.Unmarshal(raw, &document); err != nil {
+				t.Fatal(err)
+			}
+			document["replyMessageId"] = replyValue
+			raw, err = json.Marshal(document)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := receiver.Receive(context.Background(), raw); !errors.Is(err, sshproxy.ErrControlValidation) {
+				t.Fatalf("replyMessageId %v accepted: %v", replyValue, err)
+			}
+		})
+	}
+	mismatch := base
+	mismatch.OperationID = "op_0198f0e0-0000-7000-8000-000000000099"
+	raw := mustMarshal(t, mismatch)
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	delete(document, "replyMessageId")
+	raw, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := receiver.Receive(context.Background(), raw); !errors.Is(err, ErrRelationshipMismatch) {
+		t.Fatalf("operation mismatch error: %v", err)
 	}
 }
 
