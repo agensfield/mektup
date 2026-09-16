@@ -677,6 +677,25 @@ func TestMessagingReceiptPersistsBeforeOutputAndWaitResolvesReceiptID(t *testing
 	if code := app.Run([]string{"wait", "portable-reference", "--receipt-file", portablePath, "--timeout", "1ms"}); code != int(cli.ExitIncomplete) {
 		t.Fatalf("wait receipt reference exit=%d output=%s", code, out.String())
 	}
+	j, err = journal.Open(context.Background(), journal.Options{StateDir: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := j.Receipt(context.Background(), event.Data.Receipt.ReceiptID)
+	if err != nil {
+		_ = j.Close()
+		t.Fatal(err)
+	}
+	stored.Warnings = append(stored.Warnings, mektup.Warning{Code: mektup.WarningCleanupIncomplete, Message: "later cleanup warning"})
+	if err := j.PutReceipt(context.Background(), stored); err != nil {
+		_ = j.Close()
+		t.Fatal(err)
+	}
+	_ = j.Close()
+	out.Reset()
+	if code := app.Run([]string{"wait", "portable-reference", "--receipt-file", portablePath, "--timeout", "1ms"}); code != int(cli.ExitIncomplete) {
+		t.Fatalf("advisory update invalidated portable identity: exit=%d output=%s", code, out.String())
+	}
 	var imported mektup.Receipt
 	portableData, err := os.ReadFile(portablePath)
 	if err != nil {
@@ -696,6 +715,62 @@ func TestMessagingReceiptPersistsBeforeOutputAndWaitResolvesReceiptID(t *testing
 	out.Reset()
 	if code := app.Run([]string{"wait", "portable-reference", "--receipt-file", portablePath, "--timeout", "1ms"}); code != int(cli.ExitRejected) {
 		t.Fatalf("mutated portable receipt exit=%d output=%s", code, out.String())
+	}
+}
+
+func TestPortableAuthorityComparatorUsesImmutableClaims(t *testing.T) {
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	base := mektup.Receipt{
+		Schema: mektup.ReceiptSchema, ReceiptID: mektup.NewReceiptID(), OperationID: mektup.NewOperationID(), Operation: "send",
+		State:      mektup.StateAccepted,
+		Source:     mektup.ReceiptIdentity{EndpointID: endpointID(), ThreadID: "source", Resolved: "codex://local/thread/source"},
+		Target:     mektup.ReceiptIdentity{EndpointID: "ep_0198f0e0-0000-7000-8000-000000000002", ThreadID: "target", Resolved: "codex://local/thread/target"},
+		Message:    mektup.ReceiptMessage{MessageID: mektup.NewMessageID(), ClientMessageID: mektup.NewMessageID(), Kind: string(mektup.KindMessage), ReplyRequested: true, PayloadBytes: 4, PayloadSHA256: "sha256:" + strings.Repeat("a", 64), TurnID: "turn_0198f0e0-0000-7000-8000-000000000003"},
+		ContentRef: &mektup.ContentRef{EndpointID: endpointID(), ThreadID: "source", TurnID: "turn_0198f0e0-0000-7000-8000-000000000003", ItemID: "item-1", ClientMessageID: "client-1", PayloadBytes: 4, PayloadSHA256: "sha256:" + strings.Repeat("a", 64)},
+		CreatedAt:  now, UpdatedAt: now,
+	}
+	if !portableAuthorityEqual(base, func() mektup.Receipt {
+		updated := base
+		updated.State = mektup.StateReplyAccepted
+		updated.UpdatedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		updated.Warnings = []mektup.Warning{{Code: mektup.WarningCleanupIncomplete, Message: "advisory"}}
+		return updated
+	}()) {
+		t.Fatal("advisory receipt changes invalidated immutable authority")
+	}
+	turnChanged := base
+	turnChanged.Message.TurnID = "turn_0198f0e0-0000-7000-8000-000000000004"
+	if portableAuthorityEqual(base, turnChanged) {
+		t.Fatal("changed native turn identity was accepted")
+	}
+	contentChanged := base
+	content := *base.ContentRef
+	content.ItemID = "item-2"
+	contentChanged.ContentRef = &content
+	if portableAuthorityEqual(base, contentChanged) {
+		t.Fatal("changed content identity was accepted")
+	}
+	withCustody := base
+	withCustody.Evidence = []mektup.EvidenceRecord{{Details: map[string]any{"custodyRoute": "custody-route", "custodyStoreId": "store_0198f0e0-0000-7000-8000-000000000005"}}}
+	if portableAuthorityEqual(base, withCustody) == false {
+		// A stronger current durable custody claim is allowed when the old
+		// portable export did not represent it.
+		t.Fatal("durable custody strengthening rejected an older export")
+	}
+	importedCustody := withCustody
+	if portableAuthorityEqual(importedCustody, base) {
+		t.Fatal("portable custody claim was accepted without durable authority")
+	}
+	conflicting := withCustody
+	conflicting.Evidence = append(conflicting.Evidence, mektup.EvidenceRecord{Details: map[string]any{"custodyRoute": "other-route"}})
+	if portableAuthorityEqual(conflicting, withCustody) {
+		t.Fatal("conflicting custody claims were accepted")
+	}
+	malformed := withCustody
+	malformed.Evidence = append([]mektup.EvidenceRecord(nil), withCustody.Evidence...)
+	malformed.Evidence[0].Details = map[string]any{"custodyRoute": 42, "custodyStoreId": "store_0198f0e0-0000-7000-8000-000000000005"}
+	if portableAuthorityEqual(malformed, withCustody) {
+		t.Fatal("malformed custody claim was accepted")
 	}
 }
 

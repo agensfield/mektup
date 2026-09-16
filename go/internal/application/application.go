@@ -691,7 +691,7 @@ func (r applicationImportResolver) ResolveWaitReference(ctx context.Context, _ c
 		return "", portableRouteError(fmt.Errorf("portable receipt is not locally durable: %w", err))
 	}
 	projected, projectionErr := receipts.PortableProjection(stored)
-	if projectionErr != nil || !portableReceiptEqual(projected, imported.Receipt) {
+	if projectionErr != nil || !portableAuthorityEqual(imported.Receipt, projected) {
 		return "", &cli.Error{Code: "message_identity_conflict", Message: "portable receipt conflicts with durable operation identity", Effect: "rejected", Exit: cli.ExitRejected}
 	}
 	return stored.OperationID, nil
@@ -701,10 +701,78 @@ func portableRouteError(err error) error {
 	return &cli.Error{Code: "route_unavailable", Message: "portable receipt route or custody authority is unavailable", Effect: "rejected", Exit: cli.ExitRejected, Details: map[string]any{"cause": err.Error()}}
 }
 
-func portableReceiptEqual(left, right mektup.Receipt) bool {
-	leftJSON, leftErr := json.Marshal(left)
-	rightJSON, rightErr := json.Marshal(right)
-	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
+func portableAuthorityEqual(left, right mektup.Receipt) bool {
+	if left.ReceiptID != right.ReceiptID || left.OperationID != right.OperationID || left.Operation != right.Operation {
+		return false
+	}
+	if !portableIdentityEqual(left.Source, right.Source) || !portableIdentityEqual(left.Target, right.Target) {
+		return false
+	}
+	lm, rm := left.Message, right.Message
+	if lm.MessageID != rm.MessageID || lm.ClientMessageID != rm.ClientMessageID || (lm.TurnID != "" && lm.TurnID != rm.TurnID) || lm.InReplyTo != rm.InReplyTo || lm.Kind != rm.Kind || lm.ReplyRequested != rm.ReplyRequested || lm.PayloadBytes != rm.PayloadBytes || lm.PayloadSHA256 != rm.PayloadSHA256 {
+		return false
+	}
+	if !portableContentRefEqual(left.ContentRef, right.ContentRef) {
+		return false
+	}
+	leftCustody, leftHasCustody, leftCustodyValid := receiptCustodyTuple(left)
+	rightCustody, rightHasCustody, rightCustodyValid := receiptCustodyTuple(right)
+	if !leftCustodyValid || !rightCustodyValid || (leftHasCustody && (!rightHasCustody || (leftCustody.route != "" && leftCustody.route != rightCustody.route) || (leftCustody.store != "" && leftCustody.store != rightCustody.store))) {
+		return false
+	}
+	return true
+}
+
+func portableIdentityEqual(left, right mektup.ReceiptIdentity) bool {
+	return left.EndpointID == right.EndpointID && left.ThreadID == right.ThreadID && left.Resolved == right.Resolved
+}
+
+type custodyTuple struct {
+	route string
+	store string
+}
+
+func portableContentRefEqual(left, right *mektup.ContentRef) bool {
+	if left == nil {
+		return true
+	}
+	if right == nil {
+		return false
+	}
+	return left.EndpointID == right.EndpointID && left.ThreadID == right.ThreadID && left.TurnID == right.TurnID && left.ItemID == right.ItemID && left.ClientMessageID == right.ClientMessageID && left.PayloadBytes == right.PayloadBytes && left.PayloadSHA256 == right.PayloadSHA256
+}
+
+func receiptCustodyTuple(receipt mektup.Receipt) (custodyTuple, bool, bool) {
+	var tuple custodyTuple
+	valid := true
+	for _, evidence := range receipt.Evidence {
+		if evidence.Details == nil {
+			continue
+		}
+		if raw, present := evidence.Details["custodyRoute"]; present {
+			value, ok := raw.(string)
+			if !ok || value == "" {
+				valid = false
+				continue
+			}
+			if tuple.route != "" && tuple.route != value {
+				valid = false
+			}
+			tuple.route = value
+		}
+		if raw, present := evidence.Details["custodyStoreId"]; present {
+			value, ok := raw.(string)
+			if !ok || value == "" {
+				valid = false
+				continue
+			}
+			if tuple.store != "" && tuple.store != value {
+				valid = false
+			}
+			tuple.store = value
+		}
+	}
+	return tuple, tuple.route != "" || tuple.store != "", valid
 }
 
 func (r applicationImportResolver) verifyReceiptRoute(receipt mektup.Receipt) (endpoint.Endpoint, error) {
