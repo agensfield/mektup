@@ -663,11 +663,14 @@ func (j *Journal) RecordObservedReplyAndWinner(ctx context.Context, candidate Cl
 			if _, err := tx.Exec("UPDATE reply_claims SET state=?,token='',lease_until=0,accepted_at=?,updated_at=? WHERE reply_id=?", string(StateReplyObserved), now, now, candidate.ReplyID); err != nil {
 				return err
 			}
-			if priorCandidateState != StateReplyObserved {
+			if priorCandidateState != StateReplyObserved && candidate.ReplyID != winnerReplyID {
 				if err := emit(tx, "reply.observed", "", candidate.ReplyID, StateReplyObserved, now); err != nil {
 					return err
 				}
 			}
+		}
+		if _, _, err := assignReplyCommitTx(tx, candidate.OriginalID, candidate.ReplyID, now); err != nil {
+			return err
 		}
 		if err := validateObservationIdentityTx(tx, candidate.ReplyID, nativeItemID, candidate.Digest, endpointID, controlRoute); err != nil {
 			return err

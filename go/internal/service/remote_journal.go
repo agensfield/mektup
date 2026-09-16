@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -660,7 +661,7 @@ func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.Cont
 		}
 		out.WinnerNativeID = winnerNative
 	}
-	if raw, ok := winner["replyMessageId"]; !ok || json.Unmarshal(raw, &out.WinnerReplyID) != nil || out.WinnerReplyID == "" {
+	if raw, ok := winner["replyMessageId"]; !ok || json.Unmarshal(raw, &out.WinnerReplyID) != nil || mektup.ValidateID(out.WinnerReplyID, mektup.MessageIDPrefix) != nil {
 		return out, sshproxy.ErrControlValidation
 	}
 	if raw, ok := winner["commitSeq"]; !ok || json.Unmarshal(raw, &out.WinnerCommitSeq) != nil || out.WinnerCommitSeq < 1 {
@@ -669,7 +670,7 @@ func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.Cont
 	if raw, ok := winner["status"]; !ok || json.Unmarshal(raw, &out.WinnerStatus) != nil || out.WinnerStatus == "" {
 		return out, sshproxy.ErrControlValidation
 	}
-	if raw, ok := winner["bodySha256"]; !ok || json.Unmarshal(raw, &out.WinnerDigest) != nil || out.WinnerDigest == "" {
+	if raw, ok := winner["bodySha256"]; !ok || json.Unmarshal(raw, &out.WinnerDigest) != nil || !validWinnerDigest(out.WinnerDigest) {
 		return out, sshproxy.ErrControlValidation
 	}
 	if raw, ok := winner["bodyBytes"]; !ok || json.Unmarshal(raw, &out.WinnerBodySize) != nil || out.WinnerBodySize < 0 {
@@ -679,6 +680,12 @@ func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.Cont
 		if json.Unmarshal(raw, &out.WinnerErrorCode) != nil || out.WinnerErrorCode == "" {
 			return out, sshproxy.ErrControlValidation
 		}
+	}
+	if out.WinnerStatus == "success" && out.WinnerErrorCode != "" {
+		return out, sshproxy.ErrControlValidation
+	}
+	if out.WinnerStatus == "error" && out.WinnerErrorCode == "" {
+		return out, sshproxy.ErrControlValidation
 	}
 	provenanceRaw, ok := raw["provenance"]
 	if !ok || string(bytes.TrimSpace(provenanceRaw)) == "null" {
@@ -692,6 +699,18 @@ func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.Cont
 		return out, sshproxy.ErrControlValidation
 	}
 	return out, nil
+}
+
+func validWinnerDigest(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") || strings.ToLower(value) != value {
+		return false
+	}
+	for _, r := range value[len("sha256:"):] {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 func (r *RemoteJournal) status(ctx context.Context, claim remoteClaim, reconcile bool) (OperationStatus, error) {
