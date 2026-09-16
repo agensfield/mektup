@@ -14,8 +14,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"time"
+
+	"golang.org/x/mod/semver"
 )
 
 const (
@@ -83,7 +86,36 @@ func BuildInfoFromBuildVars() BuildInfo {
 	if len(servers) == 0 {
 		servers = append(servers, DefaultBuildInfo.TestedCodexServers...)
 	}
-	return BuildInfo{Version: buildVersion, Commit: buildCommit, InstallKind: buildInstallKind, ContractVersion: buildContractVersion, TestedCodexServers: servers}
+	version, commit, installKind := buildVersion, buildCommit, buildInstallKind
+	if info, ok := debug.ReadBuildInfo(); ok {
+		version, commit, installKind = resolveModuleBuildInfo(version, commit, installKind, info)
+	}
+	return BuildInfo{Version: version, Commit: commit, InstallKind: installKind, ContractVersion: buildContractVersion, TestedCodexServers: servers}
+}
+
+func resolveModuleBuildInfo(version, commit, installKind string, info *debug.BuildInfo) (string, string, string) {
+	if info == nil {
+		return version, commit, installKind
+	}
+	// GoReleaser's explicit metadata remains authoritative. Ordinary
+	// `go install module/cmd@vX.Y.Z` has no ldflag seam, but Go embeds the main
+	// module version in runtime build info. Use it only when the binary still
+	// carries the source defaults.
+	if version == "dev" && info.Main.Path == "github.com/agensfield/mektup/go" && semver.IsValid(info.Main.Version) {
+		version = strings.TrimPrefix(info.Main.Version, "v")
+		if installKind == "source" {
+			installKind = "go-install"
+		}
+	}
+	if commit == "unknown" {
+		for _, setting := range info.Settings {
+			if setting.Key == "vcs.revision" && setting.Value != "" {
+				commit = setting.Value
+				break
+			}
+		}
+	}
+	return version, commit, installKind
 }
 
 // IDGenerator is injectable for deterministic tests and for a future shared

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"runtime/debug"
 	"strings"
 	"testing"
 )
@@ -128,6 +129,25 @@ func TestVersionReportsLockedContractRevision(t *testing.T) {
 	}
 	if version.ContractVersion != "1.0.5" {
 		t.Fatalf("contract version=%q, want 1.0.5", version.ContractVersion)
+	}
+}
+
+func TestModuleBuildInfoIdentifiesGoInstallWithoutOverridingReleaseMetadata(t *testing.T) {
+	info := &debug.BuildInfo{
+		Main:     debug.Module{Path: "github.com/agensfield/mektup/go", Version: "v1.0.0"},
+		Settings: []debug.BuildSetting{{Key: "vcs.revision", Value: "0123456789abcdef"}},
+	}
+	version, commit, kind := resolveModuleBuildInfo("dev", "unknown", "source", info)
+	if version != "1.0.0" || commit != "0123456789abcdef" || kind != "go-install" {
+		t.Fatalf("go-install metadata = version %q commit %q kind %q", version, commit, kind)
+	}
+	version, commit, kind = resolveModuleBuildInfo("1.0.0", "release-commit", "github-release", info)
+	if version != "1.0.0" || commit != "release-commit" || kind != "github-release" {
+		t.Fatalf("release metadata was overridden = version %q commit %q kind %q", version, commit, kind)
+	}
+	version, _, kind = resolveModuleBuildInfo("dev", "unknown", "source", &debug.BuildInfo{Main: debug.Module{Path: "github.com/agensfield/mektup/go", Version: "(devel)"}})
+	if version != "dev" || kind != "source" {
+		t.Fatalf("local source build misidentified = version %q kind %q", version, kind)
 	}
 }
 
