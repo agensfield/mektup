@@ -43,7 +43,7 @@ func (r ResolverAdapter) Resolve(ctx context.Context, selector string) (service.
 	if resolved.ThreadID == "" {
 		return service.ResolvedTarget{}, fmt.Errorf("runtime: resolver returned an empty Codex thread ID")
 	}
-	uri := codexURI(resolved.Endpoint.Alias, resolved.ThreadID)
+	uri := codexURI(resolved.Endpoint.ID, resolved.ThreadID)
 	loaded, persistent := true, true
 	if r.StateProbe != nil {
 		loaded, persistent, err = r.StateProbe(ctx, resolved.Endpoint.ID, resolved.ThreadID)
@@ -59,7 +59,7 @@ func (r ResolverAdapter) ResolveSource(_ context.Context, source string) (servic
 	if err != nil {
 		return service.SourceIdentity{}, err
 	}
-	uri := codexURI(resolved.Endpoint.Alias, resolved.ThreadID)
+	uri := codexURI(resolved.Endpoint.ID, resolved.ThreadID)
 	return service.SourceIdentity{EndpointID: resolved.Endpoint.ID, URI: uri, Human: false, CustodyEndpointID: firstNonEmpty(r.CustodyEndpointID, resolved.Endpoint.ID), CustodyStoreID: r.CustodyStoreID}, nil
 }
 

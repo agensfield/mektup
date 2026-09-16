@@ -26,7 +26,7 @@ func TestResolverPinsEndpointAndUsesExplicitRuntimeStateProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !probed || got.EndpointID != testTargetEndpoint || got.ThreadID != "thread-1" || got.Loaded || !got.Persistent || got.URI != "codex://target/thread/thread-1" {
+	if !probed || got.EndpointID != testTargetEndpoint || got.ThreadID != "thread-1" || got.Loaded || !got.Persistent || got.URI != "codex://"+testTargetEndpoint+"/thread/thread-1" {
 		t.Fatalf("pinned target = %#v", got)
 	}
 }

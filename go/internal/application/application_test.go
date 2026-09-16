@@ -3,7 +3,9 @@ package application
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -675,6 +677,15 @@ type messagingFakeSession struct {
 	detachErr  error
 }
 
+type originalMessagingSession struct {
+	messagingFakeSession
+	history []codexapi.Turn
+}
+
+func (s originalMessagingSession) History(context.Context, string) ([]codexapi.Turn, error) {
+	return s.history, nil
+}
+
 func (s messagingFakeSession) EndpointID() string { return s.endpointID }
 func (messagingFakeSession) StartOrSteer(context.Context, string, string, string) (runtime.TurnResult, error) {
 	return runtime.TurnResult{TurnID: "turn_01999999-9999-7999-8999-999999999999", Evidence: "fake accepted"}, nil
@@ -722,6 +733,51 @@ func TestMessagingCompositionRegistersOnlyReplyCustody(t *testing.T) {
 	}
 	if _, err := os.Stat(registryPath); err != nil {
 		t.Fatalf("reply-requesting send did not register custody: %v", err)
+	}
+}
+
+func TestApplicationReplyResolvesStableOriginalEnvelopeAfterCanonicalWireSend(t *testing.T) {
+	root := t.TempDir()
+	codexHome := filepath.Join(root, "codex")
+	if err := os.MkdirAll(filepath.Join(codexHome, "app-server-control"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "app-server-control", "app-server-control.sock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	configured := endpoint.NewStore(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"))
+	configured.IdentityHome = filepath.Join(root, "identity")
+	local, err := configured.EnsureBuiltinLocal(codexHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityJournal, err := journal.Open(context.Background(), journal.Options{StateDir: filepath.Join(root, "state")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeID := identityJournal.StoreID()
+	if _, err := identityJournal.Prepare(context.Background(), journal.Operation{OperationID: "op_0198f0e0-0000-7000-8000-000000000120", MessageID: "msg_0198f0e0-0000-7000-8000-000000000121", SourceRoute: "codex://" + local.ID + "/thread/source", TargetRoute: "codex://" + local.ID + "/thread/source", Semantics: "message", SourceEndpointID: local.ID, TargetEndpointID: local.ID, ReplyRoute: "codex://" + local.ID + "/thread/source", ReplyEndpointID: local.ID, CustodyRoute: local.ID, CustodyStoreID: storeID, Digest: "sha256:" + strings.Repeat("a", 64), BodySize: 8}); err != nil {
+		t.Fatal(err)
+	}
+	_ = identityJournal.Close()
+	original := mektup.Envelope{MessageID: "msg_0198f0e0-0000-7000-8000-000000000121", Kind: mektup.KindMessage, FromEndpointID: local.ID, From: "codex://" + local.ID + "/thread/source", FromKind: "agent", ToEndpointID: local.ID, To: "codex://" + local.ID + "/thread/source", RequestedTarget: "source", ReplyRequested: true, ReplyEndpointID: local.ID, ReplyTo: "codex://" + local.ID + "/thread/source", ReplyCustodyEndpointID: local.ID, Body: "question", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	original.ReplyCustodyStoreID = storeID
+	original.PayloadBytes = uint64(len(original.Body))
+	digest := sha256.Sum256([]byte(original.Body))
+	original.PayloadSHA256 = "sha256:" + hex.EncodeToString(digest[:])
+	envelopeText, err := mektup.RenderEnvelope(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, _ := json.Marshal([]map[string]string{{"type": "text", "text": string(envelopeText)}})
+	item, _ := json.Marshal(map[string]any{"type": "userMessage", "id": "item_0198f0e0-0000-7000-8000-000000000122", "clientId": original.MessageID, "content": json.RawMessage(content)})
+	items := json.RawMessage("[" + string(item) + "]")
+	session := originalMessagingSession{messagingFakeSession: messagingFakeSession{endpointID: local.ID}, history: []codexapi.Turn{{ID: "turn_0198f0e0-0000-7000-8000-000000000123", RawObject: codexapi.RawObject{Fields: map[string]json.RawMessage{"items": items}}}}}
+	env := New(Options{CodexHome: codexHome, ConfigPath: filepath.Join(root, "endpoints.json"), StateDir: filepath.Join(root, "state"), IdentityHome: filepath.Join(root, "identity"), CurrentThreadID: "source", ThreadStateProbe: func(context.Context, string, string) (bool, bool, error) { return true, true, nil }, SessionFactory: runtime.SessionFactoryFunc(func(_ context.Context, ep endpoint.Endpoint) (runtime.Session, error) { return session, nil })})
+	out := &bytes.Buffer{}
+	app := &cli.App{Out: out, Err: &bytes.Buffer{}, Executor: env, Env: []string{"MEKTUP_AGENT=1", "CODEX_HOME=" + codexHome, "CODEX_THREAD_ID=source", "MEKTUP_CONFIG=" + filepath.Join(root, "endpoints.json"), "MEKTUP_STATE_DIR=" + filepath.Join(root, "state")}}
+	if code := app.Run([]string{"reply", original.MessageID, "answer"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("reply with stable original route exit=%d output=%s", code, out.String())
 	}
 }
 
