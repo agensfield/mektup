@@ -21,6 +21,7 @@ const (
 
 var (
 	ErrInvalidTarget       = errors.New("invalid endpoint target")
+	ErrEndpointMismatch    = errors.New("target endpoint does not match selected endpoint")
 	ErrEndpointRequired    = errors.New("target endpoint is required")
 	ErrEndpointNotFound    = errors.New("endpoint is not configured")
 	ErrDuplicateAlias      = errors.New("endpoint alias is already configured")

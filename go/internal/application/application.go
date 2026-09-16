@@ -404,6 +404,7 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 		Connections:    connections,
 		Endpoints:      endpoints,
 		EndpointHealth: endpointHealth{factory: connections},
+		Targets:        threadTargetResolver{store: store, codexHome: firstNonEmpty(inv.Resolved.CodexHome, e.options.CodexHome), herdr: e.herdrResolver()},
 		Storage:        storagePortFor(inv, j, stateDir),
 		Doctor:         doctorPort{},
 		Input:          input,
@@ -960,6 +961,38 @@ func (f *connectionFacts) Get(id string) (connection.Info, bool) {
 type endpointPort struct {
 	store    endpoint.EndpointStore
 	receipts *receiptStore
+}
+
+type threadTargetResolver struct {
+	store     endpoint.EndpointStore
+	codexHome string
+	herdr     *endpoint.HerdrResolver
+}
+
+func (r threadTargetResolver) ResolveThread(ctx context.Context, selector, endpointOverride string) (executor.ThreadTarget, error) {
+	if !strings.Contains(selector, "://") {
+		ep, err := r.store.ResolveEndpoint(endpointOverride, r.codexHome)
+		if err != nil {
+			return executor.ThreadTarget{}, err
+		}
+		return executor.ThreadTarget{Endpoint: ep.ID, ThreadID: selector, URI: "codex://" + ep.Alias + "/thread/" + selector}, nil
+	}
+	target, err := endpoint.ParseTarget(selector)
+	if err != nil {
+		return executor.ThreadTarget{}, err
+	}
+	if target.Kind == endpoint.TargetCodex && endpointOverride != "" && endpointOverride != "local" {
+		explicit, explicitErr := r.store.ResolveEndpoint(target.Endpoint, r.codexHome)
+		override, overrideErr := r.store.ResolveEndpoint(endpointOverride, r.codexHome)
+		if explicitErr != nil || overrideErr != nil || explicit.ID != override.ID {
+			return executor.ThreadTarget{}, endpoint.ErrEndpointMismatch
+		}
+	}
+	resolved, err := r.store.ResolveDestination(ctx, target, endpointOverride, r.codexHome, r.herdr)
+	if err != nil {
+		return executor.ThreadTarget{}, err
+	}
+	return executor.ThreadTarget{Endpoint: resolved.Endpoint.ID, ThreadID: resolved.ThreadID, URI: target.String()}, nil
 }
 
 func (p endpointPort) List() ([]endpoint.Endpoint, error)              { return p.store.List() }

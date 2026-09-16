@@ -92,6 +92,18 @@ type EndpointChecker interface {
 	Check(context.Context, endpoint.Endpoint) (any, error)
 }
 
+type ThreadTarget struct {
+	Endpoint string
+	ThreadID string
+	URI      string
+}
+
+// ThreadTargetResolver converts presentation selectors to a pinned endpoint
+// identity and native thread ID before any Codex adapter call.
+type ThreadTargetResolver interface {
+	ResolveThread(context.Context, string, string) (ThreadTarget, error)
+}
+
 type StoragePort interface {
 	Status(context.Context) (journal.StorageStatus, error)
 	Check(context.Context) (journal.StorageCheck, error)
@@ -133,6 +145,7 @@ type Ports struct {
 	Connections    ConnectionFactory
 	Endpoints      EndpointPort
 	EndpointHealth EndpointChecker
+	Targets        ThreadTargetResolver
 	Storage        StoragePort
 	Doctor         DoctorPort
 	Input          InputPort
@@ -225,7 +238,11 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		return cli.ExecutionResult{}, missing("receipt journal")
 	}
 	needsExperimental := inv.Position[0] == "fork" && inv.Option("before-turn") != ""
-	conn, api, err := e.openWithOptions(ctx, inv.Resolved.Endpoint, OpenOptions{ExperimentalAPI: needsExperimental})
+	endpointSelector, threadID, err := e.resolveThreadTarget(ctx, inv)
+	if err != nil {
+		return cli.ExecutionResult{}, err
+	}
+	conn, api, err := e.openWithOptions(ctx, endpointSelector, OpenOptions{ExperimentalAPI: needsExperimental})
 	if err != nil {
 		return cli.ExecutionResult{}, err
 	}
@@ -267,7 +284,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread read requires a thread identifier")
 		}
-		r, callErr := api.ThreadRead(ctx, codexapi.ThreadReadOptions{ThreadID: inv.Position[1]})
+		r, callErr := api.ThreadRead(ctx, codexapi.ThreadReadOptions{ThreadID: threadID})
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
@@ -277,7 +294,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread turns requires a thread identifier")
 		}
-		r, callErr := api.ThreadTurns(ctx, codexapi.TurnsOptions{ThreadID: inv.Position[1], Cursor: inv.Option("cursor"), Limit: optionInt(inv, "limit"), SortDirection: inv.Option("order"), ItemsView: inv.Option("view")})
+		r, callErr := api.ThreadTurns(ctx, codexapi.TurnsOptions{ThreadID: threadID, Cursor: inv.Option("cursor"), Limit: optionInt(inv, "limit"), SortDirection: inv.Option("order"), ItemsView: inv.Option("view")})
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
@@ -289,7 +306,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread items requires a thread identifier")
 		}
-		r, callErr := api.ThreadItems(ctx, codexapi.ItemsOptions{ThreadID: inv.Position[1], TurnID: inv.Option("turn"), Cursor: inv.Option("cursor"), Limit: optionInt(inv, "limit"), SortDirection: inv.Option("order")})
+		r, callErr := api.ThreadItems(ctx, codexapi.ItemsOptions{ThreadID: threadID, TurnID: inv.Option("turn"), Cursor: inv.Option("cursor"), Limit: optionInt(inv, "limit"), SortDirection: inv.Option("order")})
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
@@ -312,7 +329,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread resume requires a thread identifier")
 		}
-		r, callErr := api.ThreadResume(ctx, codexapi.ResumeOptions{ThreadID: inv.Position[1]})
+		r, callErr := api.ThreadResume(ctx, codexapi.ResumeOptions{ThreadID: threadID})
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
@@ -321,7 +338,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread fork requires a thread identifier")
 		}
-		r, callErr := api.ThreadFork(ctx, codexapi.ForkOptions{ThreadID: inv.Position[1], ThroughTurnID: inv.Option("through-turn"), BeforeTurnID: inv.Option("before-turn"), ExactRead: nil})
+		r, callErr := api.ThreadFork(ctx, codexapi.ForkOptions{ThreadID: threadID, ThroughTurnID: inv.Option("through-turn"), BeforeTurnID: inv.Option("before-turn"), ExactRead: nil})
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
@@ -338,6 +355,28 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		return e.collectionResult(ctx, kind, resultKind, data, cursor, warnings, mutating, inv.Resolved.Endpoint)
 	}
 	return e.result(ctx, kind, data, cursor, warnings, mutating, inv.Resolved.Endpoint)
+}
+
+func (e *Executor) resolveThreadTarget(ctx context.Context, inv cli.Invocation) (string, string, error) {
+	sub := inv.Position[0]
+	if sub == "list" || sub == "start" {
+		return inv.Resolved.Endpoint, "", nil
+	}
+	if len(inv.Position) < 2 {
+		return "", "", usage("thread target is required")
+	}
+	selector := inv.Position[1]
+	if e.ports.Targets != nil {
+		resolved, err := e.ports.Targets.ResolveThread(ctx, selector, inv.Resolved.Endpoint)
+		if err != nil {
+			return "", "", mapError(err, "not_sent")
+		}
+		return resolved.Endpoint, resolved.ThreadID, nil
+	}
+	if strings.Contains(selector, "://") {
+		return "", "", &cli.Error{Code: "invalid_target", Message: "thread target resolver is required for URI targets", Effect: "not_sent", Exit: cli.ExitUsage}
+	}
+	return inv.Resolved.Endpoint, selector, nil
 }
 
 func (e *Executor) search(ctx context.Context, inv cli.Invocation) (result cli.ExecutionResult, execErr error) {
@@ -966,6 +1005,15 @@ func mapError(err error, effect string) error {
 	}
 	if errors.Is(err, connection.ErrUnsupported) {
 		return &cli.Error{Code: "unsupported_server_version", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
+	}
+	if errors.Is(err, endpoint.ErrInvalidTarget) {
+		return &cli.Error{Code: "invalid_target", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitUsage}
+	}
+	if errors.Is(err, endpoint.ErrEndpointRequired) || errors.Is(err, endpoint.ErrEndpointNotFound) {
+		return &cli.Error{Code: "endpoint_unavailable", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
+	}
+	if errors.Is(err, endpoint.ErrEndpointMismatch) {
+		return &cli.Error{Code: "endpoint_unavailable", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
 	}
 	var callErr *connection.CallError
 	if errors.As(err, &callErr) && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) && callErr.Evidence.Phase >= appserver.WriteMayHaveWritten {

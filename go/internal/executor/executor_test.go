@@ -23,12 +23,16 @@ import (
 type fakeCodex struct {
 	scoped    bool
 	allowName bool
+	threadIDs *[]string
 }
 
 func (f fakeCodex) ThreadList(context.Context, codexapi.ThreadListOptions) (codexapi.ThreadListResponse, error) {
 	return codexapi.ThreadListResponse{Raw: json.RawMessage(`{"data":[],"nextCursor":"next"}`), NextCursor: "next"}, nil
 }
-func (f fakeCodex) ThreadRead(context.Context, codexapi.ThreadReadOptions) (codexapi.ThreadReadResponse, error) {
+func (f fakeCodex) ThreadRead(_ context.Context, options codexapi.ThreadReadOptions) (codexapi.ThreadReadResponse, error) {
+	if f.threadIDs != nil {
+		*f.threadIDs = append(*f.threadIDs, options.ThreadID)
+	}
 	return codexapi.ThreadReadResponse{Raw: json.RawMessage(`{"thread":{"id":"thr_1"}}`)}, nil
 }
 func (f fakeCodex) ThreadTurns(context.Context, codexapi.TurnsOptions) (codexapi.ThreadTurnsResponse, error) {
@@ -101,6 +105,21 @@ type fakeConnections struct {
 	opened  int
 	checked int
 	conn    *fakeConnection
+}
+
+type fakeTargets struct {
+	endpoint string
+	thread   string
+	seen     []string
+	err      error
+}
+
+func (f *fakeTargets) ResolveThread(_ context.Context, selector, _ string) (ThreadTarget, error) {
+	f.seen = append(f.seen, selector)
+	if f.err != nil {
+		return ThreadTarget{}, f.err
+	}
+	return ThreadTarget{Endpoint: f.endpoint, ThreadID: f.thread, URI: selector}, nil
 }
 
 type optionsConnections struct {
@@ -363,6 +382,43 @@ func TestForceWithoutOutputIsUsageError(t *testing.T) {
 	var ce *cli.Error
 	if _, err := e.Execute(context.Background(), i); !errors.As(err, &ce) || ce.Exit != cli.ExitUsage {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestFullAppResolvesPresentationThreadURIBeforeAdapter(t *testing.T) {
+	var seen []string
+	targets := &fakeTargets{endpoint: "ep_01999999-9999-7999-8999-999999999999", thread: "native-thread", seen: nil}
+	api := fakeCodex{threadIDs: &seen}
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: api}}, Targets: targets})
+	var out, errOut bytes.Buffer
+	a := &cli.App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, Executor: e}
+	if code := a.Run([]string{"--json", "thread", "read", "codex://local/thread/presentation-id"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("code=%d stderr=%q", code, errOut.String())
+	}
+	if len(targets.seen) != 1 || targets.seen[0] != "codex://local/thread/presentation-id" || len(seen) != 1 || seen[0] != "native-thread" {
+		t.Fatalf("target resolution seen=%v adapter=%v", targets.seen, seen)
+	}
+}
+
+func TestUnmappedOrMismatchedThreadTargetFailsBeforeOpen(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		code cli.ExitCode
+	}{
+		{"unmapped", endpoint.ErrEndpointNotFound, cli.ExitRejected},
+		{"mismatch", endpoint.ErrEndpointMismatch, cli.ExitRejected},
+		{"invalid", endpoint.ErrInvalidTarget, cli.ExitUsage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			connections := &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}
+			e := New(Ports{Connections: connections, Targets: &fakeTargets{err: tc.err}})
+			_, err := e.Execute(context.Background(), invocation("thread", "read", "codex://missing/thread/id"))
+			var ce *cli.Error
+			if !errors.As(err, &ce) || ce.Exit != tc.code || connections.opened != 0 {
+				t.Fatalf("err=%v opened=%d", err, connections.opened)
+			}
+		})
 	}
 }
 
