@@ -487,29 +487,58 @@ func (j *Journal) RecordObservedWinner(ctx context.Context, originalID, replyID,
 		}
 		var existing ReplyClaim
 		err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_error_code,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", replyID), &existing)
+		var currentWinner string
+		errWinner := tx.QueryRow("SELECT reply_id FROM reply_winners WHERE original_id=?", originalID).Scan(&currentWinner)
+		if errWinner != nil && errWinner != sql.ErrNoRows {
+			return errWinner
+		}
+		if errWinner == nil && currentWinner != replyID {
+			return ErrIdentityConflict
+		}
 		if err == sql.ErrNoRows {
 			if _, err := tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,accepted_at,commit_seq,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", replyID, originalID, digest, bodySize, status, replyRoute, custodyRoute, storeID, "", "", int64(0), string(winnerState), now, now, now, commitSeq, errorCode); err != nil {
+				return err
+			}
+			eventKind := "reply.accepted"
+			if winnerState == StateReplyObserved {
+				eventKind = "reply.observed"
+			}
+			if err := emit(tx, eventKind, "", replyID, winnerState, now); err != nil {
 				return err
 			}
 		} else if err != nil {
 			return err
 		} else if existing.OriginalID != originalID || existing.Digest != digest || existing.BodySize != bodySize || existing.Status != status || existing.ReplyErrorCode != errorCode || existing.ReplyRoute != replyRoute || existing.CustodyRoute != custodyRoute || existing.CustodyStoreID != storeID {
 			return ErrIdentityConflict
-		} else if nativeID != "" && existing.State != StateReplyObserved {
-			if _, err := tx.Exec("UPDATE reply_claims SET state=?,updated_at=? WHERE reply_id=?", string(StateReplyObserved), now, replyID); err != nil {
+		} else {
+			priorState := existing.State
+			state := existing.State
+			if nativeID != "" {
+				state = StateReplyObserved
+			} else if state != StateReplyObserved {
+				state = StateReplyAccepted
+			}
+			if _, err := tx.Exec("UPDATE reply_claims SET state=?,token='',lease_until=0,accepted_at=?,commit_seq=?,updated_at=? WHERE reply_id=?", string(state), now, commitSeq, now, replyID); err != nil {
 				return err
 			}
+			if state != priorState {
+				eventKind := "reply.accepted"
+				if state == StateReplyObserved {
+					eventKind = "reply.observed"
+				}
+				if err := emit(tx, eventKind, "", replyID, state, now); err != nil {
+					return err
+				}
+			}
 		}
-		var currentWinner string
-		err = tx.QueryRow("SELECT reply_id FROM reply_winners WHERE original_id=?", originalID).Scan(&currentWinner)
-		if err == sql.ErrNoRows {
+		if errWinner == sql.ErrNoRows {
 			if _, err := tx.Exec("INSERT INTO reply_winners(original_id,reply_id,committed_at,commit_seq) VALUES(?,?,?,?)", originalID, replyID, now, commitSeq); err != nil {
 				return err
 			}
-		} else if err != nil {
-			return err
-		} else if currentWinner != replyID {
-			return ErrIdentityConflict
+		} else {
+			if _, err := tx.Exec("UPDATE reply_winners SET committed_at=?,commit_seq=? WHERE original_id=? AND reply_id=?", now, commitSeq, originalID, replyID); err != nil {
+				return err
+			}
 		}
 		if nativeID != "" {
 			if err := validateObservationIdentityTx(tx, replyID, nativeID, digest, endpointID, controlRoute); err != nil {

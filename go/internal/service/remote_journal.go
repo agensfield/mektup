@@ -657,6 +657,7 @@ func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.Cont
 		if json.Unmarshal(nativeRaw, &winnerNative) != nil || winnerNative == "" {
 			return out, sshproxy.ErrControlValidation
 		}
+		out.WinnerNativeID = winnerNative
 	}
 	if raw, ok := winner["replyMessageId"]; !ok || json.Unmarshal(raw, &out.WinnerReplyID) != nil || out.WinnerReplyID == "" {
 		return out, sshproxy.ErrControlValidation

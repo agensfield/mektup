@@ -819,6 +819,35 @@ func TestObservedWinnerWithoutNativeEvidenceRemainsAccepted(t *testing.T) {
 	}
 }
 
+func TestObservedWinnerStrengthensExistingUnknownAuthoritatively(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	in := claimInput()
+	if err := j.RecordObservedWinner(context.Background(), in.OriginalID, "winner-unknown", in.Digest, in.Status, "", in.ReplyRoute, in.CustodyRoute, in.CustodyStoreID, "", "", "custody", 7, in.BodySize); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("UPDATE reply_claims SET state=?,accepted_at=NULL,commit_seq=0 WHERE reply_id=?", string(StateReplyOutcomeUnknown), "winner-unknown"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordObservedWinner(context.Background(), in.OriginalID, "winner-unknown", in.Digest, in.Status, "", in.ReplyRoute, in.CustodyRoute, in.CustodyStoreID, "", "", "custody", 7, in.BodySize); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := j.Reply(context.Background(), "winner-unknown")
+	if err != nil || claim.State != StateReplyAccepted || claim.CommitSeq != 7 || claim.Token != "" {
+		t.Fatalf("unknown winner was not strengthened: %+v err=%v", claim, err)
+	}
+	var eventKind, eventState string
+	if err := j.db.QueryRow("SELECT kind,state FROM events WHERE reply_id=? ORDER BY seq DESC LIMIT 1", "winner-unknown").Scan(&eventKind, &eventState); err != nil {
+		t.Fatal(err)
+	}
+	if eventKind != "reply.accepted" || eventState != string(StateReplyAccepted) {
+		t.Fatalf("winner strengthening event = %s/%s", eventKind, eventState)
+	}
+}
+
 func TestV8SchemaRejectsMissingObservationProvenanceColumns(t *testing.T) {
 	dir := t.TempDir()
 	var now atomic.Int64
