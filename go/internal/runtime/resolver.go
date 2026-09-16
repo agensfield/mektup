@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/agensfield/mektup/go"
@@ -54,13 +55,19 @@ func (r ResolverAdapter) Resolve(ctx context.Context, selector string) (service.
 	return service.ResolvedTarget{Requested: selector, EndpointID: resolved.Endpoint.ID, URI: uri, ThreadID: resolved.ThreadID, Loaded: loaded, Persistent: persistent}, nil
 }
 
-func (r ResolverAdapter) ResolveSource(_ context.Context, source string) (service.SourceIdentity, error) {
+func (r ResolverAdapter) ResolveSource(ctx context.Context, source string) (service.SourceIdentity, error) {
 	resolved, err := r.Store.ResolveSource(endpoint.SourceOptions{CurrentThreadID: r.CurrentThreadID, ReplyTo: firstNonEmpty(source, r.ReplyTo), CodexHome: r.CodexHome})
 	if err != nil {
 		return service.SourceIdentity{}, err
 	}
 	uri := codexURI(resolved.Endpoint.ID, resolved.ThreadID)
-	return service.SourceIdentity{EndpointID: resolved.Endpoint.ID, URI: uri, Human: false, CustodyEndpointID: firstNonEmpty(r.CustodyEndpointID, resolved.Endpoint.ID), CustodyStoreID: r.CustodyStoreID}, nil
+	herdrURI := ""
+	if r.Herdr != nil && resolved.Endpoint.HerdrEnabled() {
+		if provenance, provenanceErr := r.Herdr.ResolveThreadEndpoint(ctx, resolved.Endpoint, resolved.ThreadID); provenanceErr == nil {
+			herdrURI = "herdr://" + resolved.Endpoint.ID + "/pane/" + url.PathEscape(provenance.Pane)
+		}
+	}
+	return service.SourceIdentity{EndpointID: resolved.Endpoint.ID, URI: uri, Herdr: herdrURI, Human: false, CustodyEndpointID: firstNonEmpty(r.CustodyEndpointID, resolved.Endpoint.ID), CustodyStoreID: r.CustodyStoreID}, nil
 }
 
 func (r ResolverAdapter) ResolvePinned(ctx context.Context, endpointID, uri string) (service.ResolvedTarget, error) {

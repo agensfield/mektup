@@ -133,6 +133,7 @@ type herdrAgent struct {
 	Status      string `json:"agent_status"`
 	Agent       string `json:"agent"`
 	Session     struct {
+		Agent  string `json:"agent"`
 		Kind   string `json:"kind"`
 		Source string `json:"source"`
 		Value  string `json:"value"`
@@ -149,18 +150,77 @@ func (r *HerdrResolver) Resolve(ctx context.Context, target Target) (HerdrResolu
 // require an explicitly supplied endpoint runner, while direct local routes
 // may use the installed herdr executable through Runner.
 func (r *HerdrResolver) ResolveEndpoint(ctx context.Context, endpoint Endpoint, target Target) (HerdrResolution, error) {
+	run, err := r.endpointRunner(endpoint)
+	if err != nil {
+		return HerdrResolution{}, err
+	}
+	return r.resolve(ctx, target, run)
+}
+
+func (r *HerdrResolver) endpointRunner(endpoint Endpoint) (func(context.Context, []string) ([]byte, error), error) {
 	if r == nil {
-		return HerdrResolution{}, ErrResolverUnavailable
+		return nil, ErrResolverUnavailable
 	}
 	if endpoint.Route.Kind == RouteSSH {
 		if r.EndpointRunner == nil {
-			return HerdrResolution{}, fmt.Errorf("%w: SSH endpoint needs an endpoint-specific Herdr runner", ErrResolverUnavailable)
+			return nil, fmt.Errorf("%w: SSH endpoint needs an endpoint-specific Herdr runner", ErrResolverUnavailable)
 		}
-		return r.resolve(ctx, target, func(runCtx context.Context, argv []string) ([]byte, error) {
+		return func(runCtx context.Context, argv []string) ([]byte, error) {
 			return r.EndpointRunner.RunEndpoint(runCtx, endpoint, argv)
-		})
+		}, nil
 	}
-	return r.Resolve(ctx, target)
+	if r.Runner == nil {
+		return nil, ErrResolverUnavailable
+	}
+	return func(runCtx context.Context, argv []string) ([]byte, error) {
+		return r.Runner.Run(runCtx, argv)
+	}, nil
+}
+
+// ResolveThreadEndpoint performs reverse source-provenance discovery after the
+// Codex endpoint and thread have already been pinned. Official Herdr Codex
+// integrations and herdr-codex-bridge both publish the same native
+// agent_session tuple, so no ambient pane variables or bridge-specific files
+// participate in this lookup.
+func (r *HerdrResolver) ResolveThreadEndpoint(ctx context.Context, endpoint Endpoint, codexThreadID string) (HerdrResolution, error) {
+	if strings.TrimSpace(codexThreadID) == "" {
+		return HerdrResolution{}, ErrResolverNotFound
+	}
+	run, err := r.endpointRunner(endpoint)
+	if err != nil {
+		return HerdrResolution{}, err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	list, err := run(ctx, []string{"herdr", "agent", "list"})
+	if err != nil {
+		return HerdrResolution{}, err
+	}
+	candidate, err := uniqueThreadAgent(list, codexThreadID)
+	if err != nil {
+		return HerdrResolution{}, err
+	}
+	get, err := run(ctx, []string{"herdr", "agent", "get", candidate.PaneID})
+	if err != nil {
+		return HerdrResolution{}, err
+	}
+	confirmed, err := parseGetAgent(get)
+	if err != nil || validateThreadAgent(confirmed, codexThreadID) != nil || !sameNativeSession(candidate, confirmed) {
+		return HerdrResolution{}, ErrResolverStale
+	}
+	finalList, err := run(ctx, []string{"herdr", "agent", "list"})
+	if err != nil {
+		return HerdrResolution{}, err
+	}
+	final, err := uniqueThreadAgent(finalList, codexThreadID)
+	if err != nil || !sameNativeSession(confirmed, final) {
+		return HerdrResolution{}, ErrResolverStale
+	}
+	return HerdrResolution{
+		Name: final.Name, Workspace: final.WorkspaceID, Tab: final.TabID,
+		Pane: final.PaneID, ThreadID: final.Session.Value, Status: final.Status,
+	}, nil
 }
 
 func (r *HerdrResolver) resolve(ctx context.Context, target Target, run func(context.Context, []string) ([]byte, error)) (HerdrResolution, error) {
@@ -237,6 +297,50 @@ func validateLive(agent herdrAgent) error {
 	}
 }
 
+func validateThreadAgent(agent herdrAgent, threadID string) error {
+	if agent.Agent != "codex" || agent.Session.Agent != "codex" || agent.PaneID == "" || !fullyQualifiedPane(agent.PaneID) ||
+		agent.WorkspaceID == "" || agent.TabID == "" || agent.Session.Kind != "id" ||
+		agent.Session.Source != "herdr:codex" || agent.Session.Value != threadID {
+		return ErrResolverStale
+	}
+	switch strings.ToLower(agent.Status) {
+	case "idle", "working", "blocked", "done", "unknown":
+		return nil
+	default:
+		return ErrResolverStale
+	}
+}
+
+func uniqueThreadAgent(data []byte, threadID string) (herdrAgent, error) {
+	agents, err := parseAgents(data)
+	if err != nil {
+		return herdrAgent{}, fmt.Errorf("%w: invalid herdr agent list: %v", ErrResolverUnavailable, err)
+	}
+	matches := make([]herdrAgent, 0, 1)
+	for _, agent := range agents {
+		if agent.Session.Value != threadID {
+			continue
+		}
+		if err := validateThreadAgent(agent, threadID); err != nil {
+			return herdrAgent{}, err
+		}
+		matches = append(matches, agent)
+	}
+	if len(matches) == 0 {
+		return herdrAgent{}, ErrResolverNotFound
+	}
+	if len(matches) != 1 {
+		return herdrAgent{}, ErrResolverAmbiguous
+	}
+	return matches[0], nil
+}
+
+func sameNativeSession(a, b herdrAgent) bool {
+	return a.Agent == b.Agent && a.Session.Agent == b.Session.Agent && a.Session.Kind == b.Session.Kind &&
+		a.Session.Source == b.Session.Source && a.Session.Value == b.Session.Value &&
+		a.PaneID == b.PaneID && a.WorkspaceID == b.WorkspaceID && a.TabID == b.TabID
+}
+
 func parseAgents(data []byte) ([]herdrAgent, error) {
 	var envelope struct {
 		Result struct {
@@ -269,10 +373,10 @@ func parseGetAgent(data []byte) (herdrAgent, error) {
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return herdrAgent{}, err
 	}
-	if envelope.Result.Agent.Name != "" {
+	if envelope.Result.Agent.PaneID != "" {
 		return envelope.Result.Agent, nil
 	}
-	if envelope.Agent.Name != "" {
+	if envelope.Agent.PaneID != "" {
 		return envelope.Agent, nil
 	}
 	return herdrAgent{}, errors.New("missing agent")

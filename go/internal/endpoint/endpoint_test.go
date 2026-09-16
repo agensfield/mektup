@@ -345,9 +345,44 @@ func herdrJSON(agentName, pane, workspace, tab, thread, status string) []byte {
 	item := map[string]any{
 		"agent": "codex", "name": agentName, "pane_id": pane,
 		"workspace_id": workspace, "tab_id": tab, "agent_status": status,
-		"agent_session": map[string]any{"kind": "id", "source": "herdr:codex", "value": thread},
+		"agent_session": map[string]any{"agent": "codex", "kind": "id", "source": "herdr:codex", "value": thread},
 	}
 	return mustJSON(map[string]any{"id": "x", "result": map[string]any{"agent": item, "agents": []any{item}}})
+}
+
+func TestHerdrReverseSourceResolutionUsesNativeSessionAndStablePane(t *testing.T) {
+	list := herdrJSON("", "w3:p29", "w3", "w3:t17", "thread-source", "working")
+	get := herdrJSON("mektup-lead", "w3:p29", "w3", "w3:t17", "thread-source", "idle")
+	runner := &fakeRunner{responses: [][]byte{list, get, list}}
+	resolver := NewHerdrResolver(runner)
+	route, err := UnixRoute("/tmp/codex.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep := Endpoint{ID: testEndpointID, Alias: "local", Route: route, Herdr: HerdrAuto}
+	got, err := resolver.ResolveThreadEndpoint(context.Background(), ep, "thread-source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Pane != "w3:p29" || got.ThreadID != "thread-source" || got.Workspace != "w3" || got.Tab != "w3:t17" {
+		t.Fatalf("reverse resolution = %#v", got)
+	}
+	want := [][]string{{"herdr", "agent", "list"}, {"herdr", "agent", "get", "w3:p29"}, {"herdr", "agent", "list"}}
+	if !reflect.DeepEqual(runner.argv, want) {
+		t.Fatalf("reverse argv = %#v", runner.argv)
+	}
+
+	duplicate := mustJSON(map[string]any{"agents": []any{
+		map[string]any{"agent": "codex", "pane_id": "w3:p1", "workspace_id": "w3", "tab_id": "w3:t1", "agent_status": "idle", "agent_session": map[string]any{"agent": "codex", "kind": "id", "source": "herdr:codex", "value": "thread-source"}},
+		map[string]any{"agent": "codex", "pane_id": "w3:p2", "workspace_id": "w3", "tab_id": "w3:t1", "agent_status": "idle", "agent_session": map[string]any{"agent": "codex", "kind": "id", "source": "herdr:codex", "value": "thread-source"}},
+	}})
+	if _, err := NewHerdrResolver(&fakeRunner{responses: [][]byte{duplicate}}).ResolveThreadEndpoint(context.Background(), ep, "thread-source"); !errors.Is(err, ErrResolverAmbiguous) {
+		t.Fatalf("duplicate reverse mapping error = %v", err)
+	}
+	changed := herdrJSON("mektup-lead", "w3:p30", "w3", "w3:t17", "thread-source", "idle")
+	if _, err := NewHerdrResolver(&fakeRunner{responses: [][]byte{list, changed}}).ResolveThreadEndpoint(context.Background(), ep, "thread-source"); !errors.Is(err, ErrResolverStale) {
+		t.Fatalf("changed reverse mapping error = %v", err)
+	}
 }
 
 func mustJSON(value any) []byte {
