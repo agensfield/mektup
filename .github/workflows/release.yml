@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# The release job is the only job allowed to create GitHub release metadata.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Package and publish release artifacts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - name: Prefetch pinned Go modules
+        working-directory: go
+        run: go mod download all
+      - name: Install pinned contract validator
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Verify the repository and Go module tags agree
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git show-ref --verify --quiet "refs/remotes/origin/main"
+          repository_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          module_commit="$(git rev-parse "refs/tags/go/${RELEASE_TAG}^{commit}")"
+          test "$repository_commit" = "$module_commit"
+          git merge-base --is-ancestor "$repository_commit" refs/remotes/origin/main
+      - name: Run required release gates
+        run: |
+          make fmt-check
+          make test
+          make test-race
+          make vet
+          make conformance
+          make contracts
+          make notices
+          make govulncheck
+      - name: Install Syft for the GoReleaser SBOM step
+        uses: anchore/sbom-action/download-syft@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+        with:
+          syft-version: v1.51.1
+      - name: Release with GoReleaser
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
+        with:
+          distribution: goreleaser
+          version: v2.18.1
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

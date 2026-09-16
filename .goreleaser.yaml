@@ -1,0 +1,66 @@
+version: 2
+
+project_name: mektup
+
+before:
+  hooks:
+    - ./scripts/generate-third-party-notices.sh
+
+builds:
+  - id: mektup
+    dir: go
+    main: ./cmd/mektup
+    binary: mektup
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    # These variables are the release metadata seam consumed by `mektup
+    # version`. Keeping all four values in the binary makes an artifact's
+    # provenance inspectable without network access.
+    ldflags:
+      - >-
+        -s -w -buildid=
+        -X github.com/agensfield/mektup/go/internal/cli.buildVersion={{.Version}}
+        -X github.com/agensfield/mektup/go/internal/cli.buildCommit={{.Commit}}
+        -X github.com/agensfield/mektup/go/internal/cli.buildContractVersion=1.0.6
+        -X github.com/agensfield/mektup/go/internal/cli.buildTestedCodex=0.154.0
+        -X github.com/agensfield/mektup/go/internal/cli.buildInstallKind=github-release
+    mod_timestamp: '{{ .CommitTimestamp }}'
+
+archives:
+  - id: archives
+    ids: [mektup]
+    formats: [tar.gz]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    files:
+      - README.md
+      - LICENSE
+      - THIRD_PARTY_NOTICES.md
+      - docs/architecture.md
+      - docs/dependencies.md
+      - docs/releasing.md
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+# GoReleaser invokes syft for one SPDX/CycloneDX-compatible SBOM per archive.
+# The release workflow installs a pinned syft version before this config runs.
+sboms:
+  - artifacts: archive
+    documents:
+      - '${artifact}.sbom.json'
+
+release:
+  prerelease: auto
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'

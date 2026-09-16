@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agensfield.dev/mektup/contracts/warning-v1.schema.json",
+  "title": "Mektup v1 warning",
+  "type": "object",
+  "required": ["code", "message", "details"],
+  "properties": {
+    "code": {
+      "type": "string",
+      "enum": [
+        "untested_server_version",
+        "server_version_unknown",
+        "evidence_gap",
+        "projection_may_lag",
+        "audit_logging_enabled",
+        "output_spilled",
+        "resolver_degraded",
+        "cleanup_incomplete",
+        "manual_resolution"
+      ]
+    },
+    "message": { "type": "string", "minLength": 1 },
+    "details": { "type": "object" }
+  },
+  "additionalProperties": true
+}

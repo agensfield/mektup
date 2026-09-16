@@ -1,0 +1,9 @@
+{
+  "error": {
+    "code": "outcome_unknown",
+    "message": "The request may have been accepted, but no conclusive result is available.",
+    "retryable": false,
+    "effectState": "outcome_unknown",
+    "details": { "automaticRetry": false }
+  }
+}

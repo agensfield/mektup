@@ -1,0 +1,5 @@
+{
+  "code": "untested_server_version",
+  "message": "Codex app-server 0.155.0 is above the tested matrix and will run best-effort.",
+  "details": { "version": "0.155.0", "compatibility": "untested" }
+}

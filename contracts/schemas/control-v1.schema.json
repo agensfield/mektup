@@ -1,0 +1,391 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agensfield.dev/mektup/contracts/control-v1.schema.json",
+  "title": "Mektup custody control document v1",
+  "description": "Mektup specification revision 1.0.6 metadata-only stdin protocol for fenced custody claim, observation, original-scoped status, and reconciliation. Observe and originalStatus are tokenless evidence/selection operations and never carry dispatch authority. A claim request cannot choose a fencing token or current lease; a claim result uses an explicit claimed|existing union. Heartbeat, commit, and abandon requests must present the issued values. OriginalStatus selects winner|terminal_unknown|pending from exact original custody metadata. Receipt identity is optional because operation plus original/reply message identity is the custody authority. This protocol never carries a local path, executable path, shell fragment, reply body, or body content.",
+  "type": "object",
+  "required": ["schema", "kind", "operation", "operationId", "originalMessageId", "custody", "replyDestination"],
+  "properties": {
+    "schema": { "const": "mektup/control/v1" },
+    "kind": { "enum": ["request", "result"] },
+    "operation": {
+      "enum": ["claim", "heartbeat", "commit", "abandon", "status", "reconcile", "observe", "originalStatus"]
+    },
+    "operationId": { "$ref": "common-v1.schema.json#/$defs/operationId" },
+    "receiptId": { "$ref": "common-v1.schema.json#/$defs/receiptId" },
+    "replyMessageId": { "$ref": "common-v1.schema.json#/$defs/messageId" },
+    "originalMessageId": { "$ref": "common-v1.schema.json#/$defs/messageId" },
+    "custody": {
+      "type": "object",
+      "required": ["endpointId", "storeId"],
+      "properties": {
+        "endpointId": { "$ref": "common-v1.schema.json#/$defs/endpointId" },
+        "storeId": { "$ref": "common-v1.schema.json#/$defs/storeId" }
+      },
+      "additionalProperties": true
+    },
+    "replyDestination": {
+      "type": "object",
+      "required": ["endpointId", "threadId", "uri"],
+      "properties": {
+        "endpointId": { "$ref": "common-v1.schema.json#/$defs/endpointId" },
+        "threadId": { "$ref": "common-v1.schema.json#/$defs/threadId" },
+        "uri": { "$ref": "common-v1.schema.json#/$defs/uri" }
+      },
+      "additionalProperties": true
+    },
+    "bodyBytes": { "type": "integer", "minimum": 0 },
+    "bodySha256": { "$ref": "common-v1.schema.json#/$defs/sha256" },
+    "replyStatus": { "enum": ["success", "error"] },
+    "replyErrorCode": { "type": "string", "minLength": 1 },
+    "requestedLease": {
+      "type": "object",
+      "required": ["durationMs"],
+      "properties": {
+        "durationMs": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": true
+    },
+    "fencingToken": { "type": "string", "minLength": 1 },
+    "lease": {
+      "type": "object",
+      "required": ["expiresAt"],
+      "properties": {
+        "acquiredAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+        "expiresAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+        "heartbeatAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" }
+      },
+      "additionalProperties": true
+    },
+    "attemptOwner": { "type": "string", "minLength": 1 },
+    "requestedAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+    "nativeItemId": { "type": "string", "minLength": 1 },
+    "eventSeq": { "type": "integer", "minimum": 1 },
+    "commitSeq": { "type": "integer", "minimum": 1 },
+    "result": {
+      "type": "object",
+      "properties": {
+        "disposition": { "enum": ["claimed", "existing"] },
+        "selection": { "enum": ["winner", "terminal_unknown", "pending"] },
+        "state": { "$ref": "common-v1.schema.json#/$defs/state" },
+        "replyMessageId": { "$ref": "common-v1.schema.json#/$defs/messageId" },
+        "replyStatus": { "enum": ["success", "error"] },
+        "replyErrorCode": { "type": "string", "minLength": 1 },
+        "bodyBytes": { "type": "integer", "minimum": 0 },
+        "bodySha256": { "$ref": "common-v1.schema.json#/$defs/sha256" },
+        "nativeItemId": { "type": "string", "minLength": 1 },
+        "eventSeq": { "type": "integer", "minimum": 1 },
+        "commitSeq": { "type": "integer", "minimum": 1 },
+        "fencingToken": { "type": "string", "minLength": 1 },
+        "lease": {
+          "type": "object",
+          "required": ["expiresAt"],
+          "properties": {
+            "acquiredAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+            "expiresAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+            "heartbeatAt": { "$ref": "common-v1.schema.json#/$defs/timestamp" }
+          },
+          "additionalProperties": true
+        },
+        "status": { "type": "string", "minLength": 1 },
+        "winner": { "type": "object" }
+      },
+      "additionalProperties": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "enum": ["request", "result"] },
+          "operation": { "enum": ["claim", "heartbeat", "commit", "abandon", "status", "reconcile", "observe"] }
+        }
+      },
+      "then": { "required": ["replyMessageId"] }
+    },
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "request" },
+          "operation": { "enum": ["claim", "heartbeat", "commit", "abandon"] }
+        }
+      },
+      "then": {
+        "required": ["bodyBytes", "bodySha256", "replyStatus", "attemptOwner"]
+      }
+    },
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "request" },
+          "operation": { "const": "originalStatus" }
+        }
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            { "required": ["replyMessageId"] },
+            { "required": ["bodyBytes"] },
+            { "required": ["bodySha256"] },
+            { "required": ["replyStatus"] },
+            { "required": ["replyErrorCode"] },
+            { "required": ["nativeItemId"] },
+            { "required": ["fencingToken"] },
+            { "required": ["lease"] },
+            { "required": ["requestedLease"] },
+            { "required": ["attemptOwner"] },
+            { "required": ["result"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "request" },
+          "operation": { "const": "observe" }
+        }
+      },
+      "then": {
+        "required": ["nativeItemId", "bodyBytes", "bodySha256", "replyStatus"],
+        "not": {
+          "anyOf": [
+            { "required": ["fencingToken"] },
+            { "required": ["lease"] },
+            { "required": ["requestedLease"] },
+            { "required": ["attemptOwner"] }
+          ]
+        },
+        "allOf": [
+          {
+            "if": { "required": ["replyErrorCode"] },
+            "then": { "properties": { "replyStatus": { "const": "error" } } }
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "result" },
+          "operation": { "const": "originalStatus" }
+        }
+      },
+      "then": {
+        "required": ["result"],
+        "not": {
+          "anyOf": [
+            { "required": ["replyMessageId"] },
+            { "required": ["fencingToken"] },
+            { "required": ["lease"] },
+            { "required": ["requestedLease"] },
+            { "required": ["attemptOwner"] },
+            { "required": ["nativeItemId"] },
+            { "required": ["bodyBytes"] },
+            { "required": ["bodySha256"] },
+            { "required": ["replyStatus"] },
+            { "required": ["replyErrorCode"] }
+          ]
+        },
+        "properties": {
+          "result": {
+            "required": ["selection"],
+            "oneOf": [
+              {
+                "properties": {
+                  "selection": { "const": "winner" },
+                  "state": { "enum": ["reply_accepted", "reply_observed"] },
+                  "replyStatus": { "enum": ["success", "error"] },
+                  "replyErrorCode": { "type": "string", "minLength": 1 }
+                },
+                "required": ["state", "replyMessageId", "replyStatus", "bodyBytes", "bodySha256", "commitSeq"],
+                "allOf": [
+                  {
+                    "if": { "properties": { "state": { "const": "reply_observed" } } },
+                    "then": { "required": ["nativeItemId"] }
+                  },
+                  {
+                    "if": { "required": ["replyErrorCode"] },
+                    "then": { "properties": { "replyStatus": { "const": "error" } } }
+                  },
+                  {
+                    "if": { "required": ["replyStatus"], "properties": { "replyStatus": { "const": "success" } } },
+                    "then": { "not": { "required": ["replyErrorCode"] } }
+                  }
+                ],
+                "not": { "anyOf": [{ "required": ["eventSeq"] }, { "required": ["status"] }, { "required": ["body"] }, { "required": ["bodyText"] }, { "required": ["bodyContent"] }, { "required": ["replyBody"] }, { "required": ["fencingToken"] }, { "required": ["lease"] }, { "required": ["requestedLease"] }, { "required": ["attemptOwner"] }, { "required": ["winner"] }] }
+              },
+              {
+                "properties": {
+                  "selection": { "const": "terminal_unknown" },
+                  "state": { "const": "reply_outcome_unknown" },
+                  "replyStatus": { "enum": ["success", "error"] },
+                  "replyErrorCode": { "type": "string", "minLength": 1 }
+                },
+                "required": ["state", "replyMessageId", "replyStatus", "bodyBytes", "bodySha256", "eventSeq"],
+                "allOf": [
+                  {
+                    "if": { "required": ["replyErrorCode"] },
+                    "then": { "properties": { "replyStatus": { "const": "error" } } }
+                  },
+                  {
+                    "if": { "required": ["replyStatus"], "properties": { "replyStatus": { "const": "success" } } },
+                    "then": { "not": { "required": ["replyErrorCode"] } }
+                  }
+                ],
+                "not": { "anyOf": [{ "required": ["commitSeq"] }, { "required": ["nativeItemId"] }, { "required": ["status"] }, { "required": ["body"] }, { "required": ["bodyText"] }, { "required": ["bodyContent"] }, { "required": ["replyBody"] }, { "required": ["fencingToken"] }, { "required": ["lease"] }, { "required": ["requestedLease"] }, { "required": ["attemptOwner"] }, { "required": ["winner"] }] }
+              },
+              {
+                "properties": { "selection": { "const": "pending" } },
+                "not": {
+                  "anyOf": [
+                    { "required": ["state"] },
+                    { "required": ["replyMessageId"] },
+                    { "required": ["replyStatus"] },
+                    { "required": ["replyErrorCode"] },
+                    { "required": ["bodyBytes"] },
+                    { "required": ["bodySha256"] },
+                    { "required": ["body"] },
+                    { "required": ["bodyText"] },
+                    { "required": ["bodyContent"] },
+                    { "required": ["replyBody"] },
+                    { "required": ["status"] },
+                    { "required": ["nativeItemId"] },
+                    { "required": ["eventSeq"] },
+                    { "required": ["commitSeq"] },
+                    { "required": ["fencingToken"] },
+                    { "required": ["lease"] },
+                    { "required": ["requestedLease"] },
+                    { "required": ["attemptOwner"] },
+                    { "required": ["winner"] }
+                  ]
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "request" },
+          "operation": { "enum": ["heartbeat", "commit", "abandon"] }
+        }
+      },
+      "then": {
+        "required": ["fencingToken", "lease"],
+        "not": { "required": ["requestedLease"] }
+      }
+    },
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "request" },
+          "operation": { "const": "claim" }
+        }
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            { "required": ["fencingToken"] },
+            { "required": ["lease"] },
+            { "required": ["result"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["kind"],
+        "properties": { "kind": { "const": "result" } }
+      },
+      "then": {
+        "required": ["result"],
+        "not": {
+          "anyOf": [
+            { "required": ["fencingToken"] },
+            { "required": ["lease"] }
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "result" },
+          "operation": { "const": "claim" }
+        }
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "required": ["disposition"],
+            "allOf": [
+              {
+                "if": { "properties": { "disposition": { "const": "claimed" } } },
+                "then": { "required": ["state", "fencingToken", "lease"] }
+              },
+              {
+                "if": { "properties": { "disposition": { "const": "existing" } } },
+                "then": {
+                  "required": ["state"],
+                  "not": { "anyOf": [{ "required": ["fencingToken"] }, { "required": ["lease"] }] }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["kind", "operation"],
+        "properties": {
+          "kind": { "const": "result" },
+          "operation": { "const": "observe" }
+        }
+      },
+      "then": {
+        "required": ["result"],
+        "not": {
+          "anyOf": [
+            { "required": ["fencingToken"] },
+            { "required": ["lease"] },
+            { "required": ["requestedLease"] },
+            { "required": ["attemptOwner"] }
+          ]
+        },
+        "properties": {
+          "result": {
+            "required": ["state"],
+            "not": { "anyOf": [{ "required": ["fencingToken"] }, { "required": ["lease"] }] },
+            "properties": {
+              "status": { "type": "string", "minLength": 1 },
+              "winner": { "type": "object" }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "not": {
+    "anyOf": [
+      { "required": ["body"] },
+      { "required": ["bodyText"] },
+      { "required": ["bodyContent"] },
+      { "required": ["path"] },
+      { "required": ["executable"] },
+      { "required": ["shell"] }
+    ]
+  },
+  "additionalProperties": true
+}

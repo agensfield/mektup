@@ -1,0 +1,70 @@
+{
+  "schema": "mektup/receipt/v1",
+  "receiptId": "rcpt_0198f0e0-0000-7000-8000-000000000008",
+  "operationId": "op_0198f0e0-0000-7000-8000-000000000009",
+  "operation": "send",
+  "state": "outcome_unknown",
+  "source": {
+    "endpoint": {
+      "id": "ep_0198f0e0-0000-7000-8000-000000000001",
+      "alias": "local",
+      "transport": "unix-websocket",
+      "server": { "version": null, "compatibility": "unknown" }
+    },
+    "thread": null,
+    "requestedSelector": null,
+    "resolvedSelector": null,
+    "herdr": null,
+    "fields": {}
+  },
+  "target": {
+    "endpoint": {
+      "id": "ep_0198f0e0-0000-7000-8000-000000000002",
+      "alias": "devbox",
+      "transport": "ssh-proxy",
+      "server": { "version": "0.154.0", "compatibility": "tested" }
+    },
+    "thread": {
+      "id": "thread-recipient-001",
+      "uri": "codex://devbox/thread/thread-recipient-001"
+    },
+    "requestedSelector": "codex://devbox/thread/thread-recipient-001",
+    "resolvedSelector": "codex://devbox/thread/thread-recipient-001",
+    "herdr": null,
+    "fields": {}
+  },
+  "message": {
+    "messageId": "msg_0198f0e0-0000-7000-8000-00000000000a",
+    "inReplyTo": null,
+    "kind": "message",
+    "replyRequested": false,
+    "bodyBytes": 18,
+    "bodySha256": "sha256:b165810e4e7bf583d7a6582c9f93a2964ab0bd1fd86690a2e013e8555d4faa28",
+    "clientUserMessageId": "msg_0198f0e0-0000-7000-8000-00000000000a",
+    "turnId": null,
+    "acceptedAt": "2026-09-15T03:00:03.000000Z"
+  },
+  "evidence": [
+    {
+      "state": "dispatch_started",
+      "observedAt": "2026-09-15T03:00:03.000000Z",
+      "source": "local journal",
+      "details": { "transport": "ssh-proxy", "response": "lost" }
+    },
+    {
+      "state": "outcome_unknown",
+      "observedAt": "2026-09-15T03:00:04.000000Z",
+      "source": "recovery reconciliation",
+      "details": { "automaticRetry": false }
+    }
+  ],
+  "warnings": [
+    {
+      "code": "evidence_gap",
+      "message": "The transport ended after dispatch began and before acceptance was observed.",
+      "details": { "retryAllowed": false }
+    }
+  ],
+  "createdAt": "2026-09-15T03:00:03.000000Z",
+  "updatedAt": "2026-09-15T03:00:04.000000Z"
+}

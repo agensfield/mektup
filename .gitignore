@@ -1,0 +1,7 @@
+.DS_Store
+.worktrees/
+dist/
+coverage/
+node_modules/
+*.test
+THIRD_PARTY_NOTICES.md

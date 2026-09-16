@@ -1,0 +1,22 @@
+{
+  "schema": "Mektup/1",
+  "message-id": "msg_0198f0e0-0000-7000-8000-000000000003",
+  "kind": "message",
+  "from-endpoint-id": "ep_0198f0e0-0000-7000-8000-000000000001",
+  "from": "codex://local/thread/thread-local-001",
+  "from-kind": "agent",
+  "from-herdr": "herdr://local/agent/arachnidae",
+  "to-endpoint-id": "ep_0198f0e0-0000-7000-8000-000000000002",
+  "to": "codex://devbox/thread/thread-recipient-001",
+  "requested-target": "herdr://devbox/agent/buildoor",
+  "in-reply-to": null,
+  "reply-requested": true,
+  "reply-endpoint-id": "ep_0198f0e0-0000-7000-8000-000000000001",
+  "reply-to": "codex://local/thread/thread-local-001",
+  "reply-custody-endpoint-id": "ep_0198f0e0-0000-7000-8000-000000000001",
+  "reply-custody-store-id": "store_0198f0e0-0000-7000-8000-000000000002",
+  "sent-at": "2026-09-15T03:00:00.000000Z",
+  "payload-bytes": 18,
+  "payload-sha256": "sha256:b165810e4e7bf583d7a6582c9f93a2964ab0bd1fd86690a2e013e8555d4faa28",
+  "provenance": "observed"
+}

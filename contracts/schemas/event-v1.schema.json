@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agensfield.dev/mektup/contracts/event-v1.schema.json",
+  "title": "Mektup v1 JSONL lifecycle event",
+  "type": "object",
+  "required": [
+    "schema",
+    "event",
+    "eventId",
+    "sequence",
+    "operationId",
+    "timestamp",
+    "terminal",
+    "ok",
+    "warnings",
+    "data"
+  ],
+  "properties": {
+    "schema": { "const": "mektup/event/v1" },
+    "event": {
+      "type": "string",
+      "enum": [
+        "delivery.retrying",
+        "send.accepted",
+        "reply.accepted",
+        "reply.observed",
+        "wait.started",
+        "wait.incomplete",
+        "wait.interrupted",
+        "operation.rejected",
+        "operation.unknown",
+        "operation.failed",
+        "artifact.spilled",
+        "doctor.completed",
+        "storage.completed",
+        "rpc.completed",
+        "thread.list.completed",
+        "thread.read.completed",
+        "thread.turns.completed",
+        "thread.items.completed",
+        "search.completed"
+      ]
+    },
+    "eventId": { "$ref": "common-v1.schema.json#/$defs/eventId" },
+    "sequence": { "type": "integer", "minimum": 1 },
+    "operationId": { "$ref": "common-v1.schema.json#/$defs/operationId" },
+    "timestamp": { "$ref": "common-v1.schema.json#/$defs/timestamp" },
+    "terminal": { "type": "boolean" },
+    "ok": { "type": "boolean" },
+    "warnings": {
+      "type": "array",
+      "items": { "$ref": "warning-v1.schema.json" }
+    },
+    "data": { "type": "object" }
+  },
+  "additionalProperties": true
+}

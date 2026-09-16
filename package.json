@@ -1,0 +1,9 @@
+{
+  "name": "mektup-contract-validation",
+  "private": true,
+  "description": "Pinned offline contract-schema validator for Mektup CI",
+  "license": "MIT",
+  "dependencies": {
+    "ajv-cli": "5.0.0"
+  }
+}

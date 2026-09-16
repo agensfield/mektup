@@ -1,0 +1,22 @@
+{
+  "schema": "mektup/control/v1",
+  "kind": "request",
+  "operation": "claim",
+  "operationId": "op_0198f0e0-0000-7000-8000-00000000000e",
+  "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007",
+  "originalMessageId": "msg_0198f0e0-0000-7000-8000-000000000003",
+  "custody": {
+    "endpointId": "ep_0198f0e0-0000-7000-8000-000000000001",
+    "storeId": "store_0198f0e0-0000-7000-8000-000000000002"
+  },
+  "replyDestination": {
+    "endpointId": "ep_0198f0e0-0000-7000-8000-000000000001",
+    "threadId": "thread-local-001",
+    "uri": "codex://local/thread/thread-local-001"
+  },
+  "bodyBytes": 15,
+  "bodySha256": "sha256:914b169093c4dd7ec24080529845bb0660de553a835a200852e86c145470967f",
+  "replyStatus": "success",
+  "attemptOwner": "receiver-devbox-01",
+  "fencingToken": "caller-selected-token"
+}

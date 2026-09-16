@@ -1,0 +1,186 @@
+{
+  "schema": "mektup/conformance/v1/scenarios",
+  "version": "1.0.0",
+  "specVersion": "1.0.6",
+  "source": "acceptance-v1.md",
+  "profiles": {
+    "plain_accept": {
+      "transitions": ["intent.persisted", "dispatch.started", "delivery.accepted"],
+      "terminal": { "event": "send.accepted", "exit": 0, "state": "accepted" }
+    },
+    "reply_wait_success": {
+      "transitions": ["intent.persisted", "dispatch.started", "delivery.accepted", "reply.claimed", "reply.accepted"],
+      "terminal": { "event": "reply.accepted", "exit": 0, "state": "reply_accepted" }
+    },
+    "reply_observed_success": {
+      "transitions": ["intent.persisted", "dispatch.started", "delivery.accepted", "reply.claimed", "reply.accepted", "native.item.observed"],
+      "terminal": { "event": "reply.observed", "exit": 0, "state": "reply_observed" }
+    },
+    "reply_observed_from_unknown": {
+      "transitions": ["intent.persisted", "dispatch.started", "delivery.accepted", "reply.claimed", "claim.expired", "native.item.observed"],
+      "terminal": { "event": "reply.observed", "exit": 0, "state": "reply_observed" }
+    },
+    "rejected": {
+      "transitions": ["intent.persisted", "dispatch.started", "delivery.rejected"],
+      "terminal": { "event": "operation.rejected", "exit": 3, "state": "rejected" }
+    },
+    "usage_rejected": {
+      "transitions": [],
+      "terminal": { "event": "operation.failed", "exit": 2, "state": "not_sent" }
+    },
+    "not_sent_recovered": {
+      "transitions": ["intent.persisted", "recovery.prepared_orphan"],
+      "terminal": { "event": "operation.failed", "exit": 1, "state": "not_sent" }
+    },
+    "unknown": {
+      "transitions": ["intent.persisted", "dispatch.started", "transport.result_lost"],
+      "terminal": { "event": "operation.unknown", "exit": 4, "state": "outcome_unknown" }
+    },
+    "wait_incomplete": {
+      "transitions": ["intent.persisted", "dispatch.started", "delivery.accepted", "wait.started"],
+      "terminal": { "event": "wait.incomplete", "exit": 5, "state": "accepted" }
+    },
+    "reply_unknown": {
+      "transitions": ["intent.persisted", "dispatch.started", "delivery.accepted", "reply.claimed", "claim.expired"],
+      "terminal": { "event": "operation.unknown", "exit": 4, "state": "reply_outcome_unknown" }
+    },
+    "read_complete": {
+      "transitions": [],
+      "terminal": { "event": "thread.read.completed", "exit": 0, "state": "accepted" }
+    }
+  },
+  "scenarios": [
+    { "id": "messaging.idle-recipient", "matrix": "messaging", "profile": "plain_accept", "observable": ["one envelope accepted", "associated turn ID is receipted", "new-versus-existing turn is not claimed without evidence"] },
+    { "id": "messaging.active-regular-recipient", "matrix": "messaging", "profile": "plain_accept", "observable": ["atomic start-or-steer accepts", "caller does not choose steer", "no duplicate send"] },
+    { "id": "messaging.unloaded-persistent-recipient", "matrix": "messaging", "profile": "plain_accept", "observable": ["resume effect is receipted", "delivery is accepted", "connection detach is attempted"] },
+    { "id": "messaging.review-manual-compact", "matrix": "messaging", "profile": "rejected", "observable": ["classified temporary rejection may retry within delivery deadline", "message is never queued"] },
+    { "id": "messaging.incompatible-non-steerable-turn", "matrix": "messaging", "profile": "rejected", "observable": ["exact rejection code and evidence", "no hidden fallback", "no dispatch after conclusive rejection"] },
+    { "id": "messaging.oversized-body", "matrix": "messaging", "profile": "usage_rejected", "observable": ["measured characters and UTF-8 bytes are reported", "input_too_large", "no dispatch-start record"] },
+    { "id": "messaging.raw-send", "matrix": "messaging", "profile": "plain_accept", "observable": ["target body is byte-equivalent", "target sees no Mektup envelope", "receipt still has digest and byte count"] },
+    { "id": "messaging.raw-plus-wait", "matrix": "messaging", "profile": "usage_rejected", "observable": ["invalid_raw_wait", "no request written"] },
+    { "id": "messaging.request-reply-without-wait", "matrix": "messaging", "profile": "plain_accept", "observable": ["reply-requested envelope accepted", "returns without waiting", "later wait can observe reply"] },
+    { "id": "messaging.wait-on-plain-or-raw-send", "matrix": "messaging", "profile": "usage_rejected", "observable": ["reply_not_requested", "no follow-up message", "no resend"] },
+    { "id": "messaging.human-one-way", "matrix": "messaging", "profile": "plain_accept", "observable": ["from-kind human", "source thread may be null", "no correlated reply promise"] },
+    { "id": "messaging.human-wait-without-route", "matrix": "messaging", "profile": "usage_rejected", "observable": ["reply_route_required", "no dispatch"] },
+    { "id": "messaging.duplicate-target-name", "matrix": "messaging", "profile": "usage_rejected", "observable": ["target_ambiguous", "bounded candidates are listed", "no dispatch"] },
+    { "id": "messaging.target-changes-after-resolution", "matrix": "messaging", "profile": "plain_accept", "observable": ["retry uses pinned endpoint and thread IDs", "Herdr selector is not re-resolved"] },
+
+    { "id": "reply.active-sender-blocked-in-wait", "matrix": "reply", "profile": "reply_wait_success", "observable": ["custody wake exits waiter before pending-input drain", "reply body enters sender thread once"] },
+    { "id": "reply.sender-turn-ended", "matrix": "reply", "profile": "reply_wait_success", "observable": ["reply starts through valid new turn", "in-reply-to remains original message ID"] },
+    { "id": "reply.waiter-canceled", "matrix": "reply", "profile": "wait_incomplete", "observable": ["accepted send survives cancellation", "later wait remains possible", "delivery is not canceled"] },
+    { "id": "reply.process-restarted", "matrix": "reply", "profile": "reply_wait_success", "observable": ["custody journal is checked first", "live buffer precedes full-history scan", "overlap deduplicates by native item and envelope ID"] },
+    { "id": "reply.no-reply", "matrix": "reply", "profile": "wait_incomplete", "observable": ["wait remains active until caller timeout or cancel", "silence is not protocol error"] },
+    { "id": "reply.explicit-timeout", "matrix": "reply", "profile": "wait_incomplete", "observable": ["accepted receipt is retained", "wait_incomplete is terminal", "exit class is 5"] },
+    { "id": "reply.success-reply", "matrix": "reply", "profile": "reply_wait_success", "observable": ["first terminal reply satisfies wait", "reply body is not duplicated in tool output"] },
+    { "id": "reply.error-reply", "matrix": "reply", "profile": "reply_wait_success", "observable": ["reply status error is accepted at destination", "body is submitted once", "terminal exit class is 3"] },
+    { "id": "reply.multiple-replies", "matrix": "reply", "profile": "reply_wait_success", "observable": ["first valid reply satisfies wait", "later replies remain inspectable"] },
+    { "id": "reply.malformed-envelope", "matrix": "reply", "profile": "rejected", "observable": ["candidate is not correlated", "ordinary text remains visible"] },
+    { "id": "reply.well-formed-forged-envelope", "matrix": "reply", "profile": "reply_wait_success", "observable": ["correlation is reported as observed only", "authorship is never claimed", "thread write access remains trust boundary"] },
+    { "id": "reply.copied-forked-original", "matrix": "reply", "profile": "usage_rejected", "observable": ["message_not_addressed_to_thread", "ancestor envelope is not resolved in descendant"] },
+    { "id": "reply.missing-return-route", "matrix": "reply", "profile": "usage_rejected", "observable": ["reply_route_unavailable", "no guessed alias", "no dispatch"] },
+    { "id": "reply.portable-successor", "matrix": "reply", "profile": "reply_wait_success", "observable": ["metadata wait works with configured authority", "explicit content lookup verifies IDs and digest"] },
+    { "id": "reply.accepted-but-item-suppressed", "matrix": "reply", "profile": "reply_wait_success", "observable": ["reply_accepted is retained", "reply_observed is not emitted without native item evidence"] },
+    { "id": "reply.receiver-loses-result-commit", "matrix": "reply", "profile": "reply_unknown", "observable": ["fenced claim expires", "waiter receives reply_outcome_unknown", "automatic resend is forbidden"] },
+    { "id": "reply.two-receivers-same-reply-id", "matrix": "reply", "profile": "reply_wait_success", "observable": ["one receiver gets claimed authority and submits the body", "matching caller receives tokenless existing", "conflicting digest or route rejects"] },
+    { "id": "reply.duplicate-after-terminal", "matrix": "reply", "profile": "reply_wait_success", "observable": ["tokenless existing reports status and winner metadata", "body is not resubmitted"] },
+    { "id": "reply.claim-result-schema", "matrix": "reply", "profile": "reply_wait_success", "observable": ["claimed requires state, fencingToken, and lease", "existing requires state and forbids fencingToken and lease", "every emitted result validates"] },
+    { "id": "reply.observe-idempotent-same-evidence", "matrix": "reply", "profile": "reply_observed_success", "observable": ["same nativeItemId and digest are idempotent", "custody reaches reply_observed once"] },
+    { "id": "reply.observe-conflicting-native-item", "matrix": "reply", "profile": "rejected", "observable": ["different nativeItemId conflicts", "no dispatch authority is created"] },
+    { "id": "reply.observe-conflicting-digest", "matrix": "reply", "profile": "rejected", "observable": ["different digest conflicts", "no dispatch authority is created"] },
+    { "id": "reply.observe-unknown-to-observed", "matrix": "reply", "profile": "reply_observed_from_unknown", "observable": ["exact native evidence strengthens reply_outcome_unknown to reply_observed", "expired fencing is never revived", "existing winner is not replaced and provenance is retained"] },
+    { "id": "reply.observe-accepted-to-observed", "matrix": "reply", "profile": "reply_observed_success", "observable": ["exact native evidence strengthens reply_accepted to reply_observed", "body is not resubmitted"] },
+    { "id": "reply.observe-winner-never-replaced", "matrix": "reply", "profile": "reply_observed_success", "observable": ["first observation selects a winner only when none exists", "earlier winner remains stable"] },
+    { "id": "reply.observe-no-dispatch-authority", "matrix": "reply", "profile": "usage_rejected", "observable": ["fencingToken, lease, requestedLease, and attemptOwner are forbidden", "summary/search/receipt claims cannot substitute native evidence"] },
+    { "id": "reply.original-status-winner", "matrix": "reply", "profile": "read_complete", "observable": ["authoritative winner is selected before terminal unknown", "accepted/observed winner union includes positive commitSeq", "observed winner includes nativeItemId"] },
+    { "id": "reply.original-status-terminal-unknown", "matrix": "reply", "profile": "read_complete", "observable": ["earliest durable terminal unknown is selected", "positive terminal event sequence and exact body metadata are returned", "expired fencing is never revived"] },
+    { "id": "reply.original-status-pending", "matrix": "reply", "profile": "read_complete", "observable": ["no winner or unknown returns pending", "pending contains no selected-reply metadata", "operation remains idempotent"] },
+    { "id": "reply.original-status-message-not-found", "matrix": "reply", "profile": "usage_rejected", "observable": ["absent original returns message_not_found", "missing original is never presented as pending", "no dispatch or lease effect"] },
+    { "id": "reply.original-status-identity-conflict", "matrix": "reply", "profile": "usage_rejected", "observable": ["tuple or route mismatch returns message_identity_conflict", "cached or caller-supplied selection is ignored", "no authority effect"] },
+    { "id": "reply.original-status-no-dispatch-authority", "matrix": "reply", "profile": "usage_rejected", "observable": ["request forbids reply identity, body metadata, native evidence, and authority including null", "result forbids fencing and lease authority", "originalStatus cannot dispatch or read body"] },
+    { "id": "reply.original-status-error-code", "matrix": "reply", "profile": "read_complete", "observable": ["replyErrorCode is allowed only with error status", "success selection forbids error code", "terminal selection remains tokenless"] },
+    { "id": "reply.original-status-sequence-shape", "matrix": "reply", "profile": "usage_rejected", "observable": ["zero or non-integer sequence/commitSeq is rejected", "observed selection requires nonempty nativeItemId", "strict selection union rejects additive authority"] },
+
+    { "id": "transport.before-connection-write", "matrix": "transport", "profile": "usage_rejected", "observable": ["not_sent", "retry may be safe"] },
+    { "id": "transport.prepared-process-dies", "matrix": "transport", "profile": "not_sent_recovered", "observable": ["recovery maps orphaned prepared attempt to not_sent", "message identity is retained"] },
+    { "id": "transport.dispatch-start-process-dies", "matrix": "transport", "profile": "unknown", "observable": ["recovery maps to outcome_unknown", "automatic resend is forbidden"] },
+    { "id": "transport.explicit-pre-admission-rejection", "matrix": "transport", "profile": "rejected", "observable": ["rejected", "server evidence is nested", "no retry unless classified temporary"] },
+    { "id": "transport.full-frame-response-lost", "matrix": "transport", "profile": "unknown", "observable": ["outcome_unknown", "no automatic resend"] },
+    { "id": "transport.acceptance-response-received", "matrix": "transport", "profile": "plain_accept", "observable": ["accepted remains true even if wait later fails"] },
+    { "id": "transport.notification-gap-history-proves-id", "matrix": "transport", "profile": "plain_accept", "observable": ["history reconciles accepted", "native item evidence may separately produce reply_observed"] },
+    { "id": "transport.history-missing-id-stale", "matrix": "transport", "profile": "unknown", "observable": ["stale or incomplete history does not downgrade certainty", "remains unknown"] },
+    { "id": "transport.stdout-breaks-after-commit", "matrix": "transport", "profile": "plain_accept", "observable": ["process fails nonzero", "journaled receipt remains recoverable"] },
+    { "id": "transport.ssh-child-exits", "matrix": "transport", "profile": "unknown", "observable": ["spawn/auth/proxy/EOF/unknown effect are distinguished"] },
+    { "id": "transport.local-daemon-missing", "matrix": "transport", "profile": "rejected", "observable": ["endpoint_unavailable", "daemon is never spawned"] },
+    { "id": "transport.slow-event-consumer", "matrix": "transport", "profile": "rejected", "observable": ["bounded behavior", "explicit disconnect or degradation evidence"] },
+    { "id": "transport.active-turn-pagination", "matrix": "transport", "profile": "read_complete", "observable": ["mutable/current turns are revisited", "cursor is not a message checkpoint"] },
+    { "id": "transport.history-live-handoff", "matrix": "transport", "profile": "read_complete", "observable": ["subscription and buffer precede scan", "history/live overlap is deduplicated"] },
+
+    { "id": "multi-client.shared-thread", "matrix": "multi-client", "profile": "read_complete", "observable": ["Mektup and TUI can subscribe together"] },
+    { "id": "multi-client.server-request-observed", "matrix": "multi-client", "profile": "read_complete", "observable": ["approval/user-input/tool/auth/MCP requests are observed", "Mektup sends no response or error"] },
+    { "id": "multi-client.blocker-metadata", "matrix": "multi-client", "profile": "read_complete", "observable": ["blocker method and correlation metadata are journaled", "request contents are absent"] },
+    { "id": "multi-client.pending-replay", "matrix": "multi-client", "profile": "read_complete", "observable": ["pending request replay cannot cause a response"] },
+
+    { "id": "read.thread-list-defaults", "matrix": "read-search", "profile": "read_complete", "observable": ["updated descending", "all supported source kinds including spawned agents"] },
+    { "id": "read.thread-list-filters-pagination", "matrix": "read-search", "profile": "read_complete", "observable": ["loaded/archived/source/sort/order/limit/cursor semantics are preserved or rejected"] },
+    { "id": "read.thread-read-bounded", "matrix": "read-search", "profile": "read_complete", "observable": ["exact metadata/runtime facts", "no unbounded transcript hydration", "no resume effect"] },
+    { "id": "read.turns-summary-full", "matrix": "read-search", "profile": "read_complete", "observable": ["descending labelled summaries by default", "explicit full view"] },
+    { "id": "read.items-bounded-turn-filter", "matrix": "read-search", "profile": "read_complete", "observable": ["ascending bounded items", "exact turn filter"] },
+    { "id": "read.cross-thread-search", "matrix": "read-search", "profile": "read_complete", "observable": ["resultKind thread", "snippets and actionable thread locators", "bounded pages"] },
+    { "id": "read.scoped-search", "matrix": "read-search", "profile": "read_complete", "observable": ["resultKind message", "visible-message snippets", "native UTF-16 offsets or labelled conversion", "turn/item locators"] },
+    { "id": "read.experimental-search-unavailable", "matrix": "read-search", "profile": "rejected", "observable": ["capability negotiation is explicit", "backend unavailability has precise failure"] },
+    { "id": "read.no-title-fallback", "matrix": "read-search", "profile": "read_complete", "observable": ["thread/list.searchTerm is never substituted", "search miss is not identity or delivery evidence"] },
+    { "id": "read.exact-reconciliation", "matrix": "read-search", "profile": "read_complete", "observable": ["direct IDs/full items/envelope validation/digest checks", "fuzzy search is not authoritative"] },
+
+    { "id": "endpoint.built-in-local", "matrix": "endpoint", "profile": "read_complete", "observable": ["no config required", "current Codex home/socket identity selects stable endpoint ID"] },
+    { "id": "endpoint.custom-owner-private-config", "matrix": "endpoint", "profile": "read_complete", "observable": ["stable endpoint ID created", "config is owner-private"] },
+    { "id": "endpoint.alias-not-portable-authority", "matrix": "endpoint", "profile": "rejected", "observable": ["alias equality does not grant route authority"] },
+    { "id": "endpoint.direct-codex-without-herdr", "matrix": "endpoint", "profile": "plain_accept", "observable": ["direct Codex URI works", "Herdr absence does not block direct route"] },
+    { "id": "endpoint.herdr-one-association", "matrix": "endpoint", "profile": "plain_accept", "observable": ["one verified association is required", "requested and resolved identity retained"] },
+    { "id": "endpoint.herdr-zero-or-multiple", "matrix": "endpoint", "profile": "usage_rejected", "observable": ["zero/multiple/stale matches fail closed"] },
+    { "id": "endpoint.remote-explicit-map", "matrix": "endpoint", "profile": "plain_accept", "observable": ["stable endpoint ID is explicitly mapped before portable use"] },
+    { "id": "endpoint.source-independent-destination", "matrix": "endpoint", "profile": "plain_accept", "observable": ["source resolved independently", "destination override does not rebind source"] },
+    { "id": "endpoint.distinct-codex-homes", "matrix": "endpoint", "profile": "read_complete", "observable": ["distinct homes receive distinct built-in-local IDs"] },
+    { "id": "endpoint.cross-host-route-preflight", "matrix": "endpoint", "profile": "usage_rejected", "observable": ["missing reverse mapping fails before send", "succeeds after exact stable IDs are mapped"] },
+    { "id": "endpoint.custom-state-dir-store", "matrix": "endpoint", "profile": "read_complete", "observable": ["opaque custody store ID is registered", "path is never portable"] },
+    { "id": "endpoint.builtin-home-stable-across-state-dirs", "matrix": "endpoint", "profile": "read_complete", "observable": ["same Codex home/socket keeps one built-in-local endpoint ID", "default and custom operation state do not fork endpoint identity"] },
+    { "id": "endpoint.control-registry-fixed-state-root", "matrix": "endpoint", "profile": "read_complete", "observable": ["control-registry.json remains under the default XDG state root", "--state-dir and MEKTUP_STATE_DIR do not relocate registry authority"] },
+    { "id": "endpoint.custom-state-requires-local-journal", "matrix": "endpoint", "profile": "read_complete", "observable": ["reply-requesting use registers only a locally opened and identity-verified journal", "ordinary state reads do not mutate registry"] },
+    { "id": "endpoint.registry-owner-private-canonical", "matrix": "endpoint", "profile": "usage_rejected", "observable": ["missing/moved/corrupt/duplicate/mismatched or unsafe registry fails closed", "registry maps opaque store identity to one canonical local state directory", "remote input cannot create or rewrite mappings"] },
+    { "id": "endpoint.control-destination-membership-exact", "matrix": "endpoint", "profile": "usage_rejected", "observable": ["endpoint ID, URI alias, decoded thread, and durable journal relationship agree exactly", "missing or ambiguous aliases fail before receiver effect"] },
+    { "id": "endpoint.remote-control-cannot-rewrite-mapping", "matrix": "endpoint", "profile": "usage_rejected", "observable": ["remote control fields cannot add or rewrite endpoint, alias, route, store, or filesystem mappings", "unregistered authority fails before receiver effect"] },
+    { "id": "endpoint.split-reply-and-custody", "matrix": "endpoint", "profile": "plain_accept", "observable": ["body route and custody route are independently validated"] },
+    { "id": "endpoint.human-reply-to", "matrix": "endpoint", "profile": "usage_rejected", "observable": ["human correlated send establishes both routes or fails closed"] },
+    { "id": "endpoint.ssh-system-config", "matrix": "endpoint", "profile": "read_complete", "observable": ["OpenSSH config/verification/agent/ProxyJump remain authoritative"] },
+    { "id": "endpoint.remote-binary-version", "matrix": "endpoint", "profile": "rejected", "observable": ["remote binary absence and version mismatch are distinct", "credentials do not appear in process args"] },
+
+    { "id": "journal.concurrent-wal-writers", "matrix": "journal", "profile": "plain_accept", "observable": ["WAL and bounded busy handling", "transactional writer safety"] },
+    { "id": "journal.crash-remote-result-commit-output", "matrix": "journal", "profile": "unknown", "observable": ["journal state remains conservative across result/commit/stdout crash points"] },
+    { "id": "journal.crash-prepared", "matrix": "journal", "profile": "not_sent_recovered", "observable": ["prepared orphan recovers to not_sent"] },
+    { "id": "journal.crash-dispatch-start", "matrix": "journal", "profile": "unknown", "observable": ["dispatch-start orphan recovers to outcome_unknown"] },
+    { "id": "journal.transactional-migration", "matrix": "journal", "profile": "read_complete", "observable": ["interrupted migration recovers transactionally"] },
+    { "id": "journal.private-permissions", "matrix": "journal", "profile": "read_complete", "observable": ["file/directory/WAL/SHM permissions are owner-private"] },
+    { "id": "journal.retention-active-unknown", "matrix": "journal", "profile": "read_complete", "observable": ["active and unknown receipts survive maintenance"] },
+    { "id": "journal.retention-completed", "matrix": "journal", "profile": "read_complete", "observable": ["completed/resolved records become eligible after retention", "prune is maintenance-only"] },
+    { "id": "journal.blocker-upsert", "matrix": "journal", "profile": "read_complete", "observable": ["repeat observations update one blocker", "polling does not append duplicates"] },
+    { "id": "journal.storage-check-read-only", "matrix": "journal", "profile": "read_complete", "observable": ["integrity check makes no mutation"] },
+    { "id": "journal.storage-maintain", "matrix": "journal", "profile": "read_complete", "observable": ["prune/checkpoint/optimization are separately receipted"] },
+    { "id": "journal.storage-vacuum-explicit", "matrix": "journal", "profile": "read_complete", "observable": ["file-size result is reported", "vacuum is never implicit"] },
+    { "id": "journal.doctor-fix-receipted", "matrix": "journal", "profile": "read_complete", "observable": ["default doctor is read-only", "doctor fix lists and receipts each repair"] },
+    { "id": "journal.corrupt-no-rebuild", "matrix": "journal", "profile": "rejected", "observable": ["corrupt/unreadable/busy database fails", "no deletion or silent rebuild"] },
+    { "id": "journal.portable-import-untrusted", "matrix": "journal", "profile": "rejected", "observable": ["receipt import cannot grant endpoint access or override observed state"] },
+
+    { "id": "rpc.params-inputs", "matrix": "raw-rpc", "profile": "read_complete", "observable": ["stdin/file/inline params are bounded and equivalent"] },
+    { "id": "rpc.raw-request-reply-rejected", "matrix": "raw-rpc", "profile": "usage_rejected", "observable": ["invalid_raw_reply_request", "no dispatch"] },
+    { "id": "rpc.stable-read", "matrix": "raw-rpc", "profile": "read_complete", "observable": ["read needs no effect acknowledgment"] },
+    { "id": "rpc.network-read", "matrix": "raw-rpc", "profile": "read_complete", "observable": ["network effect is recorded in receipt"] },
+    { "id": "rpc.experimental-method", "matrix": "raw-rpc", "profile": "read_complete", "observable": ["capability auto-enables", "receipt records experimental use"] },
+    { "id": "rpc.experimental-field", "matrix": "raw-rpc", "profile": "read_complete", "observable": ["parameter-aware capability negotiation", "before-turn fork is receipted"] },
+    { "id": "rpc.in-progress-through-turn", "matrix": "raw-rpc", "profile": "rejected", "observable": ["in-progress cutoff is rejected before mutation"] },
+    { "id": "rpc.write-effect-gate", "matrix": "raw-rpc", "profile": "usage_rejected", "observable": ["missing matching allow-effect fails before request write"] },
+    { "id": "rpc.unknown-effect-gate", "matrix": "raw-rpc", "profile": "usage_rejected", "observable": ["unknown method requires allow-effect unknown"] },
+    { "id": "rpc.worst-case-classification", "matrix": "raw-rpc", "profile": "usage_rejected", "observable": ["method classification uses worst-case behavior and parameters"] },
+    { "id": "rpc.large-response-spill", "matrix": "raw-rpc", "profile": "read_complete", "observable": ["complete owner-private artifact", "artifact.spilled includes path/bytes/digest", "not silently truncated"] },
+    { "id": "rpc.server-error-nested", "matrix": "raw-rpc", "profile": "rejected", "observable": ["app-server JSON-RPC error remains nested", "stable Mektup code remains authoritative"] },
+    { "id": "rpc.uncertain-mutation-no-retry", "matrix": "raw-rpc", "profile": "unknown", "observable": ["possible mutation remains unknown", "automatic retry is forbidden"] }
+  ]
+}
