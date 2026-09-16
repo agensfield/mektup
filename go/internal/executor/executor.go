@@ -257,8 +257,16 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 	if resolvedEndpoint.ID != "" {
 		if pinned, ok := e.ports.Connections.(PinnedConnectionFactory); ok {
 			conn, err = pinned.OpenPinned(ctx, resolvedEndpoint, OpenOptions{ExperimentalAPI: needsExperimental})
-			if err == nil {
-				api = conn.Codex()
+			if err != nil {
+				return cli.ExecutionResult{}, mapError(err, "unknown")
+			}
+			if conn == nil {
+				return cli.ExecutionResult{}, missing("connection")
+			}
+			api = conn.Codex()
+			if api == nil {
+				_ = conn.Close()
+				return cli.ExecutionResult{}, missing("codex")
 			}
 		} else {
 			conn, api, err = e.openWithOptions(ctx, endpointSelector, OpenOptions{ExperimentalAPI: needsExperimental})

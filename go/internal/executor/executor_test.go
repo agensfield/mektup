@@ -119,7 +119,7 @@ func (f *fakeTargets) ResolveThread(_ context.Context, selector, _ string) (Thre
 	if f.err != nil {
 		return ThreadTarget{}, f.err
 	}
-	return ThreadTarget{Endpoint: f.endpoint, ThreadID: f.thread, URI: selector}, nil
+	return ThreadTarget{Endpoint: f.endpoint, EndpointID: f.endpoint, Resolved: endpoint.Endpoint{ID: f.endpoint, Alias: "local"}, ThreadID: f.thread, URI: selector}, nil
 }
 
 func (f *fakeTargets) ResolveThreadWithOptions(ctx context.Context, selector, endpointOverride string, _ bool) (ThreadTarget, error) {
@@ -724,6 +724,42 @@ func TestResolverNotFoundEmitsLockedWireErrorCode(t *testing.T) {
 	}
 	if event.Data.Error.Code != mektup.ErrEndpointUnavailable || !event.Data.Error.Code.Valid() {
 		t.Fatalf("code=%q", event.Data.Error.Code)
+	}
+}
+
+type pinnedFactory struct {
+	conn Connection
+	err  error
+}
+
+func (f pinnedFactory) Open(context.Context, string) (Connection, error) { return f.conn, nil }
+func (f pinnedFactory) Check(context.Context, string) (any, error)       { return nil, nil }
+func (f pinnedFactory) OpenPinned(context.Context, endpoint.Endpoint, OpenOptions) (Connection, error) {
+	return f.conn, f.err
+}
+
+func TestPinnedOpenNormalizesUnsupportedAndNilResults(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		factory pinnedFactory
+	}{
+		{"unsupported", pinnedFactory{err: connection.ErrUnsupported}},
+		{"nil", pinnedFactory{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := New(Ports{Connections: tc.factory, Targets: &fakeTargets{endpoint: "ep_1", thread: "native"}, Receipts: &fakeReceipts{}})
+			_, err := e.Execute(context.Background(), invocation("thread", "read", "codex://local/thread/native"))
+			var ce *cli.Error
+			if !errors.As(err, &ce) {
+				t.Fatalf("err=%v", err)
+			}
+			if tc.name == "unsupported" && (ce.Code != "unsupported_server_version" || ce.Exit != cli.ExitRejected) {
+				t.Fatalf("unsupported mapped=%+v", ce)
+			}
+			if tc.name == "nil" && ce.Code != "internal_error" {
+				t.Fatalf("nil mapped=%+v", ce)
+			}
+		})
 	}
 }
 
