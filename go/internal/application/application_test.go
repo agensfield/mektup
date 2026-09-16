@@ -3,6 +3,7 @@ package application
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"github.com/agensfield/mektup/go/internal/executor"
 	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/rawrpc"
+	_ "modernc.org/sqlite"
 )
 
 type fakeTransport struct {
@@ -208,6 +210,32 @@ func TestStorageCheckUsesReadOnlyPathWithoutJournalOpen(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(state, "journal.sqlite3-wal")); !os.IsNotExist(err) {
 		t.Fatalf("read-only storage check created WAL: %v", err)
+	}
+	_ = env.Close()
+}
+
+func TestRealSQLiteBusyAtJournalOpenMapsToStorageBusyExit4(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	j, err := journal.Open(context.Background(), journal.Options{StateDir: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = j.Close()
+	db, err := sql.Open("sqlite", filepath.Join(state, "journal.sqlite3"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("BEGIN IMMEDIATE"); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Exec("ROLLBACK")
+	var out, errOut bytes.Buffer
+	env := New(Options{CodexHome: filepath.Join(root, "codex")})
+	app := &cli.App{Out: &out, Err: &errOut, Executor: env, Env: []string{"MEKTUP_OUTPUT=json", "MEKTUP_STATE_DIR=" + state, "MEKTUP_CONFIG=" + filepath.Join(root, "config.json")}}
+	if code := app.Run([]string{"storage", "status"}); code != int(cli.ExitUnknown) || !strings.Contains(out.String(), `"code":"storage_busy"`) {
+		t.Fatalf("busy journal exit=%d output=%s stderr=%s", code, out.String(), errOut.String())
 	}
 	_ = env.Close()
 }

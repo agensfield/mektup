@@ -32,6 +32,8 @@ import (
 	"github.com/agensfield/mektup/go/internal/rawrpc"
 	"github.com/agensfield/mektup/go/internal/sshproxy"
 	"github.com/agensfield/mektup/go/internal/storage"
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
 )
 
 // Options controls production composition. DialerForRoute is a deterministic
@@ -356,11 +358,30 @@ func (s readOnlyStorage) Vacuum(context.Context) (journal.VacuumReceipt, error) 
 }
 
 func mapJournalOpenError(err error) error {
+	if isSQLiteBusyOrLocked(err) {
+		err = fmt.Errorf("%w: %v", journal.ErrStorageBusy, err)
+	}
 	code := "storage_corrupt"
 	if errors.Is(err, journal.ErrStorageBusy) {
 		code = "storage_busy"
 	}
-	return &cli.Error{Code: code, Message: err.Error(), Effect: "not_sent", Details: map[string]any{"cause": err.Error()}, Exit: cli.ExitRejected}
+	exit := cli.ExitRejected
+	if code == "storage_busy" {
+		exit = cli.ExitUnknown
+	}
+	return &cli.Error{Code: code, Message: err.Error(), Effect: "not_sent", Details: map[string]any{"cause": err.Error()}, Exit: exit}
+}
+
+func isSQLiteBusyOrLocked(err error) bool {
+	var sqliteErr *sqlite.Error
+	if errors.As(err, &sqliteErr) {
+		code := sqliteErr.Code() & 0xff
+		if code == sqlite3.SQLITE_BUSY || code == sqlite3.SQLITE_LOCKED {
+			return true
+		}
+	}
+	message := strings.ToUpper(err.Error())
+	return strings.Contains(message, "SQLITE_BUSY") || strings.Contains(message, "SQLITE_LOCKED") || strings.Contains(message, "DATABASE IS LOCKED")
 }
 
 func (e *Environment) paths(inv cli.Invocation) (string, string) {
