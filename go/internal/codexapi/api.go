@@ -23,21 +23,26 @@ const (
 	DefaultOccurrencesPageLimit = 50
 	MaxOccurrencesPageLimit     = 250
 	MaxCursorBytes              = 4096
-	MaxReconciliationPages      = 1000
-	MaxReconciliationItems      = 100000
-	MaxReconciliationBytes      = 64 << 20
+	// MaxSemanticResponseBytes bounds one decoded semantic response before
+	// object/page parsing or RawObject copies can amplify its memory cost.
+	MaxSemanticResponseBytes = 16 << 20
+	MaxReconciliationPages   = 1000
+	MaxReconciliationItems   = 100000
+	MaxReconciliationBytes   = 64 << 20
 )
 
 var (
-	ErrExperimentalAPIRequired = errors.New("codexapi: experimentalApi capability is required")
-	ErrUnsupportedOption       = errors.New("codexapi: option is unsupported by the pinned app-server")
-	ErrInProgressCutoff        = errors.New("codexapi: throughTurn cannot name an in-progress turn")
-	ErrUnboundedPage           = errors.New("codexapi: response page exceeds the bounded limit")
-	ErrPaginationStalled       = errors.New("codexapi: pagination cursor repeated")
-	ErrPaginationExceeded      = errors.New("codexapi: reconciliation pagination bound exceeded")
-	ErrCutoffUnproven          = errors.New("codexapi: exact cutoff read did not prove the requested turn")
-	ErrInvalidCWD              = errors.New("codexapi: cwd must be a string or []string")
-	ErrConflictingCWD          = errors.New("codexapi: CWD and Cwd aliases conflict")
+	ErrExperimentalAPIRequired  = errors.New("codexapi: experimentalApi capability is required")
+	ErrUnsupportedOption        = errors.New("codexapi: option is unsupported by the pinned app-server")
+	ErrInProgressCutoff         = errors.New("codexapi: throughTurn cannot name an in-progress turn")
+	ErrUnboundedPage            = errors.New("codexapi: response page exceeds the bounded limit")
+	ErrPaginationStalled        = errors.New("codexapi: pagination cursor repeated")
+	ErrPaginationExceeded       = errors.New("codexapi: reconciliation pagination bound exceeded")
+	ErrCutoffUnproven           = errors.New("codexapi: exact cutoff read did not prove the requested turn")
+	ErrInvalidCWD               = errors.New("codexapi: cwd must be a string or []string")
+	ErrConflictingCWD           = errors.New("codexapi: CWD and Cwd aliases conflict")
+	ErrResponseTooLarge         = errors.New("codexapi: semantic response exceeds byte bound")
+	ErrSemanticResponseTooLarge = ErrResponseTooLarge
 )
 
 // ServerError is the exact JSON-RPC error evidence supplied by a Caller.
@@ -761,6 +766,9 @@ func (c *Client) callDecode(ctx context.Context, method string, params any, deco
 	}
 	if serverErr != nil {
 		return serverErr
+	}
+	if len(raw) > MaxSemanticResponseBytes {
+		return fmt.Errorf("%w: %d bytes exceeds %d", ErrResponseTooLarge, len(raw), MaxSemanticResponseBytes)
 	}
 	if err := decode(raw); err != nil {
 		return fmt.Errorf("codexapi: decode %s: %w", method, err)

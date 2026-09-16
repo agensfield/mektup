@@ -165,6 +165,43 @@ func TestReconcileHistoryRejectsRepeatedCursor(t *testing.T) {
 	}
 }
 
+func TestSemanticResponseByteBoundPrecedesDecodeAndRawCopies(t *testing.T) {
+	huge := json.RawMessage(strings.Repeat("x", MaxSemanticResponseBytes+1))
+	for _, test := range []struct {
+		name string
+		call func(*Client) error
+	}{
+		{"thread-list", func(c *Client) error {
+			_, err := c.ThreadList(context.Background(), ThreadListOptions{})
+			return err
+		}},
+		{"thread-read", func(c *Client) error {
+			_, err := c.ThreadRead(context.Background(), ThreadReadOptions{ThreadID: "thread"})
+			return err
+		}},
+		{"search", func(c *Client) error {
+			_, err := c.Search(context.Background(), SearchOptions{SearchTerm: "term"})
+			return err
+		}},
+		{"reconcile", func(c *Client) error {
+			_, err := c.ReconcileHistory(context.Background(), "thread")
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			caller := &recordingCaller{result: huge}
+			options := Options{}
+			if test.name == "search" {
+				options.Capabilities.ExperimentalAPI = true
+			}
+			err := test.call(New(caller, options))
+			if !errors.Is(err, ErrResponseTooLarge) {
+				t.Fatalf("error = %v, want ErrResponseTooLarge", err)
+			}
+		})
+	}
+}
+
 func TestTurnsRequireExplicitItemsViewAndBoundResponse(t *testing.T) {
 	r := &recordingCaller{result: json.RawMessage(`{"data":[],"nextCursor":null,"backwardsCursor":null}`)}
 	if _, err := New(r, Options{}).ThreadTurns(context.Background(), TurnsOptions{ThreadID: "thread"}); err == nil {

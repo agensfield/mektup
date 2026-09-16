@@ -126,11 +126,14 @@ type Response struct {
 // ServerErrorEvidence preserves the JSON-RPC error fields without replacing
 // the stable Mektup error code. Data is copied, never decoded and re-encoded.
 type ServerErrorEvidence struct {
-	ID         appserver.RequestID `json:"id,omitempty"`
-	Code       int64               `json:"code"`
-	Message    string              `json:"message"`
-	Data       json.RawMessage     `json:"data,omitempty"`
-	Generation uint64              `json:"generation,omitempty"`
+	ID           appserver.RequestID `json:"id,omitempty"`
+	Code         int64               `json:"code"`
+	Message      string              `json:"message"`
+	Data         json.RawMessage     `json:"data,omitempty"`
+	DataBytes    int64               `json:"dataBytes,omitempty"`
+	DataSHA256   string              `json:"dataSHA256,omitempty"`
+	DataArtifact *artifact.Receipt   `json:"dataArtifact,omitempty"`
+	Generation   uint64              `json:"generation,omitempty"`
 }
 
 // Error is a stable Mektup terminal error with optional untouched app-server
@@ -233,7 +236,7 @@ func Execute(ctx context.Context, caller Caller, request Request) (*Response, er
 	}
 	result, callErr := caller.Call(ctx, appserver.RPCRequest{ID: id, Method: plan.Request.Method, Params: plan.Request.Params})
 	if callErr != nil {
-		return nil, classifyCallError(plan, callErr)
+		return nil, classifyCallError(ctx, plan, callErr)
 	}
 	if result == nil {
 		return nil, newError(mektup.ErrInternal, "raw RPC caller returned no result", mektup.StateOutcomeUnknown, false, nil, errors.New("nil RPC result"))
@@ -298,7 +301,7 @@ func missingEffects(effects, grants []rpcmeta.EffectClass) []rpcmeta.EffectClass
 	return missing
 }
 
-func classifyCallError(plan Plan, cause error) error {
+func classifyCallError(ctx context.Context, plan Plan, cause error) error {
 	var callErr *appserver.CallError
 	if !errors.As(cause, &callErr) || callErr == nil {
 		return newError(mektup.ErrOutcomeUnknown, "raw RPC outcome is unknown", mektup.StateOutcomeUnknown, false,
@@ -326,8 +329,13 @@ func classifyCallError(plan Plan, cause error) error {
 	}
 	var serverEvidence *ServerErrorEvidence
 	if callErr.Server != nil {
-		serverEvidence = &ServerErrorEvidence{ID: callErr.Server.ID, Code: callErr.Server.Code, Message: callErr.Server.Message, Data: append(json.RawMessage(nil), callErr.Server.Data...), Generation: callErr.Server.Generation}
-		details["serverError"] = serverEvidence
+		serverEvidence = &ServerErrorEvidence{ID: callErr.Server.ID, Code: callErr.Server.Code, Message: callErr.Server.Message, Generation: callErr.Server.Generation}
+		retentionErr := retainServerErrorData(ctx, serverEvidence, callErr.Server.Data, plan.Request.Output)
+		details["serverError"] = serverEvidenceDetails(serverEvidence)
+		if retentionErr != nil {
+			details["serverErrorRetention"] = retentionErr.Error()
+			return stableError(mektup.ErrOutputTooLarge, "app-server error data could not be retained completely", state, false, details, serverEvidence, cause)
+		}
 	}
 	return stableError(code, message, state, false, details, serverEvidence, cause)
 }
@@ -352,14 +360,7 @@ func retainResult(ctx context.Context, response *Response, raw json.RawMessage, 
 	// An explicit output path is an output request, not merely a spill
 	// fallback. Publish the complete response even when it fits inline.
 	if options.Path != "" {
-		artifactOptions := artifact.RPCOutputOptions{MaxBytes: options.MaxBytes, MediaType: "application/json", SensitiveOutputPossible: true, Force: options.Force}
-		var receipt artifact.Receipt
-		var err error
-		if options.Store != nil {
-			receipt, err = options.Store.WriteRPCOutputPath(ctx, options.Path, bytes.NewReader(raw), artifactOptions)
-		} else {
-			receipt, err = artifact.WriteRPCOutputPath(ctx, options.Path, bytes.NewReader(raw), artifactOptions)
-		}
+		receipt, err := writeArtifact(ctx, raw, options, "raw-rpc-output.json")
 		if err != nil {
 			return newError(mektup.ErrOutputTooLarge, "raw RPC response could not be retained completely", response.EffectState, false,
 				map[string]any{"bytes": len(raw), "outputPath": options.Path, "error": err.Error()}, err)
@@ -379,23 +380,82 @@ func retainResult(ctx context.Context, response *Response, raw json.RawMessage, 
 		return nil
 	}
 	name := options.Name
+	digest := sha256.Sum256(raw)
 	if name == "" {
-		digest := sha256.Sum256(raw)
 		name = "raw-rpc-" + hex.EncodeToString(digest[:]) + ".json"
 	}
-	var receipt artifact.Receipt
-	var err error
-	if options.Store != nil {
-		receipt, err = options.Store.Spill(ctx, name, bytes.NewReader(raw), artifact.Options{MaxBytes: options.MaxBytes, MediaType: "application/json", SensitiveOutputPossible: true})
-	} else {
-		err = errors.New("raw RPC response exceeds inline limit and no artifact destination was supplied")
-	}
+	spillOptions := options
+	spillOptions.Name = name
+	receipt, err := writeArtifact(ctx, raw, spillOptions, name)
 	if err != nil {
 		return newError(mektup.ErrOutputTooLarge, "raw RPC response could not be retained completely", response.EffectState, false,
 			map[string]any{"bytes": len(raw), "inlineLimit": limit, "error": err.Error()}, err)
 	}
 	response.Artifact = &receipt
 	return nil
+}
+
+func retainServerErrorData(ctx context.Context, evidence *ServerErrorEvidence, raw json.RawMessage, options OutputOptions) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	digest := sha256.Sum256(raw)
+	evidence.DataBytes = int64(len(raw))
+	evidence.DataSHA256 = "sha256:" + hex.EncodeToString(digest[:])
+	limit := options.InlineLimit
+	if limit == 0 {
+		limit = DefaultInlineLimit
+	}
+	if options.Path == "" && limit < 1 {
+		return fmt.Errorf("raw RPC server error data inline output limit must be positive")
+	}
+	if options.Path == "" && int64(len(raw)) <= limit {
+		evidence.Data = append(json.RawMessage(nil), raw...)
+		return nil
+	}
+	spillOptions := options
+	if spillOptions.Name == "" {
+		spillOptions.Name = "raw-rpc-error-" + hex.EncodeToString(digest[:]) + ".json"
+	}
+	receipt, err := writeArtifact(ctx, raw, spillOptions, spillOptions.Name)
+	if err != nil {
+		return err
+	}
+	evidence.DataArtifact = &receipt
+	return nil
+}
+
+func writeArtifact(ctx context.Context, raw json.RawMessage, options OutputOptions, defaultName string) (artifact.Receipt, error) {
+	artifactOptions := artifact.RPCOutputOptions{MaxBytes: options.MaxBytes, MediaType: "application/json", SensitiveOutputPossible: true, Force: options.Force}
+	if options.Path != "" {
+		if options.Store != nil {
+			return options.Store.WriteRPCOutputPath(ctx, options.Path, bytes.NewReader(raw), artifactOptions)
+		}
+		return artifact.WriteRPCOutputPath(ctx, options.Path, bytes.NewReader(raw), artifactOptions)
+	}
+	name := options.Name
+	if name == "" {
+		name = defaultName
+	}
+	if options.Store == nil {
+		return artifact.Receipt{}, errors.New("raw RPC response exceeds inline limit and no artifact destination was supplied")
+	}
+	return options.Store.Spill(ctx, name, bytes.NewReader(raw), artifact.Options{MaxBytes: options.MaxBytes, MediaType: "application/json", SensitiveOutputPossible: true})
+}
+
+func serverEvidenceDetails(evidence *ServerErrorEvidence) map[string]any {
+	details := map[string]any{"id": evidence.ID, "code": evidence.Code, "message": evidence.Message}
+	if evidence.Generation != 0 {
+		details["generation"] = evidence.Generation
+	}
+	if evidence.DataBytes != 0 {
+		details["dataBytes"] = evidence.DataBytes
+		details["dataSHA256"] = evidence.DataSHA256
+	}
+	if evidence.DataArtifact != nil {
+		details["dataArtifact"] = evidence.DataArtifact
+	}
+	return details
 }
 
 func newError(code mektup.ErrorCode, message string, state mektup.EvidenceState, retryable bool, details map[string]any, cause error) *Error {

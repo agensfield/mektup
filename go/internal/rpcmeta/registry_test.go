@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -43,6 +44,48 @@ func TestRegistryCoversPinnedClientInventory(t *testing.T) {
 		if !ok || metadata.Stability != StabilityExperimental || !metadata.Experimental {
 			t.Errorf("experimental inventory method %q is absent or not experimental", method)
 		}
+	}
+}
+
+func TestStateChangingMethodNamesNeverDefaultToRead(t *testing.T) {
+	// A new update/set/delete/start/stop method must opt into a mutation class
+	// in the table. Read exceptions are explicit here rather than inferred from
+	// an experimental/stable label.
+	readExceptions := map[string]bool{}
+	for _, metadata := range Registry() {
+		parts := strings.Split(metadata.Method, "/")
+		if len(parts) == 0 {
+			continue
+		}
+		suffix := parts[len(parts)-1]
+		switch suffix {
+		case "update", "set", "delete", "start", "stop":
+		default:
+			continue
+		}
+		if readExceptions[metadata.Method] {
+			continue
+		}
+		mutation := false
+		for _, effect := range metadata.Effects {
+			switch effect {
+			case EffectThreadWrite, EffectHostWrite, EffectAuth, EffectDestructive, EffectUnknown:
+				mutation = true
+			}
+		}
+		if !mutation {
+			t.Errorf("state-changing method %q is classified only as %v", metadata.Method, metadata.Effects)
+		}
+	}
+}
+
+func TestTurnSettingsUpdateRequiresThreadWriteGrant(t *testing.T) {
+	decision := Evaluate("turn/settings/update", nil)
+	if !containsEffect(decision.Effects, EffectThreadWrite) || containsEffect(decision.Effects, EffectRead) {
+		t.Fatalf("turn/settings/update effects = %v, want thread-write mutation", decision.Effects)
+	}
+	if err := Gate(GateRequest{Method: "turn/settings/update"}); err == nil {
+		t.Fatal("turn/settings/update passed without a mutation grant")
 	}
 }
 

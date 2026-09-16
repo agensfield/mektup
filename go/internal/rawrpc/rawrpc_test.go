@@ -178,9 +178,76 @@ func TestRawServerErrorIsNestedWithoutChangingStableCode(t *testing.T) {
 	if rawErr.Server == nil || rawErr.Server.Code != server.Code || rawErr.Server.Message != server.Message || string(rawErr.Server.Data) != string(server.Data) || rawErr.Server.Generation != server.Generation {
 		t.Fatalf("server evidence = %+v", rawErr.Server)
 	}
+	if nested, ok := rawErr.Details["serverError"].(map[string]any); !ok || nested["data"] != nil {
+		t.Fatalf("stable details duplicated server data: %#v", rawErr.Details["serverError"])
+	}
 	if !errors.Is(err, server) && !errors.Is(err, caller.err) {
 		t.Fatalf("server error was not retained in unwrap chain: %v", err)
 	}
+}
+
+func TestOversizedServerErrorDataSpillsWithDigestAndNoDuplicateBlob(t *testing.T) {
+	data := json.RawMessage(`{"secret":"` + strings.Repeat("s", 128) + `"}`)
+	store, err := artifact.NewStore(filepath.Join(t.TempDir(), "artifacts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &appserver.ServerError{ID: "rpc-large", Code: -32603, Message: "failed", Data: data, Generation: 8}
+	caller := &recordingCaller{err: &appserver.CallError{Server: server, Evidence: appserver.WriteEvidence{Phase: appserver.WriteComplete, Generation: 8}, Generation: 8}}
+	_, err = Execute(context.Background(), caller, Request{Method: "thread/read", Output: OutputOptions{InlineLimit: 8, Store: store}})
+	rawErr := requireRawError(t, err)
+	if rawErr.Code != mektup.ErrDeliveryRejected || rawErr.Server == nil || rawErr.Server.Data != nil || rawErr.Server.DataArtifact == nil {
+		t.Fatalf("oversized server error = %+v", rawErr)
+	}
+	if rawErr.Server.DataBytes != int64(len(data)) || rawErr.Server.DataSHA256 == "" || !rawErr.Server.DataArtifact.SensitiveOutputPossible || !rawErr.Server.DataArtifact.Complete {
+		t.Fatalf("server data retention = %+v", rawErr.Server)
+	}
+	if nested, ok := rawErr.Details["serverError"].(map[string]any); !ok || nested["data"] != nil || nested["dataArtifact"] == nil {
+		t.Fatalf("stable nested server evidence = %#v", rawErr.Details["serverError"])
+	}
+	contents, err := os.ReadFile(rawErr.Server.DataArtifact.Path)
+	if err != nil || string(contents) != string(data) {
+		t.Fatalf("spilled server data = %q err=%v", contents, err)
+	}
+}
+
+func TestServerErrorDataArtifactFailureIsTruthful(t *testing.T) {
+	data := json.RawMessage(`{"secret":"` + strings.Repeat("s", 128) + `"}`)
+	server := &appserver.ServerError{ID: "rpc-fail", Code: -32603, Message: "failed", Data: data}
+	caller := &recordingCaller{err: &appserver.CallError{Server: server, Evidence: appserver.WriteEvidence{Phase: appserver.WriteComplete}}}
+	_, err := Execute(context.Background(), caller, Request{Method: "thread/read", Output: OutputOptions{InlineLimit: 8, MaxBytes: 4, Store: mustArtifactStore(t)}})
+	rawErr := requireRawError(t, err)
+	if rawErr.Code != mektup.ErrOutputTooLarge || rawErr.EffectState != string(mektup.StateRejected) || rawErr.Server == nil || rawErr.Server.DataArtifact != nil {
+		t.Fatalf("artifact failure error = %+v", rawErr)
+	}
+	if rawErr.Details["serverErrorRetention"] == nil {
+		t.Fatalf("artifact failure omitted retention evidence: %+v", rawErr.Details)
+	}
+}
+
+func TestServerErrorDataUsesExplicitOutputPath(t *testing.T) {
+	data := json.RawMessage(`{"secret":"` + strings.Repeat("p", 64) + `"}`)
+	path := filepath.Join(t.TempDir(), "error-data.json")
+	server := &appserver.ServerError{ID: "rpc-path", Code: -32603, Message: "failed", Data: data}
+	caller := &recordingCaller{err: &appserver.CallError{Server: server, Evidence: appserver.WriteEvidence{Phase: appserver.WriteComplete}}}
+	_, err := Execute(context.Background(), caller, Request{Method: "thread/read", Output: OutputOptions{InlineLimit: 1 << 20, Path: path}})
+	rawErr := requireRawError(t, err)
+	if rawErr.Code != mektup.ErrDeliveryRejected || rawErr.Server == nil || rawErr.Server.Data != nil || rawErr.Server.DataArtifact == nil || rawErr.Server.DataArtifact.Path != path {
+		t.Fatalf("explicit server data output = %+v", rawErr)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != string(data) {
+		t.Fatalf("explicit server data = %q err=%v", contents, err)
+	}
+}
+
+func mustArtifactStore(t *testing.T) *artifact.Store {
+	t.Helper()
+	store, err := artifact.NewStore(filepath.Join(t.TempDir(), "artifacts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store
 }
 
 func TestWritePhaseClassificationIsConservative(t *testing.T) {

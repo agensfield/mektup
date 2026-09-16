@@ -367,7 +367,7 @@ func buildRegistry() map[string]Metadata {
 		"threadSection/delete", "thread/inject_items", "turn/start", "turn/steer", "turn/interrupt", "review/start",
 		"thread/increment_elicitation", "thread/decrement_elicitation", "thread/queue/add", "thread/queue/update",
 		"thread/queue/delete", "thread/queue/reorder", "thread/queue/start", "thread/settings/update",
-		"thread/memoryMode/set", "thread/realtime/start", "thread/realtime/appendAudio", "thread/realtime/appendText",
+		"thread/memoryMode/set", "turn/settings/update", "thread/realtime/start", "thread/realtime/appendAudio", "thread/realtime/appendText",
 		"thread/realtime/appendSpeech", "thread/realtime/stop", "thread/approveGuardianDeniedAction",
 		"thread/backgroundTerminals/clean", "thread/backgroundTerminals/terminate",
 	)
