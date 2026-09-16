@@ -267,7 +267,12 @@ func (e *Executor) persistReceipt(ctx context.Context, receipt mektup.Receipt) e
 	if receipt.ReceiptID == "" || e == nil || e.ports.PersistReceipt == nil {
 		return nil
 	}
-	return e.ports.PersistReceipt(ctx, receipt)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	return e.ports.PersistReceipt(persistCtx, receipt)
 }
 
 func (e *Executor) service(ctx context.Context, inv cli.Invocation) (MessagingService, error) {

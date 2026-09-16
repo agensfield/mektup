@@ -337,7 +337,9 @@ func persistReceiptWarning(ctx context.Context, j *journal.Journal, value any) e
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	return j.PutReceipt(ctx, receipt)
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	return j.PutReceipt(persistCtx, receipt)
 }
 
 type resourcePorts struct {
@@ -438,7 +440,7 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 	herdr.EndpointRunner = e.options.HerdrEndpointRunner
 	sessionFactory := e.options.SessionFactory
 	if sessionFactory == nil {
-		sessionFactory = applicationSessionFactory{options: e.options.Connection, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute}
+		sessionFactory = applicationSessionFactory{options: e.options.Connection, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute, facts: facts}
 	}
 	pool := runtime.NewConnectionPool(sessionFactory, func(id string) (endpoint.Endpoint, error) { return store.ResolveEndpointID(id, codexHome) })
 	if stateProbe == nil {
@@ -516,7 +518,7 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 		remoteJournal.LocalEndpointID = custodyEndpointID
 		return nil
 	}
-	storeReceipts := receipts.Store{Journal: receiptJournal{Journal: j}}
+	storeReceipts := receipts.Store{Journal: j}
 	historyFactory := func(context.Context, cli.Invocation, mektup.Receipt) (receipts.HistoryPort, error) {
 		return runtimeHistory{observe: observe}, nil
 	}
@@ -531,7 +533,7 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 			return invocationAssertionGate{assertion: strings.ReplaceAll(operation.Option("resolve-as"), "-", "_"), reason: operation.Option("reason"), evidence: operation.Option("evidence")}, nil
 		}
 	}
-	importResolver := applicationImportResolver{observe: observe, store: store, codexHome: codexHome, resolverFor: resolverFor}
+	importResolver := applicationImportResolver{observe: observe, store: store, codexHome: codexHome, resolverFor: resolverFor, journal: j}
 	return pool, messageexecutor.New(messageexecutor.Ports{Service: serviceFactory, Original: originalFactory, Receipts: &storeReceipts, Input: input, PersistReceipt: storeReceipts.Save, EnrichReceipt: func(receipt mektup.Receipt) mektup.Receipt {
 		return enrichMessagingReceipt(receipt, store, codexHome, facts)
 	}, Artifacts: func(context.Context, cli.Invocation) (receipts.SpillWriter, error) {
@@ -563,8 +565,6 @@ func enrichMessagingReceipt(receipt mektup.Receipt, store endpoint.EndpointStore
 	}
 	return receipt
 }
-
-type receiptJournal struct{ *journal.Journal }
 
 type artifactSpillWriter struct{ store *artifact.Store }
 
@@ -601,6 +601,7 @@ type applicationSessionFactory struct {
 	sshConfig      sshproxy.Config
 	sshFactory     sshproxy.ProcessFactory
 	dialerForRoute func(endpoint.Route, bool) connection.ClientDialer
+	facts          *connectionFacts
 }
 
 func (f applicationSessionFactory) Open(ctx context.Context, ep endpoint.Endpoint) (runtime.Session, error) {
@@ -614,7 +615,14 @@ func (f applicationSessionFactory) Open(ctx context.Context, ep endpoint.Endpoin
 		}
 		options.ClientDialer = connection.NewSSHClientDialer(config, f.sshFactory)
 	}
-	return (runtime.ConnectionFactory{Options: options}).Open(ctx, ep)
+	session, err := (runtime.ConnectionFactory{Options: options}).Open(ctx, ep)
+	if err != nil {
+		return nil, err
+	}
+	if observed, ok := session.(interface{ ConnectionInfo() connection.Info }); ok && f.facts != nil {
+		f.facts.Set(ep.ID, observed.ConnectionInfo())
+	}
+	return session, nil
 }
 
 type runtimeHistory struct{ observe *runtime.ObservationAdapter }
@@ -653,38 +661,72 @@ type applicationImportResolver struct {
 	store       endpoint.EndpointStore
 	codexHome   string
 	resolverFor func(cli.Invocation) runtime.ResolverAdapter
+	journal     *journal.Journal
 }
 
 func (r applicationImportResolver) ResolveOriginal(ctx context.Context, inv cli.Invocation, imported receipts.Imported) (service.OriginalResolver, error) {
 	if !imported.Trusted && imported.Receipt.Message.MessageID == "" {
-		return nil, errors.New("portable receipt has no exact message identity")
+		return nil, &cli.Error{Code: "message_identity_conflict", Message: "portable receipt has no exact message identity", Effect: "rejected", Exit: cli.ExitRejected}
+	}
+	ep, err := r.verifyReceiptRoute(imported.Receipt)
+	if err != nil {
+		return nil, portableRouteError(err)
 	}
 	identity := imported.Receipt.Target
+	return runtime.OriginalResolver{Observe: r.observe, Target: service.ResolvedTarget{EndpointID: ep.ID, ThreadID: identity.ThreadID, URI: identity.Resolved, Loaded: true, Persistent: true}}, nil
+}
+
+func (r applicationImportResolver) ResolveWaitReference(ctx context.Context, _ cli.Invocation, imported receipts.Imported) (string, error) {
+	if imported.Receipt.OperationID == "" || imported.Receipt.ReceiptID == "" {
+		return "", portableRouteError(errors.New("portable receipt lacks durable receipt and operation identity"))
+	}
+	if _, err := r.verifyReceiptRoute(imported.Receipt); err != nil {
+		return "", portableRouteError(err)
+	}
+	if r.journal == nil {
+		return "", portableRouteError(errors.New("portable wait requires an authoritative local journal"))
+	}
+	stored, err := r.journal.Receipt(ctx, imported.Receipt.ReceiptID)
+	if err != nil {
+		return "", portableRouteError(fmt.Errorf("portable receipt is not locally durable: %w", err))
+	}
+	projected, projectionErr := receipts.PortableProjection(stored)
+	if projectionErr != nil || !portableReceiptEqual(projected, imported.Receipt) {
+		return "", &cli.Error{Code: "message_identity_conflict", Message: "portable receipt conflicts with durable operation identity", Effect: "rejected", Exit: cli.ExitRejected}
+	}
+	return stored.OperationID, nil
+}
+
+func portableRouteError(err error) error {
+	return &cli.Error{Code: "route_unavailable", Message: "portable receipt route or custody authority is unavailable", Effect: "rejected", Exit: cli.ExitRejected, Details: map[string]any{"cause": err.Error()}}
+}
+
+func portableReceiptEqual(left, right mektup.Receipt) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftJSON, rightJSON)
+}
+
+func (r applicationImportResolver) verifyReceiptRoute(receipt mektup.Receipt) (endpoint.Endpoint, error) {
+	identity := receipt.Target
 	if identity.EndpointID == "" || identity.ThreadID == "" || identity.Resolved == "" {
-		return nil, errors.New("portable receipt lacks an exact target route")
+		return endpoint.Endpoint{}, errors.New("portable receipt lacks an exact target route")
 	}
 	ep, err := r.store.ResolveEndpointID(identity.EndpointID, r.codexHome)
 	if err != nil {
-		return nil, fmt.Errorf("portable receipt endpoint is not locally established: %w", err)
+		return endpoint.Endpoint{}, fmt.Errorf("portable receipt endpoint is not locally established: %w", err)
 	}
 	address, err := mektup.ParseThreadURI(identity.Resolved)
 	if err != nil || address.ThreadID != identity.ThreadID {
-		return nil, errors.New("portable receipt target thread identity is inconsistent")
+		return endpoint.Endpoint{}, errors.New("portable receipt target thread identity is inconsistent")
 	}
 	if address.Endpoint != ep.Alias {
 		mapped, mapErr := r.store.ResolveEndpoint(address.Endpoint, r.codexHome)
 		if mapErr != nil || mapped.ID != ep.ID {
-			return nil, errors.New("portable receipt target alias is not pinned to the configured endpoint")
+			return endpoint.Endpoint{}, errors.New("portable receipt target alias is not pinned to the configured endpoint")
 		}
 	}
-	return runtime.OriginalResolver{Observe: r.observe, Target: service.ResolvedTarget{EndpointID: ep.ID, ThreadID: identity.ThreadID, URI: identity.Resolved, Loaded: true, Persistent: true}}, nil
-}
-
-func (r applicationImportResolver) ResolveWaitReference(_ context.Context, _ cli.Invocation, imported receipts.Imported) (string, error) {
-	if imported.Receipt.OperationID == "" {
-		return "", errors.New("portable receipt lacks an operation identity")
-	}
-	return imported.Receipt.OperationID, nil
+	return ep, nil
 }
 
 func threadIDFromURI(uri string) string {

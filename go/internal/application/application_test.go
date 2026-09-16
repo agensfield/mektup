@@ -665,9 +665,37 @@ func TestMessagingReceiptPersistsBeforeOutputAndWaitResolvesReceiptID(t *testing
 		t.Fatalf("emitted receipt was not durable: %v", err)
 	}
 	_ = j.Close()
+	portablePath := filepath.Join(root, "receipt.json")
 	out.Reset()
-	if code := app.Run([]string{"wait", event.Data.Receipt.ReceiptID, "--timeout", "1ms"}); code != int(cli.ExitIncomplete) {
+	if code := app.Run([]string{"receipt", "show", event.Data.Receipt.ReceiptID, "--portable"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("portable receipt show exit=%d output=%s", code, out.String())
+	}
+	if err := os.WriteFile(portablePath, bytes.TrimSpace(out.Bytes()), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if code := app.Run([]string{"wait", "portable-reference", "--receipt-file", portablePath, "--timeout", "1ms"}); code != int(cli.ExitIncomplete) {
 		t.Fatalf("wait receipt reference exit=%d output=%s", code, out.String())
+	}
+	var imported mektup.Receipt
+	portableData, err := os.ReadFile(portablePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(portableData), &imported); err != nil {
+		t.Fatal(err)
+	}
+	imported.Message.PayloadSHA256 = "sha256:" + strings.Repeat("b", 64)
+	mutated, err := json.Marshal(imported)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(portablePath, mutated, 0600); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	if code := app.Run([]string{"wait", "portable-reference", "--receipt-file", portablePath, "--timeout", "1ms"}); code != int(cli.ExitRejected) {
+		t.Fatalf("mutated portable receipt exit=%d output=%s", code, out.String())
 	}
 }
 

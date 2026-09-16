@@ -121,7 +121,26 @@ func (s Store) Show(ctx context.Context, reference string, options ShowOptions) 
 	if err != nil {
 		return mektup.Receipt{}, err
 	}
+	if options.Portable {
+		return PortableProjection(receipt)
+	}
 	return receipt, nil
+}
+
+// PortableProjection normalizes a durable receipt through the public
+// metadata-only wire contract. This is deliberately a projection operation,
+// rather than a trust operation: callers still have to verify the resulting
+// identity against their independently established route and custody.
+func PortableProjection(receipt mektup.Receipt) (mektup.Receipt, error) {
+	document, err := json.Marshal(receipt)
+	if err != nil {
+		return mektup.Receipt{}, err
+	}
+	projected, err := mektup.ParseReceipt(document)
+	if err != nil {
+		return mektup.Receipt{}, err
+	}
+	return projected, nil
 }
 
 // Import validates only the portable shape. It does not persist the claim,

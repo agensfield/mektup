@@ -421,6 +421,8 @@ type connectionSession struct {
 
 func (s *connectionSession) EndpointID() string { return s.endpointID }
 
+func (s *connectionSession) ConnectionInfo() connection.Info { return s.conn.Info() }
+
 func (s *connectionSession) StartOrSteer(ctx context.Context, threadID, text, clientID string) (TurnResult, error) {
 	if threadID == "" || text == "" || clientID == "" {
 		return TurnResult{}, &service.DeliveryError{Err: errors.New("runtime: turn/start identity or text is empty"), Phase: service.WriteProvenBeforeWrite}
