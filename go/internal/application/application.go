@@ -61,6 +61,7 @@ type Options struct {
 	HerdrEndpointRunner endpoint.EndpointCommandRunner
 	Registry            controlreceiver.FileRegistry
 	CustodyStoreID      string
+	CustodyEndpointID   string
 	CurrentThreadID     string
 	AgentMode           bool
 	ThreadStateProbe    runtime.ThreadStateProbe
@@ -311,6 +312,11 @@ func (r *resources) CloseWithResult(ctx context.Context, result cli.ExecutionRes
 			}
 		}
 	}
+	if r.journal != nil && result.Receipt != nil {
+		if persistErr := persistReceiptWarning(ctx, r.journal, result.Receipt); persistErr != nil {
+			joined = errors.Join(joined, persistErr)
+		}
+	}
 	if r.journal != nil {
 		if err := r.journal.Close(); err != nil {
 			result = preserveCleanupResult(result, &CleanupError{Resource: "journal", Err: err})
@@ -413,7 +419,7 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 		if j == nil {
 			return nil, errors.New("messaging requires a writable local journal")
 		}
-		pool, messaging, err = e.composeMessaging(ctx, inv, j, store, artifacts, input)
+		pool, messaging, err = e.composeMessaging(ctx, inv, j, store, artifacts, input, facts)
 		if err != nil {
 			if artifacts != nil {
 				_ = artifacts.Close()
@@ -425,7 +431,7 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 	return &resources{journal: j, artifact: artifacts, pool: pool, messaging: messaging, ports: resourcePorts{Ports: ports}}, nil
 }
 
-func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, j *journal.Journal, store endpoint.EndpointStore, artifacts *artifact.Store, input executor.ReaderInput) (*runtime.ConnectionPool, *messageexecutor.Executor, error) {
+func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, j *journal.Journal, store endpoint.EndpointStore, artifacts *artifact.Store, input executor.ReaderInput, facts *connectionFacts) (*runtime.ConnectionPool, *messageexecutor.Executor, error) {
 	codexHome := firstNonEmpty(inv.Resolved.CodexHome, e.options.CodexHome)
 	stateProbe := e.options.ThreadStateProbe
 	herdr := endpoint.NewHerdrResolver(e.options.HerdrRunner)
@@ -439,22 +445,20 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 		stateProbe = pool.ProbeThreadState
 	}
 	observe := &runtime.ObservationAdapter{Pool: pool}
+	localEndpoint, localErr := store.ResolveExistingEndpoint("local", codexHome)
+	if localErr != nil {
+		localEndpoint = endpoint.Endpoint{}
+	}
 	resolverFor := func(operation cli.Invocation) runtime.ResolverAdapter {
 		current := firstNonEmpty(operation.Resolved.CurrentThreadID, e.options.CurrentThreadID)
 		custodyStore := firstNonEmpty(e.options.CustodyStoreID, j.StoreID())
-		return runtime.ResolverAdapter{Store: store, Herdr: herdr, EndpointOverride: operation.Resolved.Endpoint, CodexHome: codexHome, CurrentThreadID: current, ReplyTo: operation.Option("reply-to"), CustodyStoreID: custodyStore, StateProbe: stateProbe}
+		custodyEndpoint := firstNonEmpty(e.options.CustodyEndpointID, localEndpoint.ID)
+		return runtime.ResolverAdapter{Store: store, Herdr: herdr, EndpointOverride: operation.Resolved.Endpoint, CodexHome: codexHome, CurrentThreadID: current, ReplyTo: operation.Option("reply-to"), CustodyEndpointID: custodyEndpoint, CustodyStoreID: custodyStore, StateProbe: stateProbe}
 	}
 	localJournal, err := runtime.NewJournalAdapter(j, nil)
 	if err != nil {
 		_ = pool.Close(ctx)
 		return nil, nil, err
-	}
-	localEndpoint, localErr := store.ResolveExistingEndpoint("local", codexHome)
-	if localErr != nil {
-		// ResolveSource will establish the local identity for operations that
-		// need it; the remote journal only needs this value to distinguish a
-		// local custody route from SSH custody.
-		localEndpoint = endpoint.Endpoint{}
 	}
 	remoteJournal := &service.RemoteJournal{Local: &localJournal, Endpoints: store, LocalEndpointID: localEndpoint.ID}
 	serviceFactory := func(serviceCtx context.Context, operation cli.Invocation) (messageexecutor.MessagingService, error) {
@@ -479,8 +483,25 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 		if err != nil {
 			return &cli.Error{Code: "reply_route_unavailable", Message: "reply custody endpoint is unavailable", Effect: "not_sent", Exit: cli.ExitRejected, Details: map[string]any{"cause": err.Error()}}
 		}
-		if ep.Route.Kind != endpoint.RouteUnix {
-			return nil
+		custodyEndpointID := firstNonEmpty(e.options.CustodyEndpointID, localEndpoint.ID)
+		if ep.Route.Kind != endpoint.RouteUnix && custodyEndpointID == "" {
+			local, localResolveErr := store.EnsureBuiltinLocal(codexHome)
+			if localResolveErr != nil {
+				return &cli.Error{Code: "reply_route_unavailable", Message: "authoritative local custody endpoint is unavailable", Effect: "not_sent", Exit: cli.ExitRejected, Details: map[string]any{"cause": localResolveErr.Error()}}
+			}
+			localEndpoint = local
+			custodyEndpointID = local.ID
+			remoteJournal.LocalEndpointID = local.ID
+		}
+		if custodyEndpointID == "" && ep.Route.Kind == endpoint.RouteUnix {
+			custodyEndpointID = source.EndpointID
+		}
+		if custodyEndpointID == "" {
+			return &cli.Error{Code: "reply_route_unavailable", Message: "authoritative custody endpoint is unavailable", Effect: "not_sent", Exit: cli.ExitRejected}
+		}
+		custodyEP, custodyErr := store.ResolveEndpointID(custodyEndpointID, codexHome)
+		if custodyErr != nil || custodyEP.Route.Kind != endpoint.RouteUnix {
+			return &cli.Error{Code: "reply_route_unavailable", Message: "custody endpoint is not a verified local journal authority", Effect: "not_sent", Exit: cli.ExitRejected, Details: map[string]any{"endpointId": custodyEndpointID}}
 		}
 		registry := e.options.Registry
 		if registry.Path == "" {
@@ -489,10 +510,10 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 				return err
 			}
 		}
-		if err := controlreceiver.RegisterLocalJournal(prepareCtx, registry, store, codexHome, source.EndpointID, j); err != nil {
+		if err := controlreceiver.RegisterLocalJournal(prepareCtx, registry, store, codexHome, custodyEndpointID, j); err != nil {
 			return &cli.Error{Code: "reply_route_unavailable", Message: "local reply custody registration failed", Effect: "not_sent", Exit: cli.ExitRejected, Details: map[string]any{"cause": err.Error()}}
 		}
-		remoteJournal.LocalEndpointID = source.EndpointID
+		remoteJournal.LocalEndpointID = custodyEndpointID
 		return nil
 	}
 	storeReceipts := receipts.Store{Journal: receiptJournal{Journal: j}}
@@ -505,9 +526,15 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 	var gateFactory messageexecutor.HumanGateFactory
 	if e.options.HumanGate != nil {
 		gateFactory = func(context.Context, cli.Invocation) (receipts.HumanGate, error) { return e.options.HumanGate, nil }
+	} else {
+		gateFactory = func(_ context.Context, operation cli.Invocation) (receipts.HumanGate, error) {
+			return invocationAssertionGate{assertion: strings.ReplaceAll(operation.Option("resolve-as"), "-", "_"), reason: operation.Option("reason"), evidence: operation.Option("evidence")}, nil
+		}
 	}
 	importResolver := applicationImportResolver{observe: observe, store: store, codexHome: codexHome, resolverFor: resolverFor}
-	return pool, messageexecutor.New(messageexecutor.Ports{Service: serviceFactory, Original: originalFactory, Receipts: &storeReceipts, Input: input, Artifacts: func(context.Context, cli.Invocation) (receipts.SpillWriter, error) {
+	return pool, messageexecutor.New(messageexecutor.Ports{Service: serviceFactory, Original: originalFactory, Receipts: &storeReceipts, Input: input, PersistReceipt: storeReceipts.Save, EnrichReceipt: func(receipt mektup.Receipt) mektup.Receipt {
+		return enrichMessagingReceipt(receipt, store, codexHome, facts)
+	}, Artifacts: func(context.Context, cli.Invocation) (receipts.SpillWriter, error) {
 		if artifacts == nil {
 			return nil, nil
 		}
@@ -515,9 +542,47 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 	}, History: historyFactory, Inspector: inspectorFactory, HumanGate: gateFactory, ImportResolver: importResolver, PrepareCustody: prepareCustody}), nil
 }
 
+func enrichMessagingReceipt(receipt mektup.Receipt, store endpoint.EndpointStore, codexHome string, facts *connectionFacts) mektup.Receipt {
+	for _, identity := range []*mektup.ReceiptIdentity{&receipt.Source, &receipt.Target} {
+		if identity.EndpointID == "" {
+			continue
+		}
+		if ep, err := store.ResolveEndpointID(identity.EndpointID, codexHome); err == nil {
+			identity.Alias = ep.Alias
+			identity.Transport = string(ep.Route.Kind)
+			if identity.Resolved == "" && identity.ThreadID != "" {
+				identity.Resolved = "codex://" + ep.Alias + "/thread/" + identity.ThreadID
+			}
+		}
+		if facts != nil {
+			if info, ok := facts.Get(identity.EndpointID); ok {
+				identity.ServerVersion = info.DaemonVersion
+				identity.Compatibility = string(info.Compatibility.Class)
+			}
+		}
+	}
+	return receipt
+}
+
 type receiptJournal struct{ *journal.Journal }
 
 type artifactSpillWriter struct{ store *artifact.Store }
+
+// invocationAssertionGate is an explicit caller-assertion gate. It does not
+// consult native evidence or pretend that an operator verified delivery; the
+// receipt retains the supplied assertion, reason, and evidence reference.
+type invocationAssertionGate struct {
+	assertion string
+	reason    string
+	evidence  string
+}
+
+func (g invocationAssertionGate) Authorize(_ context.Context, intent receipts.ResolveIntent) (string, error) {
+	if intent.Assertion == "" || intent.Assertion != g.assertion || strings.TrimSpace(g.reason) == "" || strings.TrimSpace(g.evidence) == "" {
+		return "", errors.New("explicit receipt assertion, reason, and evidence are required")
+	}
+	return "cli-assertion", nil
+}
 
 func (w artifactSpillWriter) WriteSpill(ctx context.Context, body []byte, digest string) (string, error) {
 	if w.store == nil {

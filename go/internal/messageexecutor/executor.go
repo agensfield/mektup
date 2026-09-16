@@ -47,6 +47,8 @@ type ReceiptImportResolver interface {
 	ResolveWaitReference(context.Context, cli.Invocation, receipts.Imported) (string, error)
 }
 type CustodyPreparer func(context.Context, cli.Invocation) error
+type ReceiptPersister func(context.Context, mektup.Receipt) error
+type ReceiptEnricher func(mektup.Receipt) mektup.Receipt
 
 type ReceiptStore interface {
 	List(context.Context, receipts.ListOptions) ([]mektup.Receipt, error)
@@ -68,6 +70,8 @@ type Ports struct {
 	HumanGate      HumanGateFactory
 	ImportResolver ReceiptImportResolver
 	PrepareCustody CustodyPreparer
+	PersistReceipt ReceiptPersister
+	EnrichReceipt  ReceiptEnricher
 	Actor          string
 }
 
@@ -117,6 +121,12 @@ func (e *Executor) ExecuteStream(ctx context.Context, inv cli.Invocation, emit f
 		}
 		if !request.Wait {
 			result, callErr := svc.Send(ctx, request)
+			result.Receipt = e.prepareReceipt(result.Receipt)
+			if result.Receipt.ReceiptID != "" {
+				if persistErr := e.persistReceipt(ctx, result.Receipt); persistErr != nil {
+					return persistErr
+				}
+			}
 			output, resultErr := e.messagingResult("send", result.Receipt, result.Wait, callErr)
 			if resultErr != nil {
 				return resultErr
@@ -136,6 +146,12 @@ func (e *Executor) ExecuteStream(ctx context.Context, inv cli.Invocation, emit f
 		}
 		if !request.Wait {
 			result, callErr := svc.Reply(ctx, original, request)
+			result.Receipt = e.prepareReceipt(result.Receipt)
+			if result.Receipt.ReceiptID != "" {
+				if persistErr := e.persistReceipt(ctx, result.Receipt); persistErr != nil {
+					return persistErr
+				}
+			}
 			output, resultErr := e.messagingResult("reply", result.Receipt, result.Wait, callErr)
 			if resultErr != nil {
 				return resultErr
@@ -158,8 +174,11 @@ func (e *Executor) streamSend(ctx context.Context, svc AcceptanceMessagingServic
 	var callbackErr error
 	var acceptedReceipt mektup.Receipt
 	result, callErr := svc.SendWithAcceptance(ctx, request, func(accepted service.SendResult) error {
-		acceptedReceipt = accepted.Receipt
-		output := acceptedResult("send", accepted.Receipt)
+		acceptedReceipt = e.prepareReceipt(accepted.Receipt)
+		if err := e.persistReceipt(ctx, acceptedReceipt); err != nil {
+			return err
+		}
+		output := acceptedResult("send", acceptedReceipt)
 		callbackErr = emit(output)
 		return callbackErr
 	})
@@ -173,6 +192,11 @@ func (e *Executor) streamSend(ctx context.Context, svc AcceptanceMessagingServic
 		}
 		return resultErr
 	}
+	if terminalReceipt, ok := output.Receipt.(mektup.Receipt); ok {
+		if err := e.persistReceipt(ctx, terminalReceipt); err != nil {
+			return err
+		}
+	}
 	return emit(output)
 }
 
@@ -180,8 +204,11 @@ func (e *Executor) streamReply(ctx context.Context, svc AcceptanceMessagingServi
 	var callbackErr error
 	var acceptedReceipt mektup.Receipt
 	result, callErr := svc.ReplyWithAcceptance(ctx, original, request, func(accepted service.ReplyResult) error {
-		acceptedReceipt = accepted.Receipt
-		output := acceptedResult("reply", accepted.Receipt)
+		acceptedReceipt = e.prepareReceipt(accepted.Receipt)
+		if err := e.persistReceipt(ctx, acceptedReceipt); err != nil {
+			return err
+		}
+		output := acceptedResult("reply", acceptedReceipt)
 		callbackErr = emit(output)
 		return callbackErr
 	})
@@ -194,6 +221,11 @@ func (e *Executor) streamReply(ctx context.Context, svc AcceptanceMessagingServi
 			return emit(terminalErrorResult("reply", acceptedReceipt, resultErr))
 		}
 		return resultErr
+	}
+	if terminalReceipt, ok := output.Receipt.(mektup.Receipt); ok {
+		if err := e.persistReceipt(ctx, terminalReceipt); err != nil {
+			return err
+		}
 	}
 	return emit(output)
 }
@@ -209,6 +241,10 @@ func terminalErrorResult(kind string, receipt mektup.Receipt, err error) cli.Exe
 }
 
 func (e *Executor) terminalResult(kind string, receipt mektup.Receipt, wait *service.WaitResult, callErr error) (cli.ExecutionResult, error) {
+	receipt = e.prepareReceipt(receipt)
+	if wait != nil && wait.Receipt.ReceiptID != "" {
+		wait.Receipt = e.prepareReceipt(wait.Receipt)
+	}
 	result, err := e.messagingResult(kind, receipt, wait, callErr)
 	if err != nil {
 		return cli.ExecutionResult{}, err
@@ -218,6 +254,20 @@ func (e *Executor) terminalResult(kind string, receipt mektup.Receipt, wait *ser
 	}
 	result.Streaming = true
 	return result, nil
+}
+
+func (e *Executor) prepareReceipt(receipt mektup.Receipt) mektup.Receipt {
+	if e != nil && e.ports.EnrichReceipt != nil {
+		return e.ports.EnrichReceipt(receipt)
+	}
+	return receipt
+}
+
+func (e *Executor) persistReceipt(ctx context.Context, receipt mektup.Receipt) error {
+	if receipt.ReceiptID == "" || e == nil || e.ports.PersistReceipt == nil {
+		return nil
+	}
+	return e.ports.PersistReceipt(ctx, receipt)
 }
 
 func (e *Executor) service(ctx context.Context, inv cli.Invocation) (MessagingService, error) {
@@ -251,7 +301,7 @@ func (e *Executor) sendInvocation(ctx context.Context, inv cli.Invocation) (Mess
 	if err != nil {
 		return nil, service.SendRequest{}, err
 	}
-	request := service.SendRequest{Target: inv.Position[0], Body: body, Raw: has(inv, "raw"), RequestReply: has(inv, "request-reply"), Wait: has(inv, "wait"), Source: inv.Option("reply-to")}
+	request := service.SendRequest{Target: inv.Position[0], Body: body, Raw: has(inv, "raw"), RequestReply: has(inv, "request-reply") || has(inv, "wait"), Wait: has(inv, "wait"), Source: inv.Option("reply-to")}
 	request.DeliveryTimeout, err = duration(inv, "delivery-timeout")
 	if err != nil {
 		return nil, service.SendRequest{}, err
@@ -367,6 +417,17 @@ func (e *Executor) wait(ctx context.Context, inv cli.Invocation) (cli.ExecutionR
 		reference, err = e.ports.ImportResolver.ResolveWaitReference(ctx, inv, imported)
 		if err != nil {
 			return cli.ExecutionResult{}, mapError(err)
+		}
+	}
+	if inv.Option("receipt-file") == "" && e.ports.Receipts != nil && strings.HasPrefix(reference, mektup.ReceiptIDPrefix) {
+		stored, lookupErr := e.ports.Receipts.Show(ctx, reference, receipts.ShowOptions{})
+		if lookupErr != nil {
+			return cli.ExecutionResult{}, mapError(lookupErr)
+		}
+		if stored.OperationID != "" {
+			reference = stored.OperationID
+		} else if stored.Message.MessageID != "" {
+			reference = stored.Message.MessageID
 		}
 	}
 	result, callErr := svc.Wait(ctx, service.WaitRequest{Reference: reference, Timeout: timeout})
@@ -592,6 +653,10 @@ func (e *Executor) importReceipt(ctx context.Context, inv cli.Invocation) (recei
 }
 
 func (e *Executor) messagingResult(kind string, accepted mektup.Receipt, wait *service.WaitResult, callErr error) (cli.ExecutionResult, error) {
+	accepted = e.prepareReceipt(accepted)
+	if wait != nil && wait.Receipt.ReceiptID != "" {
+		wait.Receipt = e.prepareReceipt(wait.Receipt)
+	}
 	if accepted.ReceiptID == "" {
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr)

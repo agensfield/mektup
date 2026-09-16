@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -39,6 +40,9 @@ func (s *Service) Wait(ctx context.Context, req WaitRequest) (WaitResult, error)
 	}
 	status, err := s.Journal.Lookup(ctx, req.Reference)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return WaitResult{}, semantic(mektup.ErrWaitIncomplete, "wait ended before custody lookup completed", nil, err)
+		}
 		return WaitResult{}, semantic(mektup.ErrMessageNotFound, "operation receipt was not found", nil, err)
 	}
 	if !status.ReplyRequested || status.Semantics == "raw" {

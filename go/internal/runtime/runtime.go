@@ -44,7 +44,11 @@ type itemHistorySession interface {
 }
 
 type threadStateSession interface {
-	ThreadExists(context.Context, string) (bool, error)
+	ThreadState(context.Context, string) (string, *bool, error)
+}
+
+type loadedThreadsSession interface {
+	LoadedThreads(context.Context) ([]string, error)
 }
 
 // TurnResult is deliberately smaller than codexapi's response. The adapter
@@ -157,9 +161,8 @@ func (p *ConnectionPool) session(ctx context.Context, target service.ResolvedTar
 	return session, err
 }
 
-// ProbeThreadState proves persistence with an authoritative thread/read call.
-// Loaded is intentionally reported false because thread/read does not prove
-// in-memory hydration; callers therefore take the conservative resume path.
+// ProbeThreadState combines exact native loaded enumeration with thread/read
+// persistence metadata. Missing either capability fails closed.
 func (p *ConnectionPool) ProbeThreadState(ctx context.Context, endpointID, threadID string) (bool, bool, error) {
 	if p == nil || p.Lookup == nil {
 		return false, false, errors.New("runtime: thread-state lookup is unavailable")
@@ -173,18 +176,31 @@ func (p *ConnectionPool) ProbeThreadState(ctx context.Context, endpointID, threa
 	if err != nil {
 		return false, false, err
 	}
-	reader, ok := session.(threadStateSession)
-	if !ok {
-		return false, false, errors.New("runtime: session cannot authoritatively probe thread state")
+	reader, stateOK := session.(threadStateSession)
+	loadedReader, loadedOK := session.(loadedThreadsSession)
+	if !stateOK || !loadedOK {
+		return false, false, errors.New("runtime: session cannot authoritatively probe loaded and persistent thread state")
 	}
-	exists, err := reader.ThreadExists(ctx, threadID)
+	status, ephemeral, err := reader.ThreadState(ctx, threadID)
 	if err != nil {
 		return false, false, err
 	}
-	if !exists {
-		return false, false, errors.New("runtime: pinned thread does not exist")
+	if status == "" || ephemeral == nil {
+		return false, false, errors.New("runtime: thread/read omitted status or persistence metadata")
 	}
-	return false, true, nil
+	if status != "active" {
+		return false, !*ephemeral, nil
+	}
+	loadedIDs, err := loadedReader.LoadedThreads(ctx)
+	if err != nil {
+		return false, false, fmt.Errorf("runtime: loaded thread enumeration failed: %w", err)
+	}
+	for _, id := range loadedIDs {
+		if id == threadID {
+			return true, !*ephemeral, nil
+		}
+	}
+	return false, !*ephemeral, nil
 }
 
 func (p *ConnectionPool) openEndpoint(ctx context.Context, target service.ResolvedTarget) (Session, error) {
@@ -490,6 +506,30 @@ func (s *connectionSession) History(ctx context.Context, threadID string) ([]cod
 func (s *connectionSession) ThreadExists(ctx context.Context, threadID string) (bool, error) {
 	_, err := s.api.ThreadRead(ctx, codexapi.ThreadReadOptions{ThreadID: threadID})
 	return err == nil, err
+}
+
+func (s *connectionSession) ThreadState(ctx context.Context, threadID string) (string, *bool, error) {
+	result, err := s.api.ThreadRead(ctx, codexapi.ThreadReadOptions{ThreadID: threadID})
+	if err != nil {
+		return "", nil, err
+	}
+	ephemeralRaw, ok := result.Thread.Fields["ephemeral"]
+	if !ok {
+		return result.Thread.Status, nil, nil
+	}
+	var ephemeral bool
+	if err := json.Unmarshal(ephemeralRaw, &ephemeral); err != nil {
+		return result.Thread.Status, nil, err
+	}
+	return result.Thread.Status, &ephemeral, nil
+}
+
+func (s *connectionSession) LoadedThreads(ctx context.Context) ([]string, error) {
+	result, err := s.api.LoadedThreads(ctx, "", codexapi.MaxThreadPageLimit)
+	if err != nil {
+		return nil, err
+	}
+	return result.Data, nil
 }
 
 func (s *connectionSession) ItemsHistory(ctx context.Context, threadID string) ([]codexapi.ItemEntry, error) {

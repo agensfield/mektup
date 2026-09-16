@@ -547,6 +547,27 @@ func TestProductionCompositionDoesNotRequireDaemonOrSSHProcessForInjectedRoute(t
 	}
 }
 
+func TestApplicationSessionFactorySelectsSSHRouteDialer(t *testing.T) {
+	route, err := endpoint.SSHRoute("example.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := &recordingDialer{transport: newFakeTransport()}
+	var selected endpoint.Route
+	factory := applicationSessionFactory{dialerForRoute: func(got endpoint.Route, _ bool) connection.ClientDialer {
+		selected = got
+		return dialer
+	}}
+	session, err := factory.Open(context.Background(), endpoint.Endpoint{ID: endpointID(), Alias: "remote", Route: route, Herdr: endpoint.HerdrDisabled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session == nil || selected != route || len(dialer.routes) != 1 || dialer.routes[0] != route {
+		t.Fatalf("SSH route selection selected=%+v routes=%+v", selected, dialer.routes)
+	}
+	_ = session.Detach(context.Background())
+}
+
 func TestReadFileBoundedSupportsExplicitAbsoluteParamsPath(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "params.json")
 	if err := os.WriteFile(path, []byte(`{"ok":true}`), 0600); err != nil {
@@ -558,7 +579,10 @@ func TestReadFileBoundedSupportsExplicitAbsoluteParamsPath(t *testing.T) {
 	}
 }
 
-type messagingFakeSession struct{ endpointID string }
+type messagingFakeSession struct {
+	endpointID string
+	detachErr  error
+}
 
 func (s messagingFakeSession) EndpointID() string { return s.endpointID }
 func (messagingFakeSession) StartOrSteer(context.Context, string, string, string) (runtime.TurnResult, error) {
@@ -572,7 +596,7 @@ func (messagingFakeSession) History(context.Context, string) ([]codexapi.Turn, e
 func (messagingFakeSession) NextEvent(context.Context) (appserver.Event, error) {
 	return appserver.Event{}, io.EOF
 }
-func (messagingFakeSession) Detach(context.Context) error                       { return nil }
+func (s messagingFakeSession) Detach(context.Context) error                     { return s.detachErr }
 func (messagingFakeSession) ThreadExists(context.Context, string) (bool, error) { return true, nil }
 
 func TestMessagingCompositionRegistersOnlyReplyCustody(t *testing.T) {
@@ -601,5 +625,85 @@ func TestMessagingCompositionRegistersOnlyReplyCustody(t *testing.T) {
 	}
 	if _, err := os.Stat(registryPath); err != nil {
 		t.Fatalf("reply-requesting send did not register custody: %v", err)
+	}
+}
+
+func TestMessagingReceiptPersistsBeforeOutputAndWaitResolvesReceiptID(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "codex")
+	if err := os.MkdirAll(filepath.Join(home, "app-server-control"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "app-server-control", "app-server-control.sock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(root, "state")
+	out := &bytes.Buffer{}
+	env := New(Options{CodexHome: home, ConfigPath: filepath.Join(root, "endpoints.json"), StateDir: state, IdentityHome: filepath.Join(root, "identity"), CurrentThreadID: "source", ThreadStateProbe: func(context.Context, string, string) (bool, bool, error) { return true, true, nil }, SessionFactory: runtime.SessionFactoryFunc(func(_ context.Context, ep endpoint.Endpoint) (runtime.Session, error) {
+		return messagingFakeSession{endpointID: ep.ID}, nil
+	})})
+	app := &cli.App{Out: out, Err: &bytes.Buffer{}, Executor: env, Env: []string{"MEKTUP_AGENT=1", "CODEX_HOME=" + home, "CODEX_THREAD_ID=source", "MEKTUP_CONFIG=" + filepath.Join(root, "endpoints.json"), "MEKTUP_STATE_DIR=" + state}}
+	if code := app.Run([]string{"send", "codex://local/thread/target", "question", "--request-reply"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("send exit=%d output=%s", code, out.String())
+	}
+	var event struct {
+		Data struct {
+			Receipt mektup.Receipt `json:"receipt"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Data.Receipt.ReceiptID == "" {
+		t.Fatal("send emitted no receipt")
+	}
+	j, err := journal.Open(context.Background(), journal.Options{StateDir: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.Receipt(context.Background(), event.Data.Receipt.ReceiptID); err != nil {
+		t.Fatalf("emitted receipt was not durable: %v", err)
+	}
+	_ = j.Close()
+	out.Reset()
+	if code := app.Run([]string{"wait", event.Data.Receipt.ReceiptID, "--timeout", "1ms"}); code != int(cli.ExitIncomplete) {
+		t.Fatalf("wait receipt reference exit=%d output=%s", code, out.String())
+	}
+}
+
+func TestMessagingPoolCleanupWarningIsDurable(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "codex")
+	if err := os.MkdirAll(filepath.Join(home, "app-server-control"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "app-server-control", "app-server-control.sock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(root, "state")
+	out := &bytes.Buffer{}
+	env := New(Options{CodexHome: home, ConfigPath: filepath.Join(root, "endpoints.json"), StateDir: state, IdentityHome: filepath.Join(root, "identity"), CurrentThreadID: "source", ThreadStateProbe: func(context.Context, string, string) (bool, bool, error) { return true, true, nil }, SessionFactory: runtime.SessionFactoryFunc(func(_ context.Context, ep endpoint.Endpoint) (runtime.Session, error) {
+		return messagingFakeSession{endpointID: ep.ID, detachErr: errors.New("detach failed")}, nil
+	})})
+	app := &cli.App{Out: out, Err: &bytes.Buffer{}, Executor: env, Env: []string{"MEKTUP_AGENT=1", "CODEX_HOME=" + home, "CODEX_THREAD_ID=source", "MEKTUP_CONFIG=" + filepath.Join(root, "endpoints.json"), "MEKTUP_STATE_DIR=" + state}}
+	if code := app.Run([]string{"send", "codex://local/thread/target", "question"}); code != int(cli.ExitInternal) {
+		t.Fatalf("cleanup failure exit=%d output=%s", code, out.String())
+	}
+	var event struct {
+		Data struct {
+			Receipt mektup.Receipt `json:"receipt"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &event); err != nil {
+		t.Fatal(err)
+	}
+	j, err := journal.Open(context.Background(), journal.Options{StateDir: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored, err := j.Receipt(context.Background(), event.Data.Receipt.ReceiptID)
+	_ = j.Close()
+	if err != nil || len(stored.Warnings) == 0 {
+		t.Fatalf("cleanup warning was not durable: err=%v receipt=%+v", err, stored)
 	}
 }
