@@ -172,10 +172,10 @@ func hasNamedIndex(ctx context.Context, q schemaQueryer, table string, want sche
 		if rows.Scan(&seq, &name, &unique, &origin, &partial) != nil || name != want.name {
 			continue
 		}
-		found = true
+		found = (unique == 1) == want.unique && partial == 0
 	}
 	rows.Close()
-	return found && hasIndexColumns(ctx, q, table, want.columns, want.unique)
+	return found && indexColumnsEqual(ctx, q, want.name, want.columns)
 }
 
 func hasIndexColumns(ctx context.Context, q schemaQueryer, table string, columns []string, unique bool) bool {
@@ -192,31 +192,36 @@ func hasIndexColumns(ctx context.Context, q schemaQueryer, table string, columns
 		if rows.Scan(&seq, &name, &isUnique, &origin, &partial) != nil {
 			continue
 		}
-		if (isUnique == 1) != unique {
+		if (isUnique == 1) != unique || partial != 0 {
 			continue
 		}
 		names = append(names, name)
 	}
 	rows.Close()
 	for _, name := range names {
-		ir, err := q.QueryContext(ctx, "PRAGMA index_info('"+name+"')")
-		if err != nil {
-			continue
-		}
-		got := []string{}
-		for ir.Next() {
-			var s, c int
-			var n string
-			if ir.Scan(&s, &c, &n) == nil {
-				got = append(got, n)
-			}
-		}
-		ir.Close()
-		if strings.Join(got, "\x00") == strings.Join(columns, "\x00") {
+		if indexColumnsEqual(ctx, q, name, columns) {
 			return true
 		}
 	}
 	return false
+}
+
+func indexColumnsEqual(ctx context.Context, q schemaQueryer, name string, columns []string) bool {
+	rows, err := q.QueryContext(ctx, "PRAGMA index_info('"+name+"')")
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	got := []string{}
+	for rows.Next() {
+		var seq, cid int
+		var column string
+		if rows.Scan(&seq, &cid, &column) != nil {
+			return false
+		}
+		got = append(got, column)
+	}
+	return rows.Err() == nil && strings.Join(got, "\x00") == strings.Join(columns, "\x00")
 }
 
 func validateForeignKeys(ctx context.Context, q schemaQueryer, spec schemaTableSpec) error {
@@ -252,11 +257,66 @@ func validateChecks(ctx context.Context, q schemaQueryer, spec schemaTableSpec) 
 	if err := q.QueryRowContext(ctx, "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", spec.name).Scan(&sqlText); err != nil {
 		return fmt.Errorf("%w: inspect checks %s: %v", ErrCorrupt, spec.name, err)
 	}
-	compact := strings.ToLower(strings.Join(strings.Fields(sqlText), ""))
+	observed := extractCheckExpressions(sqlText)
 	for _, check := range spec.checks {
-		if !strings.Contains(compact, strings.ToLower(strings.Join(strings.Fields(check), ""))) {
+		if _, ok := observed[normalizeCheckExpression(check)]; !ok {
 			return fmt.Errorf("%w: missing check constraint %s.%s", ErrCorrupt, spec.name, check)
 		}
 	}
 	return nil
+}
+
+func extractCheckExpressions(sqlText string) map[string]struct{} {
+	checks := make(map[string]struct{})
+	lower := strings.ToLower(sqlText)
+	for offset := 0; offset < len(lower); {
+		relative := strings.Index(lower[offset:], "check")
+		if relative < 0 {
+			break
+		}
+		start := offset + relative
+		offset = start + len("check")
+		if start > 0 && isSchemaIdentifierByte(lower[start-1]) || offset < len(lower) && isSchemaIdentifierByte(lower[offset]) {
+			continue
+		}
+		for offset < len(lower) && (lower[offset] == ' ' || lower[offset] == '\t' || lower[offset] == '\r' || lower[offset] == '\n') {
+			offset++
+		}
+		if offset >= len(lower) || lower[offset] != '(' {
+			continue
+		}
+		expressionStart := offset + 1
+		depth := 1
+		quoted := false
+		for offset++; offset < len(sqlText) && depth > 0; offset++ {
+			switch sqlText[offset] {
+			case '\'':
+				if quoted && offset+1 < len(sqlText) && sqlText[offset+1] == '\'' {
+					offset++
+					continue
+				}
+				quoted = !quoted
+			case '(':
+				if !quoted {
+					depth++
+				}
+			case ')':
+				if !quoted {
+					depth--
+					if depth == 0 {
+						checks[normalizeCheckExpression(sqlText[expressionStart:offset])] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	return checks
+}
+
+func normalizeCheckExpression(value string) string {
+	return strings.ToLower(strings.Join(strings.Fields(value), ""))
+}
+
+func isSchemaIdentifierByte(value byte) bool {
+	return value == '_' || value >= 'a' && value <= 'z' || value >= '0' && value <= '9'
 }

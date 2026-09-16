@@ -477,7 +477,7 @@ CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen);
 `
 
 func migrateV1ToV4(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration) error {
-	stmts := []string{
+	for _, stmt := range []string{
 		`ALTER TABLE attempts ADD COLUMN owner TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE attempts ADD COLUMN token TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE attempts ADD COLUMN lease_until INTEGER NOT NULL DEFAULT 0`,
@@ -485,8 +485,17 @@ func migrateV1ToV4(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration)
 		`ALTER TABLE operations ADD COLUMN custody_route TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE operations ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE reply_claims ADD COLUMN custody_store_id TEXT NOT NULL DEFAULT ''`,
-		`CREATE TABLE IF NOT EXISTS reply_winners (original_id TEXT PRIMARY KEY, reply_id TEXT NOT NULL, committed_at INTEGER NOT NULL, commit_seq INTEGER NOT NULL)`,
-		`CREATE TABLE IF NOT EXISTS observations (reply_id TEXT PRIMARY KEY, native_item_id TEXT NOT NULL, observed_at INTEGER NOT NULL, digest TEXT NOT NULL)`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("journal migration: %w", err)
+		}
+	}
+	if err := rebuildV1CoreTables(ctx, tx); err != nil {
+		return err
+	}
+	for _, stmt := range []string{
+		`CREATE TABLE IF NOT EXISTS reply_winners (original_id TEXT PRIMARY KEY, reply_id TEXT NOT NULL REFERENCES reply_claims(reply_id), committed_at INTEGER NOT NULL, commit_seq INTEGER NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS observations (reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE, native_item_id TEXT NOT NULL, observed_at INTEGER NOT NULL, digest TEXT NOT NULL)`,
 		`CREATE TABLE IF NOT EXISTS events (seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, operation_id TEXT, reply_id TEXT, state TEXT NOT NULL, at INTEGER NOT NULL)`,
 		`CREATE INDEX IF NOT EXISTS events_operation ON events(operation_id, seq)`,
 		`CREATE TABLE IF NOT EXISTS manual_resolutions (operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE, assertion TEXT NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL, evidence_ref TEXT NOT NULL, presentation TEXT NOT NULL DEFAULT '', resolved_at INTEGER NOT NULL)`,
@@ -499,8 +508,7 @@ func migrateV1ToV4(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration)
 		`CREATE TABLE IF NOT EXISTS blockers (method TEXT NOT NULL, correlation_id TEXT NOT NULL, generation TEXT NOT NULL DEFAULT '', first_seen INTEGER NOT NULL, last_seen INTEGER NOT NULL, resolved_at INTEGER, endpoint_id TEXT NOT NULL DEFAULT '', thread_id TEXT NOT NULL DEFAULT '', turn_id TEXT NOT NULL DEFAULT '', item_id TEXT NOT NULL DEFAULT '', operation_id TEXT NOT NULL DEFAULT '', message_id TEXT NOT NULL DEFAULT '', PRIMARY KEY(endpoint_id, generation, method, correlation_id))`,
 		`CREATE INDEX IF NOT EXISTS blockers_thread ON blockers(thread_id, last_seen)`,
 		`PRAGMA user_version=5`,
-	}
-	for _, stmt := range stmts {
+	} {
 		if _, err := tx.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
 		}
@@ -527,6 +535,52 @@ func migrateV1ToV4(ctx context.Context, tx *sql.Tx, leaseDuration time.Duration)
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("journal migration: %w", err)
+	}
+	return nil
+}
+
+func rebuildV1CoreTables(ctx context.Context, tx *sql.Tx) error {
+	for _, stmt := range []string{
+		`ALTER TABLE attempts RENAME TO attempts_v1_legacy`,
+		`ALTER TABLE reply_claims RENAME TO reply_claims_v1_legacy`,
+		`ALTER TABLE operations RENAME TO operations_v1_legacy`,
+		`CREATE TABLE operations (
+ operation_id TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE,
+ source_route TEXT NOT NULL, target_route TEXT NOT NULL, semantics TEXT NOT NULL,
+ reply_route TEXT NOT NULL DEFAULT '', custody_route TEXT NOT NULL DEFAULT '', custody_store_id TEXT NOT NULL DEFAULT '',
+ digest TEXT NOT NULL, body_size INTEGER NOT NULL CHECK(body_size >= 0),
+ state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+ dispatch_started_at INTEGER, terminal_at INTEGER, error_code TEXT NOT NULL DEFAULT ''
+)`,
+		`CREATE TABLE attempts (
+ operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id) ON DELETE CASCADE,
+ state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+ owner TEXT NOT NULL, token TEXT NOT NULL, lease_until INTEGER NOT NULL
+)`,
+		`CREATE TABLE reply_claims (
+ reply_id TEXT PRIMARY KEY, original_id TEXT NOT NULL,
+ digest TEXT NOT NULL, body_size INTEGER NOT NULL CHECK(body_size >= 0),
+ status TEXT NOT NULL CHECK(status IN ('success','error')),
+ reply_route TEXT NOT NULL, custody_route TEXT NOT NULL, custody_store_id TEXT NOT NULL DEFAULT '',
+ owner TEXT NOT NULL, token TEXT NOT NULL, lease_until INTEGER NOT NULL,
+ state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+ accepted_at INTEGER, commit_seq INTEGER, error_code TEXT NOT NULL DEFAULT '',
+ UNIQUE(reply_id, original_id)
+)`,
+		`INSERT INTO operations(operation_id,message_id,source_route,target_route,semantics,reply_route,custody_route,custody_store_id,digest,body_size,state,created_at,updated_at,dispatch_started_at,terminal_at,error_code)
+ SELECT operation_id,message_id,source_route,target_route,semantics,reply_route,custody_route,custody_store_id,digest,body_size,state,created_at,updated_at,dispatch_started_at,terminal_at,error_code FROM operations_v1_legacy`,
+		`INSERT INTO attempts(operation_id,state,created_at,updated_at,owner,token,lease_until)
+ SELECT operation_id,state,created_at,updated_at,owner,token,lease_until FROM attempts_v1_legacy`,
+		`INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,accepted_at,commit_seq,error_code)
+ SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,accepted_at,commit_seq,error_code FROM reply_claims_v1_legacy`,
+		`DROP TABLE attempts_v1_legacy`,
+		`DROP TABLE reply_claims_v1_legacy`,
+		`DROP TABLE operations_v1_legacy`,
+		`CREATE INDEX IF NOT EXISTS reply_claims_original ON reply_claims(original_id)`,
+	} {
+		if _, err := tx.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("journal migration v1 constraints: %w", err)
+		}
 	}
 	return nil
 }
@@ -862,7 +916,10 @@ func migrateV7ToV8(ctx context.Context, tx *sql.Tx) error {
 }
 
 func validateV8Schema(ctx context.Context, tx *sql.Tx) error {
-	return validateCurrentV8Schema(ctx, tx, false)
+	// A migration must publish exactly the same schema that an ordinary v8
+	// reopen and CheckPath accept. Skipping constraints here can commit a
+	// database that becomes unusable on the very next open.
+	return validateCurrentV8Schema(ctx, tx, true)
 }
 
 func validateObservationColumns(ctx context.Context, queryer schemaQueryer) error {
