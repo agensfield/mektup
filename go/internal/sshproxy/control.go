@@ -501,6 +501,9 @@ func (r ControlRequest) Validate() error {
 		if err := json.Unmarshal(r.Result, &resultObject); err != nil || resultObject == nil {
 			return fmt.Errorf("%w: result must be an object", ErrControlValidation)
 		}
+		if r.Operation == "originalStatus" {
+			return validateOriginalStatusResult(resultObject)
+		}
 		if r.Operation == "claim" {
 			var resultObject map[string]json.RawMessage
 			if err := json.Unmarshal(r.Result, &resultObject); err != nil || resultObject == nil {
@@ -617,6 +620,96 @@ func (r ControlRequest) Validate() error {
 		if r.NativeItemID == "" || r.BodyBytes == nil || r.BodySHA256 == "" || r.ReplyStatus == "" || r.FencingToken != "" || r.Lease != nil || r.RequestedLease != nil || r.AttemptOwner != "" {
 			return fmt.Errorf("%w: observe requires native item evidence without dispatch authority", ErrControlValidation)
 		}
+	}
+	return nil
+}
+
+func validateOriginalStatusResult(result map[string]json.RawMessage) error {
+	for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner"} {
+		if _, ok := result[field]; ok {
+			return fmt.Errorf("%w: originalStatus result forbids %s", ErrControlValidation, field)
+		}
+	}
+	selectionRaw, ok := result["selection"]
+	if !ok {
+		return fmt.Errorf("%w: originalStatus result requires selection", ErrControlValidation)
+	}
+	selection, err := rawString(selectionRaw, "result.selection")
+	if err != nil {
+		return err
+	}
+	selected := []string{"replyMessageId", "replyStatus", "bodyBytes", "bodySha256", "state", "commitSeq", "eventSeq", "replyErrorCode", "nativeItemId"}
+	if selection == "pending" {
+		for _, field := range selected {
+			if _, ok := result[field]; ok {
+				return fmt.Errorf("%w: pending originalStatus forbids %s", ErrControlValidation, field)
+			}
+		}
+		return nil
+	}
+	if selection != "winner" && selection != "terminal_unknown" {
+		return fmt.Errorf("%w: invalid originalStatus selection", ErrControlValidation)
+	}
+	for _, field := range []string{"replyMessageId", "replyStatus", "bodyBytes", "bodySha256", "state"} {
+		if _, ok := result[field]; !ok {
+			return fmt.Errorf("%w: selected originalStatus result requires %s", ErrControlValidation, field)
+		}
+	}
+	replyID, err := rawString(result["replyMessageId"], "result.replyMessageId")
+	if err != nil || !validID(replyID, "msg_") {
+		return fmt.Errorf("%w: invalid result.replyMessageId", ErrControlValidation)
+	}
+	status, err := rawString(result["replyStatus"], "result.replyStatus")
+	if err != nil || (status != "success" && status != "error") {
+		return fmt.Errorf("%w: invalid result.replyStatus", ErrControlValidation)
+	}
+	bytesValue, err := rawInt(result["bodyBytes"], "result.bodyBytes")
+	if err != nil || bytesValue < 0 {
+		return fmt.Errorf("%w: invalid result.bodyBytes", ErrControlValidation)
+	}
+	digest, err := rawString(result["bodySha256"], "result.bodySha256")
+	if err != nil || !validSHA256(digest) {
+		return fmt.Errorf("%w: invalid result.bodySha256", ErrControlValidation)
+	}
+	state, err := rawString(result["state"], "result.state")
+	if err != nil {
+		return err
+	}
+	if selection == "winner" {
+		if state != "reply_accepted" && state != "reply_observed" {
+			return fmt.Errorf("%w: invalid winner state", ErrControlValidation)
+		}
+	} else if state != "reply_outcome_unknown" {
+		return fmt.Errorf("%w: invalid unknown state", ErrControlValidation)
+	}
+	seqField := "commitSeq"
+	if selection == "terminal_unknown" {
+		seqField = "eventSeq"
+	}
+	seqRaw, ok := result[seqField]
+	if !ok {
+		return fmt.Errorf("%w: selected result requires %s", ErrControlValidation, seqField)
+	}
+	seq, err := rawInt(seqRaw, "result."+seqField)
+	if err != nil || seq <= 0 {
+		return fmt.Errorf("%w: invalid result.%s", ErrControlValidation, seqField)
+	}
+	if codeRaw, ok := result["replyErrorCode"]; ok {
+		code, err := rawString(codeRaw, "result.replyErrorCode")
+		if err != nil || status != "error" || code == "" {
+			return fmt.Errorf("%w: invalid result.replyErrorCode", ErrControlValidation)
+		}
+	} else if status == "success" { /* optional field omitted */
+	}
+	if nativeRaw, ok := result["nativeItemId"]; ok {
+		if selection != "winner" || state != "reply_observed" {
+			return fmt.Errorf("%w: nativeItemId only applies to observed winners", ErrControlValidation)
+		}
+		if _, err := rawString(nativeRaw, "result.nativeItemId"); err != nil {
+			return err
+		}
+	} else if selection == "winner" && state == "reply_observed" {
+		return fmt.Errorf("%w: observed winner requires nativeItemId", ErrControlValidation)
 	}
 	return nil
 }

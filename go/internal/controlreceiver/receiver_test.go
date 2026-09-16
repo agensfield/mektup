@@ -257,6 +257,26 @@ func TestReceiverOriginalStatusRejectsReplyIDPresenceAndOperationMismatch(t *tes
 	}
 }
 
+func TestOriginalStatusResultRejectsAuthorityAndBodyKeysIncludingNull(t *testing.T) {
+	base := map[string]any{"schema": "mektup/control/v1", "kind": "result", "operation": "originalStatus", "operationId": operationID, "originalMessageId": originalID, "custody": map[string]any{"endpointId": receiverEndpoint, "storeId": "store_0198f0e0-0000-7000-8000-000000000002"}, "replyDestination": map[string]any{"endpointId": receiverEndpoint, "threadId": "source", "uri": "codex://local/thread/source"}, "result": map[string]any{"selection": "pending"}}
+	for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner", "replyMessageId", "bodyBytes", "bodySha256", "replyStatus", "state"} {
+		document := map[string]any{}
+		for k, v := range base {
+			document[k] = v
+		}
+		result := map[string]any{"selection": "pending"}
+		document["result"] = result
+		result[field] = nil
+		data, err := json.Marshal(document)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sshproxy.ValidateControlRequest(data); !errors.Is(err, sshproxy.ErrControlValidation) {
+			t.Fatalf("authority/body field %s accepted: %v", field, err)
+		}
+	}
+}
+
 func TestReceiverObserveAcceptedIsTokenlessAndIdempotent(t *testing.T) {
 	j, _ := openReceiverJournal(t, time.Minute)
 	prepareOriginal(t, j)

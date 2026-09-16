@@ -86,6 +86,9 @@ func (j *Journal) OriginalStatus(ctx context.Context, originalID string) (Origin
 			if err := tx.QueryRow("SELECT w.commit_seq,COALESCE(o.native_item_id,'') FROM reply_winners w LEFT JOIN observations o ON o.reply_id=w.reply_id WHERE w.original_id=?", originalID).Scan(&seq, &native); err != nil {
 				return err
 			}
+			if err := validateOriginalSelectedClaim(claim, seq, native.String, true); err != nil {
+				return err
+			}
 			claim.Token = ""
 			out = OriginalStatusResult{Selection: "winner", Claim: claim, EventSeq: seq, NativeItemID: native.String}
 			return nil
@@ -124,6 +127,9 @@ func (j *Journal) OriginalStatus(ctx context.Context, originalID string) (Origin
 			if err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_error_code,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", unknowns[0].id), &u); err != nil {
 				return err
 			}
+			if err := validateOriginalSelectedClaim(u, unknowns[0].seq, "", false); err != nil {
+				return err
+			}
 			u.Token = ""
 			out = OriginalStatusResult{Selection: "terminal_unknown", Claim: u, TerminalEventSeq: unknowns[0].seq}
 			return nil
@@ -132,6 +138,23 @@ func (j *Journal) OriginalStatus(ctx context.Context, originalID string) (Origin
 		return nil
 	})
 	return out, err
+}
+
+func validateOriginalSelectedClaim(claim ReplyClaim, seq int64, native string, winner bool) error {
+	if claim.ReplyID == "" || claim.OriginalID == "" || claim.Digest == "" || claim.BodySize < 0 || (claim.Status != "success" && claim.Status != "error") || (claim.Status == "success" && claim.ReplyErrorCode != "") || seq <= 0 {
+		return fmt.Errorf("%w: corrupt selected reply metadata", ErrCorrupt)
+	}
+	if winner {
+		if claim.State != StateReplyAccepted && claim.State != StateReplyObserved || claim.CommitSeq != seq {
+			return fmt.Errorf("%w: corrupt winner state/order", ErrCorrupt)
+		}
+		if claim.State == StateReplyObserved && native == "" {
+			return fmt.Errorf("%w: observed winner lacks native item", ErrCorrupt)
+		}
+	} else if claim.State != StateReplyOutcomeUnknown {
+		return fmt.Errorf("%w: corrupt terminal unknown state", ErrCorrupt)
+	}
+	return nil
 }
 
 // ClaimInput is the complete identity fence. Every field is compared for a

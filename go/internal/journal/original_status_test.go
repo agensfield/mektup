@@ -172,3 +172,33 @@ func TestOriginalStatusRollbackAndConcurrentLinearization(t *testing.T) {
 		}
 	}
 }
+
+func TestOriginalStatusFailsClosedOnCorruptWinnerMetadata(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	c, err := j.ClaimReply(context.Background(), claimInput())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.CommitReply(context.Background(), c.ReplyID, c.Owner, c.Token); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("UPDATE reply_claims SET state=?,commit_seq=0 WHERE reply_id=?", string(StateReplyAccepted), c.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.OriginalStatus(context.Background(), "msg-1"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("corrupt winner accepted: %v", err)
+	}
+	if _, err := j.db.Exec("UPDATE reply_claims SET state=?,commit_seq=1 WHERE reply_id=?", string(StateReplyObserved), c.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("DELETE FROM observations WHERE reply_id=?", c.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.OriginalStatus(context.Background(), "msg-1"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("observed winner without native evidence accepted: %v", err)
+	}
+}
