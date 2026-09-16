@@ -228,6 +228,13 @@ func (s *Service) observeCandidate(ctx context.Context, status OperationStatus, 
 	if _, ok := seen[key]; ok {
 		return nil
 	}
+	if verified, ok := s.Journal.(VerifiedObservation); ok {
+		if err := verified.ObserveVerifiedReply(ctx, status, item, e); err != nil {
+			return err
+		}
+		seen[key] = struct{}{}
+		return nil
+	}
 	var observeErr error
 	if historical {
 		observeErr = s.Journal.ReconcileReplyObservation(ctx, e.MessageID, item.NativeItemID, e.PayloadSHA256)

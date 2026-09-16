@@ -173,19 +173,7 @@ func (r *RemoteJournal) ClaimReply(ctx context.Context, input ReplyClaimInput) (
 		return claim, nil
 	}
 	op.ReplyEndpointID = replyEndpointID
-	controlOp := op
-	if op.InReplyTo != "" {
-		// The receiver validates the original durable operation relationship.
-		// A reply operation may be the sender-side source of routing context,
-		// but its control document must still name the original operation that
-		// owns the custody tuple.
-		originalStatus, lookupErr := r.Local.Lookup(ctx, input.OriginalID)
-		if lookupErr != nil {
-			return ReplyClaim{}, fmt.Errorf("%w: original operation identity: %v", ErrRemoteCustodyBinding, lookupErr)
-		}
-		controlOp.OperationID = originalStatus.OperationID
-	}
-	request, err := r.request(controlOp, input, "claim", replyEndpointID)
+	request, err := r.request(op, input, "claim", replyEndpointID)
 	if err != nil {
 		return ReplyClaim{}, err
 	}
@@ -292,6 +280,64 @@ func (r *RemoteJournal) ObserveReply(ctx context.Context, replyID, nativeID, dig
 	return r.observeRemote(ctx, claim, nativeID, digest)
 }
 
+// ObserveVerifiedReply builds a tokenless observation directly from an exact
+// native envelope and the sender's durable original relationship. It does not
+// require a prior in-process ClaimReply cache and never creates dispatch
+// authority.
+func (r *RemoteJournal) ObserveVerifiedReply(ctx context.Context, status OperationStatus, item ObservedItem, envelope mektup.Envelope) error {
+	if err := r.init(); err != nil {
+		return err
+	}
+	input := ReplyClaimInput{ReplyID: envelope.MessageID, OriginalID: status.MessageID, Digest: envelope.PayloadSHA256, BodySize: int64(envelope.PayloadBytes), Status: string(envelope.ReplyStatus), ErrorCode: envelope.ReplyErrorCode, ReplyRoute: status.ReplyRoute, CustodyRoute: status.CustodyRoute, CustodyStoreID: status.CustodyStoreID}
+	if input.ReplyRoute == "" {
+		input.ReplyRoute = status.SourceRoute
+	}
+	if input.Status == "" {
+		input.Status = status.ReplyStatus
+	}
+	if input.ReplyID == "" || item.NativeItemID == "" {
+		return sshproxy.ErrControlValidation
+	}
+	route, remote, err := r.route(input.CustodyRoute)
+	if err != nil {
+		return err
+	}
+	if !remote {
+		return r.Local.RecordObservedReply(ctx, input, item.NativeItemID, status.ReplyEndpointID, status.CustodyRoute)
+	}
+	replyEndpointID := status.ReplyEndpointID
+	if replyEndpointID == "" {
+		replyEndpointID = status.SourceEndpointID
+	}
+	request, err := r.request(status.Operation, input, "observe", replyEndpointID)
+	if err != nil {
+		return err
+	}
+	request.NativeItemID = item.NativeItemID
+	request.AttemptOwner = ""
+	request.FencingToken = ""
+	request.Lease = nil
+	request.RequestedLease = nil
+	response, err := r.invoke(ctx, route, request)
+	if err != nil {
+		return err
+	}
+	result, err := decodeObserveResult(response, request)
+	if err != nil {
+		return err
+	}
+	if err := r.Local.Inner.RecordObservedWinner(ctx, status.MessageID, result.WinnerReplyID, result.WinnerDigest, result.WinnerStatus, result.WinnerErrorCode, input.ReplyRoute, input.CustodyRoute, input.CustodyStoreID, result.WinnerNativeID, status.ReplyEndpointID, status.CustodyRoute, result.WinnerCommitSeq, result.WinnerBodySize); err != nil {
+		return err
+	}
+	if err := r.Local.RecordObservedReply(ctx, input, item.NativeItemID, status.ReplyEndpointID, status.CustodyRoute); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.claims[input.ReplyID] = remoteClaim{input: input, operation: status.Operation, request: request, route: route, state: mektup.StateReplyObserved}
+	r.mu.Unlock()
+	return nil
+}
+
 func (r *RemoteJournal) ReconcileReplyObservation(ctx context.Context, replyID, nativeID, digest string) error {
 	claim, remote, err := r.claimFor(replyID)
 	if err != nil {
@@ -305,6 +351,17 @@ func (r *RemoteJournal) ReconcileReplyObservation(ctx context.Context, replyID, 
 	// this method name is retained for the local JournalPort seam, while the
 	// wire operation remains the explicit tokenless observe operation.
 	return r.observeRemote(ctx, claim, nativeID, digest)
+}
+
+type observeResult struct {
+	State           mektup.EvidenceState
+	WinnerReplyID   string
+	WinnerNativeID  string
+	WinnerCommitSeq int64
+	WinnerStatus    string
+	WinnerDigest    string
+	WinnerBodySize  int64
+	WinnerErrorCode string
 }
 
 func (r *RemoteJournal) observeRemote(ctx context.Context, claim remoteClaim, nativeID, digest string) error {
@@ -325,6 +382,12 @@ func (r *RemoteJournal) observeRemote(ctx context.Context, claim remoteClaim, na
 	}
 	result, err := decodeObserveResult(response, request)
 	if err != nil {
+		return err
+	}
+	if err := r.Local.Inner.RecordObservedWinner(ctx, claim.input.OriginalID, result.WinnerReplyID, result.WinnerDigest, result.WinnerStatus, result.WinnerErrorCode, claim.input.ReplyRoute, claim.input.CustodyRoute, claim.input.CustodyStoreID, result.WinnerNativeID, request.ReplyDestination.EndpointID, request.Custody.EndpointID, result.WinnerCommitSeq, result.WinnerBodySize); err != nil {
+		return err
+	}
+	if err := r.Local.RecordObservedReply(ctx, claim.input, nativeID, request.ReplyDestination.EndpointID, request.Custody.EndpointID); err != nil {
 		return err
 	}
 	r.mu.Lock()
@@ -485,7 +548,7 @@ func decodeClaimResult(response sshproxy.ControlRequest, input ReplyClaimInput) 
 	if result.Disposition != "claimed" && result.Disposition != "existing" {
 		return ReplyClaim{}, sshproxy.ErrControlValidation
 	}
-	return ReplyClaim{ReplyID: input.ReplyID, OriginalID: input.OriginalID, Digest: input.Digest, BodySize: input.BodySize, Status: input.Status, ReplyRoute: input.ReplyRoute, CustodyRoute: input.CustodyRoute, CustodyStoreID: input.CustodyStoreID, Owner: input.Owner, Token: result.FencingToken, State: result.State, Joined: result.Disposition == "existing"}, nil
+	return ReplyClaim{ReplyID: input.ReplyID, OriginalID: input.OriginalID, Digest: input.Digest, BodySize: input.BodySize, Status: input.Status, ReplyErrorCode: input.ErrorCode, ReplyRoute: input.ReplyRoute, CustodyRoute: input.CustodyRoute, CustodyStoreID: input.CustodyStoreID, Owner: input.Owner, Token: result.FencingToken, State: result.State, Joined: result.Disposition == "existing"}, nil
 }
 
 func decodeLeaseResult(response sshproxy.ControlRequest) (*sshproxy.Lease, error) {
@@ -563,11 +626,11 @@ func decodeMutationResult(response sshproxy.ControlRequest, input ReplyClaimInpu
 	if err := json.Unmarshal(response.Result, &result); err != nil || !result.State.Valid() || !result.WakeRecorded || (result.State != mektup.StateReplyAccepted && result.State != mektup.StateReplyObserved) {
 		return ReplyClaim{}, sshproxy.ErrControlValidation
 	}
-	return ReplyClaim{ReplyID: input.ReplyID, OriginalID: input.OriginalID, Digest: input.Digest, BodySize: input.BodySize, Status: input.Status, ReplyRoute: input.ReplyRoute, CustodyRoute: input.CustodyRoute, CustodyStoreID: input.CustodyStoreID, Owner: input.Owner, State: result.State, Joined: joined, Won: result.Won}, nil
+	return ReplyClaim{ReplyID: input.ReplyID, OriginalID: input.OriginalID, Digest: input.Digest, BodySize: input.BodySize, Status: input.Status, ReplyErrorCode: input.ErrorCode, ReplyRoute: input.ReplyRoute, CustodyRoute: input.CustodyRoute, CustodyStoreID: input.CustodyStoreID, Owner: input.Owner, State: result.State, Joined: joined, Won: result.Won}, nil
 }
 
-func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.ControlRequest) (struct{ State mektup.EvidenceState }, error) {
-	var out struct{ State mektup.EvidenceState }
+func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.ControlRequest) (observeResult, error) {
+	var out observeResult
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(response.Result, &raw); err != nil || raw == nil {
 		return out, sshproxy.ErrControlValidation
@@ -595,6 +658,26 @@ func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.Cont
 			return out, sshproxy.ErrControlValidation
 		}
 	}
+	if raw, ok := winner["replyMessageId"]; !ok || json.Unmarshal(raw, &out.WinnerReplyID) != nil || out.WinnerReplyID == "" {
+		return out, sshproxy.ErrControlValidation
+	}
+	if raw, ok := winner["commitSeq"]; !ok || json.Unmarshal(raw, &out.WinnerCommitSeq) != nil || out.WinnerCommitSeq < 1 {
+		return out, sshproxy.ErrControlValidation
+	}
+	if raw, ok := winner["status"]; !ok || json.Unmarshal(raw, &out.WinnerStatus) != nil || out.WinnerStatus == "" {
+		return out, sshproxy.ErrControlValidation
+	}
+	if raw, ok := winner["bodySha256"]; !ok || json.Unmarshal(raw, &out.WinnerDigest) != nil || out.WinnerDigest == "" {
+		return out, sshproxy.ErrControlValidation
+	}
+	if raw, ok := winner["bodyBytes"]; !ok || json.Unmarshal(raw, &out.WinnerBodySize) != nil || out.WinnerBodySize < 0 {
+		return out, sshproxy.ErrControlValidation
+	}
+	if raw, ok := winner["replyErrorCode"]; ok {
+		if json.Unmarshal(raw, &out.WinnerErrorCode) != nil || out.WinnerErrorCode == "" {
+			return out, sshproxy.ErrControlValidation
+		}
+	}
 	provenanceRaw, ok := raw["provenance"]
 	if !ok || string(bytes.TrimSpace(provenanceRaw)) == "null" {
 		return out, sshproxy.ErrControlValidation
@@ -603,7 +686,7 @@ func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.Cont
 		EndpointID   string `json:"endpointId"`
 		ControlRoute string `json:"controlRoute"`
 	}
-	if json.Unmarshal(provenanceRaw, &provenance) != nil || provenance.EndpointID != request.ReplyDestination.EndpointID || provenance.ControlRoute != request.ReplyDestination.URI {
+	if json.Unmarshal(provenanceRaw, &provenance) != nil || provenance.EndpointID != request.ReplyDestination.EndpointID || provenance.ControlRoute != request.Custody.EndpointID {
 		return out, sshproxy.ErrControlValidation
 	}
 	return out, nil
@@ -628,11 +711,12 @@ func (r *RemoteJournal) status(ctx context.Context, claim remoteClaim, reconcile
 		return OperationStatus{}, err
 	}
 	var result struct {
-		State       mektup.EvidenceState `json:"state"`
-		ReplyStatus string               `json:"replyStatus"`
+		State          mektup.EvidenceState `json:"state"`
+		ReplyStatus    string               `json:"replyStatus"`
+		ReplyErrorCode string               `json:"replyErrorCode"`
 	}
 	if err := json.Unmarshal(response.Result, &result); err != nil || !result.State.Valid() {
 		return OperationStatus{}, sshproxy.ErrControlValidation
 	}
-	return OperationStatus{Operation: op, State: result.State, ReplyStatus: result.ReplyStatus, ReplyDigest: claim.input.Digest, ReplyBodySize: claim.input.BodySize}, nil
+	return OperationStatus{Operation: op, State: result.State, ReplyStatus: result.ReplyStatus, ReplyErrorCode: result.ReplyErrorCode, ReplyDigest: claim.input.Digest, ReplyBodySize: claim.input.BodySize}, nil
 }

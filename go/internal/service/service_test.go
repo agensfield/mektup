@@ -317,6 +317,35 @@ func TestReplyObservationUsesIndependentEndpointAndThread(t *testing.T) {
 	}
 }
 
+func TestReplyObservationBindsNativeStatusAndErrorCode(t *testing.T) {
+	status := OperationStatus{Operation: Operation{MessageID: "msg_27999999-9999-7999-9999-999999999999", SourceRoute: "codex://local/thread/source", TargetRoute: "codex://local/thread/target", ReplyRoute: "codex://local/thread/reply", ReplyRequested: true}, ReplyStatus: "error", ReplyErrorCode: "remote-bad", ReplyDigest: digest("answer"), ReplyBodySize: 6}
+	e := mektup.Envelope{MessageID: "msg_28999999-9999-7999-8999-999999999999", Kind: mektup.KindReply, FromEndpointID: epTarget, ToEndpointID: epSource, From: status.TargetRoute, FromKind: "agent", To: status.ReplyRoute, RequestedTarget: status.ReplyRoute, InReplyTo: status.MessageID, ReplyStatus: mektup.ReplySuccess, Body: "answer", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	payload, err := mektup.RenderEnvelope(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateObservedEnvelope(ObservedItem{ThreadID: "reply", NativeItemID: "native", ClientMessageID: e.MessageID, Text: string(payload)}, status, true); err == nil {
+		t.Fatal("native status/error mismatch was accepted")
+	}
+	e.ReplyStatus = mektup.ReplyError
+	e.ReplyErrorCode = "wrong"
+	payload, err = mektup.RenderEnvelope(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateObservedEnvelope(ObservedItem{ThreadID: "reply", NativeItemID: "native", ClientMessageID: e.MessageID, Text: string(payload)}, status, true); err == nil {
+		t.Fatal("native error-code mismatch was accepted")
+	}
+	e.ReplyErrorCode = status.ReplyErrorCode
+	payload, err = mektup.RenderEnvelope(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := validateObservedEnvelope(ObservedItem{ThreadID: "reply", NativeItemID: "native", ClientMessageID: e.MessageID, Text: string(payload)}, status, true); err != nil {
+		t.Fatalf("matching native status/error rejected: %v", err)
+	}
+}
+
 type countingDelivery struct {
 	inner        *fakeDelivery
 	firstErr     error

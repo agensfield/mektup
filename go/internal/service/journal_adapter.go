@@ -174,12 +174,12 @@ func (a SQLiteJournal) Lookup(ctx context.Context, ref string) (OperationStatus,
 		if claim.State == journal.StateReplyAccepted || claim.State == journal.StateReplyObserved {
 			if status.State != mektup.StateReplyAccepted && status.State != mektup.StateReplyObserved {
 				status.State = mektup.EvidenceState(claim.State)
-				status.ReplyID, status.ReplyStatus = claim.ReplyID, claim.Status
+				status.ReplyID, status.ReplyStatus, status.ReplyErrorCode = claim.ReplyID, claim.Status, claim.ReplyErrorCode
 				status.ReplyDigest, status.ReplyBodySize = claim.Digest, claim.BodySize
 			}
 		} else if claim.State == journal.StateReplyOutcomeUnknown && status.State != mektup.StateReplyAccepted && status.State != mektup.StateReplyObserved {
 			status.State = mektup.StateReplyOutcomeUnknown
-			status.ReplyID, status.ReplyStatus = claim.ReplyID, claim.Status
+			status.ReplyID, status.ReplyStatus, status.ReplyErrorCode = claim.ReplyID, claim.Status, claim.ReplyErrorCode
 			status.ReplyDigest, status.ReplyBodySize = claim.Digest, claim.BodySize
 		}
 	}
@@ -246,6 +246,13 @@ func (a SQLiteJournal) ObserveReply(ctx context.Context, id, native, digest stri
 	}
 	return a.Inner.ObserveReply(ctx, id, native, digest)
 }
+
+func (a SQLiteJournal) RecordObservedReply(ctx context.Context, in ReplyClaimInput, native, endpointID, controlRoute string) error {
+	if err := a.valid(); err != nil {
+		return err
+	}
+	return a.Inner.RecordObservedReply(ctx, journal.ClaimInput{ReplyID: in.ReplyID, OriginalID: in.OriginalID, Digest: in.Digest, BodySize: in.BodySize, Status: in.Status, ErrorCode: in.ErrorCode, ReplyRoute: in.ReplyRoute, CustodyRoute: in.CustodyRoute, CustodyStoreID: in.CustodyStoreID}, native, endpointID, controlRoute)
+}
 func (a SQLiteJournal) ReconcileReplyObservation(ctx context.Context, id, native, digest string) error {
 	if err := a.valid(); err != nil {
 		return err
@@ -289,7 +296,7 @@ func (a SQLiteJournal) WaitReply(ctx context.Context, replyID string, timeout ti
 }
 
 func replyClaim(c journal.ReplyClaim) ReplyClaim {
-	return ReplyClaim{ReplyID: c.ReplyID, OriginalID: c.OriginalID, Digest: c.Digest, BodySize: c.BodySize, Status: c.Status, ReplyRoute: c.ReplyRoute, CustodyRoute: c.CustodyRoute, CustodyStoreID: c.CustodyStoreID, Owner: c.Owner, Token: c.Token, State: mektup.EvidenceState(c.State), Joined: c.Joined, Won: c.Won}
+	return ReplyClaim{ReplyID: c.ReplyID, OriginalID: c.OriginalID, Digest: c.Digest, BodySize: c.BodySize, Status: c.Status, ReplyErrorCode: c.ReplyErrorCode, ReplyRoute: c.ReplyRoute, CustodyRoute: c.CustodyRoute, CustodyStoreID: c.CustodyStoreID, Owner: c.Owner, Token: c.Token, State: mektup.EvidenceState(c.State), Joined: c.Joined, Won: c.Won}
 }
 
 var _ JournalPort = SQLiteJournal{}

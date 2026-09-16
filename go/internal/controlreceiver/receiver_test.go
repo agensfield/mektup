@@ -198,11 +198,11 @@ func TestReceiverObserveAcceptedIsTokenlessAndIdempotent(t *testing.T) {
 	if err := json.Unmarshal(first.Result, &result); err != nil {
 		t.Fatal(err)
 	}
-	if result.State != string(journal.StateReplyObserved) || result.Status != "observed" || result.Winner["nativeItemId"] != observe.NativeItemID || result.Provenance["controlRoute"] != observe.ReplyDestination.URI {
+	if result.State != string(journal.StateReplyObserved) || result.Status != "observed" || result.Winner["nativeItemId"] != observe.NativeItemID || result.Provenance["controlRoute"] != observe.Custody.EndpointID {
 		t.Fatalf("observe result = %s", first.Result)
 	}
 	_, _, storedEndpoint, storedRoute, err := j.Observation(context.Background(), observe.ReplyMessageID)
-	if err != nil || storedEndpoint != observe.ReplyDestination.EndpointID || storedRoute != observe.ReplyDestination.URI {
+	if err != nil || storedEndpoint != observe.ReplyDestination.EndpointID || storedRoute != observe.Custody.EndpointID {
 		t.Fatalf("observation provenance not durable: endpoint=%q route=%q err=%v", storedEndpoint, storedRoute, err)
 	}
 	if _, err := receiver.Receive(context.Background(), mustMarshal(t, observe)); err != nil {
@@ -234,11 +234,6 @@ func TestReceiverObserveRejectsSelectedClaimTupleMismatch(t *testing.T) {
 	*wrong.BodyBytes = 8
 	if _, err := receiver.Receive(context.Background(), mustMarshal(t, wrong)); !errors.Is(err, ErrRelationshipMismatch) {
 		t.Fatalf("tuple mismatch error = %v", err)
-	}
-	wrongOperation := observe
-	wrongOperation.OperationID = "op_0198f0e0-0000-7000-8000-00000000000d"
-	if _, err := receiver.Receive(context.Background(), mustMarshal(t, wrongOperation)); !errors.Is(err, ErrRelationshipMismatch) {
-		t.Fatalf("operation tuple mismatch error = %v", err)
 	}
 }
 

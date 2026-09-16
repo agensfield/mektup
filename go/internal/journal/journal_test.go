@@ -756,6 +756,29 @@ func TestReplyErrorCodeRemainsSeparateFromOutcomeErrorCode(t *testing.T) {
 	}
 }
 
+func TestObservedProjectionStrengthensExistingAcceptedClaim(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	in := claimInput()
+	c, err := j.ClaimReply(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.CommitReply(context.Background(), c.ReplyID, c.Owner, c.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordObservedReply(context.Background(), in, "native-projected", "ep_0198f0e0-0000-7000-8000-000000000001", "custody"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := j.Reply(context.Background(), c.ReplyID)
+	if err != nil || got.State != StateReplyObserved || got.Token != "" {
+		t.Fatalf("accepted projection did not strengthen safely: %+v err=%v", got, err)
+	}
+}
+
 func TestV8SchemaRejectsMissingObservationProvenanceColumns(t *testing.T) {
 	dir := t.TempDir()
 	var now atomic.Int64

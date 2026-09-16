@@ -175,6 +175,13 @@ type ObservationPort interface {
 	FullHistory(context.Context, ResolvedTarget) ([]ObservedItem, error)
 }
 
+// VerifiedObservation is the only native-evidence path allowed to remote
+// custody. The envelope has already passed exact correlation, route, thread,
+// size, digest, and client-message checks.
+type VerifiedObservation interface {
+	ObserveVerifiedReply(context.Context, OperationStatus, ObservedItem, mektup.Envelope) error
+}
+
 // Operation is metadata only. Body bytes remain in the native envelope and
 // are intentionally absent here and from every journal-facing type.
 type Operation struct {
@@ -205,13 +212,14 @@ type Prepared struct {
 
 type OperationStatus struct {
 	Operation
-	State         mektup.EvidenceState
-	TurnID        string
-	ErrorCode     string
-	ReplyID       string
-	ReplyStatus   string
-	ReplyDigest   string
-	ReplyBodySize int64
+	State          mektup.EvidenceState
+	TurnID         string
+	ErrorCode      string
+	ReplyID        string
+	ReplyStatus    string
+	ReplyErrorCode string
+	ReplyDigest    string
+	ReplyBodySize  int64
 }
 
 type ReplyClaimInput struct {
@@ -233,6 +241,7 @@ type ReplyClaim struct {
 	Digest         string
 	BodySize       int64
 	Status         string
+	ReplyErrorCode string
 	ReplyRoute     string
 	CustodyRoute   string
 	CustodyStoreID string

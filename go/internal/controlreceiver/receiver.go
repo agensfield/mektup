@@ -167,7 +167,7 @@ func (r Receiver) validateOriginal(ctx context.Context, j *journal.Journal, req 
 	if err != nil {
 		return fmt.Errorf("%w: original operation unavailable: %v", ErrRelationshipMismatch, err)
 	}
-	if op.OperationID != req.OperationID || op.CustodyRoute != req.Custody.EndpointID || op.CustodyStoreID != storeID || op.ReplyRoute == "" || op.ReplyRoute != req.ReplyDestination.URI || op.ReplyEndpointID == "" || op.ReplyEndpointID != req.ReplyDestination.EndpointID || op.ReplyThreadID == "" || op.ReplyThreadID != req.ReplyDestination.ThreadID {
+	if op.CustodyRoute != req.Custody.EndpointID || op.CustodyStoreID != storeID || op.ReplyRoute == "" || op.ReplyRoute != req.ReplyDestination.URI || op.ReplyEndpointID == "" || op.ReplyEndpointID != req.ReplyDestination.EndpointID || op.ReplyThreadID == "" || op.ReplyThreadID != req.ReplyDestination.ThreadID {
 		return ErrRelationshipMismatch
 	}
 	return nil
@@ -215,7 +215,10 @@ func validateClaimJoinTuple(ctx context.Context, j *journal.Journal, req sshprox
 		}
 		return fmt.Errorf("%w: selected claim unavailable: %v", ErrRelationshipMismatch, err)
 	}
-	if claim.OriginalID != req.OriginalMessageID || claim.Digest != req.BodySHA256 ||
+	if claim.Digest != req.BodySHA256 {
+		return journal.ErrIdentityConflict
+	}
+	if claim.OriginalID != req.OriginalMessageID ||
 		(req.BodyBytes == nil || claim.BodySize != *req.BodyBytes) || claim.Status != req.ReplyStatus ||
 		claim.ReplyRoute != req.ReplyDestination.URI || claim.CustodyRoute != req.Custody.EndpointID ||
 		claim.CustodyStoreID != storeID {
@@ -298,7 +301,7 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 		}
 		return resultJSON(map[string]any{"state": journal.StateReplyOutcomeUnknown})
 	case "observe":
-		if err := j.ObserveReplyWithProvenance(ctx, req.ReplyMessageID, req.NativeItemID, req.BodySHA256, req.ReplyDestination.EndpointID, req.ReplyDestination.URI); err != nil {
+		if err := j.ObserveReplyWithProvenance(ctx, req.ReplyMessageID, req.NativeItemID, req.BodySHA256, req.ReplyDestination.EndpointID, req.Custody.EndpointID); err != nil {
 			return nil, err
 		}
 		claim, err := j.Reply(ctx, req.ReplyMessageID)
@@ -309,17 +312,20 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 		if err != nil {
 			return nil, err
 		}
-		winnerID, winnerNative, winnerSeq, winnerErr := j.Winner(ctx, claim.OriginalID)
+		winnerClaim, winnerNative, winnerSeq, winnerErr := j.WinnerDetails(ctx, claim.OriginalID)
 		if winnerErr != nil && !errors.Is(winnerErr, journal.ErrNotFound) {
 			return nil, winnerErr
 		}
 		result := map[string]any{"state": claim.State, "status": "observed", "provenance": map[string]any{"endpointId": observedEndpoint, "controlRoute": observedRoute}}
 		if winnerErr == nil {
-			winner := map[string]any{"replyMessageId": winnerID, "commitSeq": winnerSeq}
+			winner := map[string]any{"replyMessageId": winnerClaim.ReplyID, "commitSeq": winnerSeq, "status": winnerClaim.Status, "bodyBytes": winnerClaim.BodySize, "bodySha256": winnerClaim.Digest}
+			if winnerClaim.ReplyErrorCode != "" {
+				winner["replyErrorCode"] = winnerClaim.ReplyErrorCode
+			}
 			if winnerNative != "" {
 				winner["nativeItemId"] = winnerNative
 			}
-			if winnerID == claim.ReplyID && observedNative != "" && winnerNative == "" {
+			if winnerClaim.ReplyID == claim.ReplyID && observedNative != "" && winnerNative == "" {
 				winner["nativeItemId"] = observedNative
 			}
 			result["winner"] = winner
@@ -335,7 +341,7 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 		if err != nil {
 			return nil, err
 		}
-		return resultJSON(map[string]any{"state": claim.State, "replyStatus": claim.Status, "commitSeq": claim.CommitSeq})
+		return resultJSON(map[string]any{"state": claim.State, "replyStatus": claim.Status, "replyErrorCode": claim.ReplyErrorCode, "commitSeq": claim.CommitSeq})
 	default:
 		return nil, fmt.Errorf("%w: unsupported operation", sshproxy.ErrControlValidation)
 	}

@@ -31,6 +31,12 @@ func validateObservedEnvelope(item ObservedItem, original OperationStatus, accep
 	if e.Kind != mektup.KindReply || e.InReplyTo != original.MessageID {
 		return mektup.Envelope{}, fmt.Errorf("reply correlation mismatch")
 	}
+	if original.ReplyStatus != "" && string(e.ReplyStatus) != original.ReplyStatus {
+		return mektup.Envelope{}, fmt.Errorf("reply status mismatch")
+	}
+	if (original.ReplyStatus == string(mektup.ReplySuccess) && e.ReplyErrorCode != "") || (original.ReplyStatus == string(mektup.ReplyError) && e.ReplyErrorCode != original.ReplyErrorCode) {
+		return mektup.Envelope{}, fmt.Errorf("reply error code mismatch")
+	}
 	expectedRoute := original.ReplyRoute
 	if expectedRoute == "" {
 		expectedRoute = original.SourceRoute

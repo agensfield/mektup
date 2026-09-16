@@ -63,7 +63,7 @@ func TestRemoteJournalRoutesCustodyAndPreservesSeparateBodyEndpoint(t *testing.T
 		case "commit":
 			response.Result = json.RawMessage(`{"state":"reply_accepted","wakeRecorded":true,"won":true}`)
 		case "observe":
-			response.Result = json.RawMessage(`{"state":"reply_observed","status":"observed","winner":{"nativeItemId":"native-remote-1"},"provenance":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000072","controlRoute":"codex://body/thread/reply"}}`)
+			response.Result = json.RawMessage(`{"state":"reply_observed","status":"observed","winner":{"replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000075","commitSeq":1,"status":"success","bodyBytes":4,"bodySha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","nativeItemId":"native-remote-1"},"provenance":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000072","controlRoute":"ep_0198f0e0-0000-7000-8000-000000000071"}}`)
 		case "status", "reconcile":
 			response.Result = json.RawMessage(`{"state":"reply_accepted","replyStatus":"success","commitSeq":1}`)
 		default:
