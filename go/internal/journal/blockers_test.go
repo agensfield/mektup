@@ -40,4 +40,17 @@ func TestBlockerUpsertIsOneMetadataRowPerCorrelation(t *testing.T) {
 	if payload == "" {
 		t.Fatal("empty blocker metadata")
 	}
+	if err := j.ResolveBlocker(context.Background(), "ep-1", "", "req-1", last); err == nil {
+		t.Fatal("incomplete blocker resolution accepted")
+	}
+	if err := j.UpsertBlocker(context.Background(), BlockerObservation{Method: "approval", CorrelationID: `"req-2"`, Generation: "7", SeenAt: first, EndpointID: "ep-1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.ResolveBlocker(context.Background(), "ep-1", "7", `"req-2"`, last); err != nil {
+		t.Fatal(err)
+	}
+	resolvedRows, err := j.ListBlockers(context.Background(), BlockerQuery{EndpointID: "ep-1", Generation: "7"})
+	if err != nil || len(resolvedRows) != 1 || resolvedRows[0].ResolvedAt == nil || !resolvedRows[0].ResolvedAt.Equal(last) {
+		t.Fatalf("resolved blocker = %#v, %v", resolvedRows, err)
+	}
 }

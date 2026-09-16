@@ -7,11 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/agensfield/mektup/go/appserver"
+	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/service"
 )
 
@@ -19,7 +21,13 @@ import (
 // history scan. FullHistory deliberately uses full turn pages, because legacy
 // local stores reject thread/items/list and summary views omit steered inputs.
 type ObservationAdapter struct {
-	Pool *ConnectionPool
+	Pool     *ConnectionPool
+	Blockers BlockerJournal
+}
+
+type BlockerJournal interface {
+	UpsertBlocker(context.Context, journal.BlockerObservation) error
+	ResolveBlocker(context.Context, string, string, string, time.Time) error
 }
 
 func (a *ObservationAdapter) Subscribe(ctx context.Context, target service.ResolvedTarget) (service.EventStream, error) {
@@ -42,7 +50,7 @@ func (a *ObservationAdapter) Subscribe(ctx context.Context, target service.Resol
 		cleanupCancel()
 		return nil, err
 	}
-	return &eventStream{session: session, target: target, ctx: streamCtx, cancel: streamCancel}, nil
+	return &eventStream{session: session, target: target, blockers: a.Blockers, ctx: streamCtx, cancel: streamCancel}, nil
 }
 
 func (a *ObservationAdapter) FullHistory(ctx context.Context, target service.ResolvedTarget) ([]service.ObservedItem, error) {
@@ -91,12 +99,13 @@ func (a *ObservationAdapter) FullHistory(ctx context.Context, target service.Res
 }
 
 type eventStream struct {
-	session Session
-	target  service.ResolvedTarget
-	ctx     context.Context
-	cancel  context.CancelFunc
-	mu      sync.Mutex
-	closed  bool
+	session  Session
+	target   service.ResolvedTarget
+	blockers BlockerJournal
+	ctx      context.Context
+	cancel   context.CancelFunc
+	mu       sync.Mutex
+	closed   bool
 }
 
 func (s *eventStream) Next(ctx context.Context) (service.Event, error) {
@@ -140,11 +149,41 @@ func (s *eventStream) Next(ctx context.Context) (service.Event, error) {
 			return service.Event{Gap: true, Reason: reason}, nil
 		case appserver.EventServerRequest:
 			// Mektup is a passive observer and MUST NOT answer any server request,
-			// including unknown methods. Discard only the payload, retaining the
-			// connection's callback for another subscribed client.
+			// including unknown methods. Journal bounded correlation metadata only;
+			// discard the payload and retain the shared callback for another client.
+			if event.Request != nil && s.blockers != nil {
+				correlationID, correlationErr := serverRequestCorrelationID(event.Request.ID)
+				if correlationErr != nil {
+					return service.Event{}, correlationErr
+				}
+				if blockerErr := s.blockers.UpsertBlocker(nextCtx, journal.BlockerObservation{
+					Method: event.Request.Method, CorrelationID: correlationID,
+					Generation: strconv.FormatUint(event.Request.Generation, 10),
+					EndpointID: s.target.EndpointID, ThreadID: s.target.ThreadID,
+				}); blockerErr != nil {
+					return service.Event{}, blockerErr
+				}
+			}
 			continue
 		case appserver.EventNotification:
-			if event.Notification == nil || event.Notification.Method != "item/completed" {
+			if event.Notification == nil {
+				continue
+			}
+			if event.Notification.Method == "serverRequest/resolved" {
+				if s.blockers != nil {
+					threadID, requestID, resolvedErr := resolvedServerRequest(event.Notification.Params)
+					if resolvedErr != nil {
+						return service.Event{}, resolvedErr
+					}
+					if threadID == s.target.ThreadID {
+						if blockerErr := s.blockers.ResolveBlocker(nextCtx, s.target.EndpointID, strconv.FormatUint(event.Notification.Generation, 10), requestID, time.Now()); blockerErr != nil {
+							return service.Event{}, blockerErr
+						}
+					}
+				}
+				continue
+			}
+			if event.Notification.Method != "item/completed" {
 				continue
 			}
 			item, ok := notificationItem(*event.Notification, s.target.ThreadID)
@@ -156,6 +195,33 @@ func (s *eventStream) Next(ctx context.Context) (service.Event, error) {
 			continue
 		}
 	}
+}
+
+func serverRequestCorrelationID(id appserver.RequestID) (string, error) {
+	encoded, err := json.Marshal(id)
+	if err != nil || len(encoded) == 0 || string(encoded) == "null" {
+		return "", fmt.Errorf("runtime: invalid server request correlation ID")
+	}
+	return string(encoded), nil
+}
+
+func resolvedServerRequest(params json.RawMessage) (string, string, error) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(params, &object); err != nil {
+		return "", "", fmt.Errorf("runtime: invalid resolved server request: %w", err)
+	}
+	threadID, ok := requiredStringField(object, "threadId")
+	if !ok {
+		return "", "", fmt.Errorf("runtime: resolved server request omitted threadId")
+	}
+	var id any
+	decoder := json.NewDecoder(bytes.NewReader(object["requestId"]))
+	decoder.UseNumber()
+	if err := decoder.Decode(&id); err != nil {
+		return "", "", fmt.Errorf("runtime: resolved server request ID: %w", err)
+	}
+	correlationID, err := serverRequestCorrelationID(id)
+	return threadID, correlationID, err
 }
 
 func (s *eventStream) Close() error {

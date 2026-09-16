@@ -1,11 +1,14 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +17,7 @@ import (
 	"github.com/agensfield/mektup/go/appserver"
 	"github.com/agensfield/mektup/go/internal/codexapi"
 	"github.com/agensfield/mektup/go/internal/endpoint"
+	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/service"
 )
 
@@ -320,8 +324,16 @@ func TestConnectionPoolCanceledWaiterDoesNotBlockBehindEndpointOpen(t *testing.T
 }
 
 func TestObservationIgnoresServerRequestsAndMapsVisibleCompletedItem(t *testing.T) {
-	events := make(chan appserver.Event, 2)
-	events <- appserver.Event{Kind: appserver.EventServerRequest, Request: &appserver.ServerRequest{Method: "item/permissions/requestApproval"}}
+	stateDir := t.TempDir()
+	blockers, err := journal.Open(context.Background(), journal.Options{StateDir: stateDir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer blockers.Close()
+	events := make(chan appserver.Event, 3)
+	events <- appserver.Event{Kind: appserver.EventServerRequest, Request: &appserver.ServerRequest{ID: "s1", Method: "item/permissions/requestApproval", Params: json.RawMessage(`{"secret":"must-not-persist"}`), Generation: 7}}
+	resolved, _ := json.Marshal(map[string]any{"threadId": "thread-1", "requestId": "s1"})
+	events <- appserver.Event{Kind: appserver.EventNotification, Notification: &appserver.RPCNotification{Method: "serverRequest/resolved", Params: resolved, Generation: 7}}
 	params, _ := json.Marshal(map[string]any{
 		"threadId": "thread-1", "turnId": "turn-1",
 		"item": map[string]any{"id": "item-1", "type": "userMessage", "clientId": "msg-1", "content": []any{map[string]any{"type": "text", "text": "hello"}}},
@@ -329,7 +341,7 @@ func TestObservationIgnoresServerRequestsAndMapsVisibleCompletedItem(t *testing.
 	events <- appserver.Event{Kind: appserver.EventNotification, Notification: &appserver.RPCNotification{Method: "item/completed", Params: params}}
 	session := &fakeSession{endpoint: testTargetEndpoint, events: events}
 	pool := NewConnectionPool(&fakeFactory{session: session}, func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: testTargetEndpoint}, nil })
-	stream, err := (&ObservationAdapter{Pool: pool}).Subscribe(context.Background(), testTarget())
+	stream, err := (&ObservationAdapter{Pool: pool, Blockers: blockers}).Subscribe(context.Background(), testTarget())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -340,6 +352,26 @@ func TestObservationIgnoresServerRequestsAndMapsVisibleCompletedItem(t *testing.
 	}
 	if event.Item.Text != "hello" || event.Item.ClientMessageID != "msg-1" || event.Item.NativeItemID != "item-1" {
 		t.Fatalf("mapped item = %#v", event.Item)
+	}
+	rows, err := blockers.ListBlockers(context.Background(), journal.BlockerQuery{EndpointID: testTargetEndpoint, Generation: "7", ThreadID: "thread-1"})
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("blocker metadata = %#v, %v", rows, err)
+	}
+	if rows[0].Method != "item/permissions/requestApproval" || rows[0].CorrelationID != `"s1"` || rows[0].ResolvedAt == nil {
+		t.Fatalf("blocker metadata = %#v", rows[0])
+	}
+	entries, err := os.ReadDir(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(stateDir, entry.Name()))
+		if readErr == nil && bytes.Contains(data, []byte("must-not-persist")) {
+			t.Fatalf("server request payload persisted in %s", entry.Name())
+		}
 	}
 }
 

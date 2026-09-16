@@ -88,6 +88,23 @@ ON CONFLICT(endpoint_id,generation,method,correlation_id) DO UPDATE SET
 	return err
 }
 
+// ResolveBlocker marks the matching connection-generation request resolved.
+// The app-server resolved notification carries no method, so request IDs must
+// be unique within one connection generation and endpoint. No request payload
+// is accepted or persisted here.
+func (j *Journal) ResolveBlocker(ctx context.Context, endpointID, generation, correlationID string, resolvedAt time.Time) error {
+	if strings.TrimSpace(endpointID) == "" || strings.TrimSpace(generation) == "" || strings.TrimSpace(correlationID) == "" {
+		return fmt.Errorf("journal: blocker endpoint, generation, and correlation ID are required")
+	}
+	if resolvedAt.IsZero() {
+		resolvedAt = j.now().UTC()
+	} else {
+		resolvedAt = resolvedAt.UTC()
+	}
+	_, err := j.db.ExecContext(ctx, `UPDATE blockers SET resolved_at=COALESCE(resolved_at,?) WHERE endpoint_id=? AND generation=? AND correlation_id=?`, resolvedAt.UnixNano(), endpointID, generation, correlationID)
+	return err
+}
+
 func (j *Journal) ListBlockers(ctx context.Context, query BlockerQuery) ([]Blocker, error) {
 	limit, err := query.limit()
 	if err != nil {

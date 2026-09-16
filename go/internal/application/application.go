@@ -649,7 +649,7 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 	if stateProbe == nil {
 		stateProbe = pool.ProbeThreadState
 	}
-	observe := &runtime.ObservationAdapter{Pool: pool}
+	observe := &runtime.ObservationAdapter{Pool: pool, Blockers: j}
 	localEndpoint, localErr := store.ResolveExistingEndpoint("local", codexHome)
 	if localErr != nil {
 		localEndpoint = endpoint.Endpoint{}
