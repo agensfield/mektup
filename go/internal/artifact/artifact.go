@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"time"
 )
@@ -523,13 +524,21 @@ func (s *Store) reuseExisting(ctx context.Context, name string, expectedBytes in
 	if info.Size() != expectedBytes {
 		return zero, fmt.Errorf("artifact: %w: %w: size %d != %d", ErrExists, ErrConflict, info.Size(), expectedBytes)
 	}
+	before := fileFingerprintOf(info)
 	h := sha256.New()
 	readBytes, err := copyBounded(ctx, h, f, expectedBytes)
 	if err != nil {
-		return zero, fmt.Errorf("artifact: %w: %w: %v", ErrExists, ErrCorrupt, err)
+		return zero, fmt.Errorf("artifact: %w: %w: %w", ErrExists, ErrCorrupt, err)
 	}
 	if readBytes != expectedBytes || !equalBytes(h.Sum(nil), expectedDigest) {
 		return zero, fmt.Errorf("artifact: %w: %w", ErrExists, ErrConflict)
+	}
+	afterInfo, err := f.Stat()
+	if err != nil {
+		return zero, fmt.Errorf("artifact: verify existing destination: %w", err)
+	}
+	if !sameFileFingerprint(before, fileFingerprintOf(afterInfo)) {
+		return zero, fmt.Errorf("artifact: %w: file changed during verification", ErrConflict)
 	}
 	finalInfo, err := s.fs.Lstat(name)
 	if err != nil {
@@ -541,7 +550,7 @@ func (s *Store) reuseExisting(ctx context.Context, name string, expectedBytes in
 	if !finalInfo.Mode().IsRegular() {
 		return zero, ErrNonRegular
 	}
-	if finalInfo.Mode().Perm() != 0o600 || !os.SameFile(info, finalInfo) {
+	if finalInfo.Mode().Perm() != 0o600 || !os.SameFile(info, finalInfo) || !sameFileFingerprint(before, fileFingerprintOf(finalInfo)) {
 		return zero, fmt.Errorf("artifact: %w: %w", ErrExists, ErrConflict)
 	}
 	if opts.MediaType == "" {
@@ -568,6 +577,50 @@ func equalBytes(left, right []byte) bool {
 		}
 	}
 	return true
+}
+
+type fileFingerprint struct {
+	size       int64
+	mode       os.FileMode
+	modTime    time.Time
+	changeTime time.Time
+}
+
+func fileFingerprintOf(info os.FileInfo) fileFingerprint {
+	return fileFingerprint{size: info.Size(), mode: info.Mode(), modTime: info.ModTime(), changeTime: changeTimeOf(info)}
+}
+
+func sameFileFingerprint(left, right fileFingerprint) bool {
+	return left.size == right.size && left.mode == right.mode && left.modTime.Equal(right.modTime) && left.changeTime.Equal(right.changeTime)
+}
+
+// changeTimeOf extracts ctime without binding the package to one platform's
+// syscall.Stat_t shape. Darwin exposes Ctimespec while Linux exposes Ctim;
+// both are handled when the underlying FileInfo provides them.
+func changeTimeOf(info os.FileInfo) time.Time {
+	value := reflect.ValueOf(info.Sys())
+	if !value.IsValid() {
+		return time.Time{}
+	}
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return time.Time{}
+		}
+		value = value.Elem()
+	}
+	for _, name := range []string{"Ctimespec", "Ctim"} {
+		field := value.FieldByName(name)
+		if !field.IsValid() || field.Kind() != reflect.Struct {
+			continue
+		}
+		seconds := field.FieldByName("Sec")
+		nanoseconds := field.FieldByName("Nsec")
+		if !seconds.IsValid() || !nanoseconds.IsValid() || !seconds.CanInt() || !nanoseconds.CanInt() {
+			continue
+		}
+		return time.Unix(seconds.Int(), nanoseconds.Int())
+	}
+	return time.Time{}
 }
 
 func ensurePrivateDir(dir string) error {
