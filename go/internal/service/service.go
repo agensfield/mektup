@@ -220,6 +220,8 @@ type OperationStatus struct {
 	ReplyErrorCode string
 	ReplyDigest    string
 	ReplyBodySize  int64
+	ReplyCommitSeq int64
+	ReplyNativeID  string
 }
 
 type ReplyClaimInput struct {
@@ -227,6 +229,7 @@ type ReplyClaimInput struct {
 	OriginalID     string
 	Digest         string
 	BodySize       int64
+	BodySizeKnown  bool
 	Status         string
 	ReplyRoute     string
 	CustodyRoute   string

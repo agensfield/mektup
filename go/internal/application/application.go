@@ -66,6 +66,7 @@ type Options struct {
 	AgentMode           bool
 	ThreadStateProbe    runtime.ThreadStateProbe
 	HumanGate           receipts.HumanGate
+	ControlInvoker      service.ControlInvoker
 
 	DialerForRoute func(endpoint.Route, bool) connection.ClientDialer
 }
@@ -462,7 +463,7 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 		_ = pool.Close(ctx)
 		return nil, nil, err
 	}
-	remoteJournal := &service.RemoteJournal{Local: &localJournal, Endpoints: store, LocalEndpointID: localEndpoint.ID}
+	remoteJournal := &service.RemoteJournal{Local: &localJournal, Endpoints: store, LocalEndpointID: localEndpoint.ID, Invoke: e.options.ControlInvoker}
 	serviceFactory := func(serviceCtx context.Context, operation cli.Invocation) (messageexecutor.MessagingService, error) {
 		resolver := resolverFor(operation)
 		return &service.Service{Resolver: resolver, Delivery: &runtime.DeliveryAdapter{Pool: pool}, Journal: remoteJournal, Observe: observe}, nil
@@ -533,7 +534,7 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 			return invocationAssertionGate{assertion: strings.ReplaceAll(operation.Option("resolve-as"), "-", "_"), reason: operation.Option("reason"), evidence: operation.Option("evidence")}, nil
 		}
 	}
-	importResolver := applicationImportResolver{observe: observe, store: store, codexHome: codexHome, resolverFor: resolverFor, journal: j}
+	importResolver := applicationImportResolver{observe: observe, store: store, codexHome: codexHome, resolverFor: resolverFor, journal: j, remote: remoteJournal}
 	return pool, messageexecutor.New(messageexecutor.Ports{Service: serviceFactory, Original: originalFactory, Receipts: &storeReceipts, Input: input, PersistReceipt: storeReceipts.Save, EnrichReceipt: func(receipt mektup.Receipt) mektup.Receipt {
 		return enrichMessagingReceipt(receipt, store, codexHome, facts)
 	}, Artifacts: func(context.Context, cli.Invocation) (receipts.SpillWriter, error) {
@@ -674,39 +675,274 @@ type applicationImportResolver struct {
 	codexHome   string
 	resolverFor func(cli.Invocation) runtime.ResolverAdapter
 	journal     *journal.Journal
+	remote      *service.RemoteJournal
 }
 
 func (r applicationImportResolver) ResolveOriginal(ctx context.Context, inv cli.Invocation, imported receipts.Imported) (service.OriginalResolver, error) {
 	if !imported.Trusted && imported.Receipt.Message.MessageID == "" {
 		return nil, &cli.Error{Code: "message_identity_conflict", Message: "portable receipt has no exact message identity", Effect: "rejected", Exit: cli.ExitRejected}
 	}
-	ep, err := r.verifyReceiptRoute(imported.Receipt)
+	routes, err := r.verifyPortableRoutes(imported.Receipt)
 	if err != nil {
 		return nil, portableRouteError(err)
 	}
 	identity := imported.Receipt.Target
-	return runtime.OriginalResolver{Observe: r.observe, Target: service.ResolvedTarget{EndpointID: ep.ID, ThreadID: identity.ThreadID, URI: identity.Resolved, Loaded: true, Persistent: true}}, nil
+	return runtime.OriginalResolver{Observe: r.observe, Target: service.ResolvedTarget{EndpointID: routes.target.ID, ThreadID: identity.ThreadID, URI: identity.Resolved, Loaded: true, Persistent: true}}, nil
 }
 
 func (r applicationImportResolver) ResolveWaitReference(ctx context.Context, _ cli.Invocation, imported receipts.Imported) (string, error) {
-	if imported.Receipt.OperationID == "" || imported.Receipt.ReceiptID == "" {
+	receipt := imported.Receipt
+	if receipt.OperationID == "" || receipt.ReceiptID == "" {
 		return "", portableRouteError(errors.New("portable receipt lacks durable receipt and operation identity"))
 	}
-	if _, err := r.verifyReceiptRoute(imported.Receipt); err != nil {
+	if !receipt.Message.ReplyRequested {
+		return "", &cli.Error{Code: "reply_not_requested", Message: "portable receipt did not request a correlated reply", Effect: "rejected", Exit: cli.ExitRejected}
+	}
+	routes, err := r.verifyPortableRoutes(receipt)
+	if err != nil {
 		return "", portableRouteError(err)
 	}
 	if r.journal == nil {
 		return "", portableRouteError(errors.New("portable wait requires an authoritative local journal"))
 	}
-	stored, err := r.journal.Receipt(ctx, imported.Receipt.ReceiptID)
+	if stored, lookupErr := r.journal.Receipt(ctx, receipt.ReceiptID); lookupErr == nil {
+		projected, projectionErr := receipts.PortableProjection(stored)
+		if projectionErr != nil || !portableAuthorityEqual(receipt, projected) {
+			return "", &cli.Error{Code: "message_identity_conflict", Message: "portable receipt conflicts with durable operation identity", Effect: "rejected", Exit: cli.ExitRejected}
+		}
+		if claim, ok, claimErr := portableReplyClaim(stored, service.Operation{MessageID: stored.Message.MessageID, ReplyRoute: stored.Source.Resolved, CustodyRoute: routes.custody.ID, CustodyStoreID: routes.custodyStore}); claimErr != nil {
+			return "", claimErr
+		} else if ok && r.remote != nil && routes.custody.Route.Kind == endpoint.RouteSSH {
+			op := portableOperation(stored, routes)
+			if err := r.remote.ImportPortableClaim(ctx, op, claim, stored.State); err != nil {
+				return "", portableControlError(err)
+			}
+			if err := r.remote.PersistPortableClaim(ctx, op, claim.ReplyID); err != nil {
+				return "", portableControlError(err)
+			}
+		}
+		return stored.OperationID, nil
+	} else if !errors.Is(lookupErr, journal.ErrNotFound) {
+		return "", portableRouteError(fmt.Errorf("portable local authority lookup failed: %w", lookupErr))
+	}
+	op := portableOperation(receipt, routes)
+	claim, hasClaim, claimErr := portableReplyClaim(receipt, op)
+	if claimErr != nil {
+		return "", claimErr
+	}
+	if hasClaim {
+		if r.remote == nil {
+			return "", portableRouteError(errors.New("portable custody control is unavailable"))
+		}
+		if err := r.remote.ImportPortableClaim(ctx, op, claim, receipt.State); err != nil {
+			return "", portableControlError(err)
+		}
+	} else {
+		if r.remote == nil || routes.custody.Route.Kind != endpoint.RouteSSH {
+			return "", portableRouteError(errors.New("portable custody originalStatus requires a mapped remote control endpoint"))
+		}
+		status, err := r.remote.OriginalStatus(ctx, op)
+		if err != nil {
+			return "", portableControlError(err)
+		}
+		projectionState := mektup.StateAccepted
+		if status.Selection == "pending" {
+			projectionState = mektup.StatePrepared
+		}
+		if err := r.ensurePortableOperation(ctx, op, projectionState); err != nil {
+			return "", err
+		}
+		if err := r.remote.PersistOriginalStatus(ctx, op, status); err != nil {
+			return "", portableControlError(err)
+		}
+		return op.OperationID, nil
+	}
+	if err := r.ensurePortableOperation(ctx, op, receipt.State); err != nil {
+		if hasClaim && r.remote != nil {
+			r.remote.ForgetPortableClaim(claim.ReplyID)
+		}
+		return "", err
+	}
+	if hasClaim && r.remote != nil {
+		if err := r.remote.PersistPortableClaim(ctx, op, claim.ReplyID); err != nil {
+			return "", portableControlError(err)
+		}
+	}
+	return op.OperationID, nil
+}
+
+type portableRoutes struct {
+	source, target, custody endpoint.Endpoint
+	custodyStore            string
+}
+
+func (r applicationImportResolver) verifyPortableRoutes(receipt mektup.Receipt) (portableRoutes, error) {
+	if receipt.Source.EndpointID == "" || receipt.Source.ThreadID == "" || receipt.Source.Resolved == "" || receipt.Target.EndpointID == "" || receipt.Target.ThreadID == "" || receipt.Target.Resolved == "" {
+		return portableRoutes{}, errors.New("portable receipt lacks complete source and target route identities")
+	}
+	source, err := r.verifyIdentityRoute(receipt.Source)
 	if err != nil {
-		return "", portableRouteError(fmt.Errorf("portable receipt is not locally durable: %w", err))
+		return portableRoutes{}, fmt.Errorf("source route: %w", err)
 	}
-	projected, projectionErr := receipts.PortableProjection(stored)
-	if projectionErr != nil || !portableAuthorityEqual(imported.Receipt, projected) {
-		return "", &cli.Error{Code: "message_identity_conflict", Message: "portable receipt conflicts with durable operation identity", Effect: "rejected", Exit: cli.ExitRejected}
+	target, err := r.verifyIdentityRoute(receipt.Target)
+	if err != nil {
+		return portableRoutes{}, fmt.Errorf("target route: %w", err)
 	}
-	return stored.OperationID, nil
+	custodyTuple, present, valid := receiptCustodyTuple(receipt)
+	if !valid || !present || custodyTuple.route == "" || custodyTuple.store == "" {
+		return portableRoutes{}, errors.New("portable receipt lacks a complete custody identity")
+	}
+	custody, err := r.store.ResolveEndpointID(custodyTuple.route, r.codexHome)
+	if err != nil {
+		return portableRoutes{}, err
+	}
+	if err := mektup.ValidateID(custodyTuple.store, mektup.StoreIDPrefix); err != nil {
+		return portableRoutes{}, err
+	}
+	return portableRoutes{source: source, target: target, custody: custody, custodyStore: custodyTuple.store}, nil
+}
+
+func (r applicationImportResolver) verifyIdentityRoute(identity mektup.ReceiptIdentity) (endpoint.Endpoint, error) {
+	ep, err := r.store.ResolveEndpointID(identity.EndpointID, r.codexHome)
+	if err != nil {
+		return endpoint.Endpoint{}, err
+	}
+	address, err := mektup.ParseThreadURI(identity.Resolved)
+	if err != nil || address.ThreadID != identity.ThreadID {
+		return endpoint.Endpoint{}, errors.New("thread URI does not match pinned thread identity")
+	}
+	return ep, nil
+}
+
+func portableOperation(receipt mektup.Receipt, routes portableRoutes) service.Operation {
+	return service.Operation{OperationID: receipt.OperationID, MessageID: receipt.Message.MessageID, SourceRoute: receipt.Source.Resolved, TargetRoute: receipt.Target.Resolved, Semantics: receipt.Operation, ReplyRoute: receipt.Source.Resolved, ReplyEndpointID: receipt.Source.EndpointID, CustodyRoute: routes.custody.ID, CustodyStoreID: routes.custodyStore, Digest: receipt.Message.PayloadSHA256, BodySize: int64(receipt.Message.PayloadBytes), ReplyRequested: receipt.Message.ReplyRequested, SourceEndpointID: receipt.Source.EndpointID, TargetEndpointID: receipt.Target.EndpointID}
+}
+
+func (r applicationImportResolver) ensurePortableOperation(ctx context.Context, op service.Operation, state mektup.EvidenceState) error {
+	if existing, err := r.journal.Operation(ctx, op.OperationID); err == nil {
+		if !samePortableOperation(existing, op) {
+			return &cli.Error{Code: "message_identity_conflict", Message: "portable operation conflicts with local authority", Effect: "rejected", Exit: cli.ExitRejected}
+		}
+		return nil
+	} else if !errors.Is(err, journal.ErrNotFound) {
+		return portableRouteError(err)
+	}
+	if existing, err := r.journal.OperationByMessage(ctx, op.MessageID); err == nil {
+		if !samePortableOperation(existing, op) {
+			return &cli.Error{Code: "message_identity_conflict", Message: "portable message conflicts with local authority", Effect: "rejected", Exit: cli.ExitRejected}
+		}
+		return nil
+	} else if !errors.Is(err, journal.ErrNotFound) {
+		return portableRouteError(err)
+	}
+	if state == mektup.StateReplyAccepted || state == mektup.StateReplyObserved || state == mektup.StateReplyOutcomeUnknown {
+		state = mektup.StateAccepted
+	}
+	err := r.journal.ImportOperation(ctx, journal.Operation{OperationID: op.OperationID, MessageID: op.MessageID, SourceRoute: op.SourceRoute, TargetRoute: op.TargetRoute, Semantics: op.Semantics, SourceEndpointID: op.SourceEndpointID, TargetEndpointID: op.TargetEndpointID, ReplyRoute: op.ReplyRoute, ReplyEndpointID: op.ReplyEndpointID, ReplyThreadID: threadIDFromURI(op.ReplyRoute), CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID, Digest: op.Digest, BodySize: op.BodySize}, journal.EvidenceState(state), "portable_import")
+	if errors.Is(err, journal.ErrIdentityConflict) {
+		return &cli.Error{Code: "message_identity_conflict", Message: "portable operation conflicts with local authority", Effect: "rejected", Exit: cli.ExitRejected}
+	}
+	if err != nil {
+		return portableRouteError(err)
+	}
+	return nil
+}
+
+func samePortableOperation(existing journal.OperationRecord, op service.Operation) bool {
+	return existing.OperationID == op.OperationID && existing.MessageID == op.MessageID && existing.SourceRoute == op.SourceRoute && existing.TargetRoute == op.TargetRoute && existing.Semantics == op.Semantics && existing.SourceEndpointID == op.SourceEndpointID && existing.TargetEndpointID == op.TargetEndpointID && existing.ReplyRoute == op.ReplyRoute && existing.ReplyEndpointID == op.ReplyEndpointID && existing.ReplyThreadID == threadIDFromURI(op.ReplyRoute) && existing.CustodyRoute == op.CustodyRoute && existing.CustodyStoreID == op.CustodyStoreID && existing.Digest == op.Digest && existing.BodySize == op.BodySize
+}
+
+func portableReplyClaim(receipt mektup.Receipt, op service.Operation) (service.ReplyClaimInput, bool, error) {
+	var selected *service.ReplyClaimInput
+	for _, evidence := range receipt.Evidence {
+		if evidence.Reference == "" || mektup.ValidateID(evidence.Reference, mektup.MessageIDPrefix) != nil {
+			continue
+		}
+		in := service.ReplyClaimInput{ReplyID: evidence.Reference, OriginalID: op.MessageID, ReplyRoute: op.ReplyRoute, CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID}
+		if value, present := evidence.Details["replyStatus"]; present {
+			status, ok := value.(string)
+			if !ok || (status != "success" && status != "error") {
+				return service.ReplyClaimInput{}, false, errors.New("portable reply status metadata is malformed")
+			}
+			in.Status = status
+		}
+		if value, present := evidence.Details["replyDigest"]; present {
+			digest, ok := value.(string)
+			if !ok || !portableDigestValid(digest) {
+				return service.ReplyClaimInput{}, false, errors.New("portable reply digest metadata is malformed")
+			}
+			in.Digest = digest
+		}
+		if value, present := evidence.Details["replyBodyBytes"]; present {
+			body, ok := portableBodySize(value)
+			if !ok {
+				return service.ReplyClaimInput{}, false, errors.New("portable reply body size metadata is malformed")
+			}
+			in.BodySize, in.BodySizeKnown = body, true
+		}
+		if value, present := evidence.Details["replyErrorCode"]; present {
+			code, ok := value.(string)
+			if !ok || code == "" || in.Status != "error" {
+				return service.ReplyClaimInput{}, false, errors.New("portable reply error metadata is malformed")
+			}
+			in.ErrorCode = code
+		}
+		if in.Status == "success" && in.ErrorCode != "" {
+			return service.ReplyClaimInput{}, false, errors.New("portable success reply carries an error code")
+		}
+		if selected == nil {
+			selected = &in
+		} else if *selected != in {
+			return service.ReplyClaimInput{}, false, errors.New("portable receipt carries conflicting reply metadata")
+		}
+	}
+	if selected != nil {
+		return *selected, true, nil
+	}
+	return service.ReplyClaimInput{}, false, nil
+}
+
+func portableDigestValid(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") || strings.ToLower(value) != value {
+		return false
+	}
+	for _, c := range value[len("sha256:"):] {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func portableBodySize(value any) (int64, bool) {
+	switch number := value.(type) {
+	case int:
+		return int64(number), number >= 0
+	case int64:
+		return number, number >= 0
+	case uint64:
+		if number > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(number), true
+	case float64:
+		if number < 0 || number >= 9223372036854775808 || number != float64(int64(number)) {
+			return 0, false
+		}
+		return int64(number), true
+	default:
+		return 0, false
+	}
+}
+
+func portableControlError(err error) error {
+	if errors.Is(err, journal.ErrNotFound) {
+		return &cli.Error{Code: "message_not_found", Message: "portable original relationship is not present in authoritative custody", Effect: "rejected", Exit: cli.ExitRejected}
+	}
+	if errors.Is(err, journal.ErrIdentityConflict) {
+		return &cli.Error{Code: "message_identity_conflict", Message: "portable custody metadata conflicts with authoritative custody", Effect: "rejected", Exit: cli.ExitRejected}
+	}
+	return &cli.Error{Code: "reply_route_unavailable", Message: "portable custody control could not validate the pinned reply claim", Effect: "rejected", Exit: cli.ExitRejected}
 }
 
 func portableRouteError(err error) error {
@@ -785,28 +1021,6 @@ func receiptCustodyTuple(receipt mektup.Receipt) (custodyTuple, bool, bool) {
 		}
 	}
 	return tuple, tuple.route != "" || tuple.store != "", valid
-}
-
-func (r applicationImportResolver) verifyReceiptRoute(receipt mektup.Receipt) (endpoint.Endpoint, error) {
-	identity := receipt.Target
-	if identity.EndpointID == "" || identity.ThreadID == "" || identity.Resolved == "" {
-		return endpoint.Endpoint{}, errors.New("portable receipt lacks an exact target route")
-	}
-	ep, err := r.store.ResolveEndpointID(identity.EndpointID, r.codexHome)
-	if err != nil {
-		return endpoint.Endpoint{}, fmt.Errorf("portable receipt endpoint is not locally established: %w", err)
-	}
-	address, err := mektup.ParseThreadURI(identity.Resolved)
-	if err != nil || address.ThreadID != identity.ThreadID {
-		return endpoint.Endpoint{}, errors.New("portable receipt target thread identity is inconsistent")
-	}
-	if address.Endpoint != ep.Alias {
-		mapped, mapErr := r.store.ResolveEndpoint(address.Endpoint, r.codexHome)
-		if mapErr != nil || mapped.ID != ep.ID {
-			return endpoint.Endpoint{}, errors.New("portable receipt target alias is not pinned to the configured endpoint")
-		}
-	}
-	return ep, nil
 }
 
 func threadIDFromURI(uri string) string {

@@ -275,13 +275,30 @@ func (s *Service) waitResult(status OperationStatus, incomplete bool, gap string
 	if status.State == mektup.StateReplyAccepted || status.State == mektup.StateReplyObserved {
 		acceptedAt = now
 	}
-	message := mektup.ReceiptMessage{MessageID: status.MessageID, InReplyTo: status.InReplyTo, Kind: kind, ReplyRequested: status.ReplyRequested, PayloadBytes: uint64(status.BodySize), PayloadSHA256: status.Digest, TurnID: status.TurnID, AcceptedAt: acceptedAt}
+	message := mektup.ReceiptMessage{MessageID: status.MessageID, InReplyTo: status.InReplyTo, Kind: kind, ReplyRequested: status.ReplyRequested, PayloadBytes: uint64(status.BodySize), PayloadSHA256: status.Digest, ClientMessageID: status.MessageID, TurnID: status.TurnID, AcceptedAt: acceptedAt}
 	if status.ReplyID != "" {
 		message.ReplyAt = now
+	}
+	details := map[string]any{"replyStatus": status.ReplyStatus, "custodyRoute": status.CustodyRoute, "custodyStoreId": status.CustodyStoreID}
+	if status.ReplyID != "" {
+		details["replyDigest"] = status.ReplyDigest
+		details["replyBodyBytes"] = status.ReplyBodySize
+		if status.ReplyErrorCode != "" {
+			details["replyErrorCode"] = status.ReplyErrorCode
+		}
+		if status.ReplyCommitSeq > 0 {
+			details["commitSeq"] = status.ReplyCommitSeq
+		}
+		if status.ReplyNativeID != "" {
+			details["nativeItemId"] = status.ReplyNativeID
+		}
 	}
 	receipt := mektup.Receipt{Schema: mektup.ReceiptSchema, ReceiptID: mektup.NewReceiptID(), OperationID: status.OperationID, Operation: status.Semantics, State: status.State,
 		Source: mektup.ReceiptIdentity{EndpointID: status.SourceEndpointID, ThreadID: threadID(status.SourceRoute), Resolved: status.SourceRoute},
 		Target: mektup.ReceiptIdentity{EndpointID: status.TargetEndpointID, ThreadID: threadID(status.TargetRoute), Resolved: status.TargetRoute}, Message: message,
-		Evidence: []mektup.EvidenceRecord{{State: status.State, At: now, Reference: status.ReplyID, Details: map[string]any{"replyStatus": status.ReplyStatus, "custodyRoute": status.CustodyRoute, "custodyStoreId": status.CustodyStoreID}}}, CreatedAt: now, UpdatedAt: now}
+		Evidence: []mektup.EvidenceRecord{{State: status.State, At: now, Reference: status.ReplyID, Details: details}}, CreatedAt: now, UpdatedAt: now}
+	if status.ReplyNativeID != "" && status.ReplyDigest != "" {
+		receipt.ContentRef = &mektup.ContentRef{EndpointID: status.ReplyEndpointID, ThreadID: threadID(status.ReplyRoute), ItemID: status.ReplyNativeID, ClientMessageID: status.ReplyID, PayloadBytes: uint64(status.ReplyBodySize), PayloadSHA256: status.ReplyDigest}
+	}
 	return WaitResult{State: status.State, ReplyID: status.ReplyID, ReplyStatus: status.ReplyStatus, Incomplete: incomplete, GapReason: gap, Receipt: receipt}
 }

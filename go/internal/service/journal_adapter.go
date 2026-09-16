@@ -175,12 +175,15 @@ func (a SQLiteJournal) Lookup(ctx context.Context, ref string) (OperationStatus,
 			if status.State != mektup.StateReplyAccepted && status.State != mektup.StateReplyObserved {
 				status.State = mektup.EvidenceState(claim.State)
 				status.ReplyID, status.ReplyStatus, status.ReplyErrorCode = claim.ReplyID, claim.Status, claim.ReplyErrorCode
-				status.ReplyDigest, status.ReplyBodySize = claim.Digest, claim.BodySize
+				status.ReplyDigest, status.ReplyBodySize, status.ReplyCommitSeq = claim.Digest, claim.BodySize, claim.CommitSeq
+				if nativeID, _, _, _, observationErr := a.Inner.Observation(ctx, claim.ReplyID); observationErr == nil {
+					status.ReplyNativeID = nativeID
+				}
 			}
 		} else if claim.State == journal.StateReplyOutcomeUnknown && status.State != mektup.StateReplyAccepted && status.State != mektup.StateReplyObserved {
 			status.State = mektup.StateReplyOutcomeUnknown
 			status.ReplyID, status.ReplyStatus, status.ReplyErrorCode = claim.ReplyID, claim.Status, claim.ReplyErrorCode
-			status.ReplyDigest, status.ReplyBodySize = claim.Digest, claim.BodySize
+			status.ReplyDigest, status.ReplyBodySize, status.ReplyCommitSeq = claim.Digest, claim.BodySize, claim.CommitSeq
 		}
 	}
 	return status, nil

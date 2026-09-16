@@ -143,6 +143,42 @@ func (j *Journal) OriginalStatus(ctx context.Context, originalID string) (Origin
 	return out, err
 }
 
+// ImportTerminalUnknown projects a tokenless authoritative expired claim into
+// a successor journal without creating dispatch authority.
+func (j *Journal) ImportTerminalUnknown(ctx context.Context, in ClaimInput) error {
+	if in.ReplyID == "" || in.OriginalID == "" || in.Digest == "" || in.BodySize < 0 || (in.Status != "success" && in.Status != "error") || in.ReplyRoute == "" || in.CustodyRoute == "" || in.CustodyStoreID == "" {
+		return fmt.Errorf("journal: invalid imported terminal unknown")
+	}
+	now := j.nowUnix()
+	return j.withTx(ctx, func(tx *sql.Tx) error {
+		var route, custody, storeID string
+		if err := tx.QueryRow("SELECT reply_route,custody_route,custody_store_id FROM operations WHERE message_id=?", in.OriginalID).Scan(&route, &custody, &storeID); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrNotFound
+			}
+			return err
+		}
+		if route != in.ReplyRoute || custody != in.CustodyRoute || storeID != in.CustodyStoreID {
+			return ErrIdentityConflict
+		}
+		var existing ReplyClaim
+		err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_error_code,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", in.ReplyID), &existing)
+		if err == nil {
+			if existing.OriginalID != in.OriginalID || existing.Digest != in.Digest || existing.BodySize != in.BodySize || existing.Status != in.Status || existing.ReplyErrorCode != in.ErrorCode || existing.ReplyRoute != in.ReplyRoute || existing.CustodyRoute != in.CustodyRoute || existing.CustodyStoreID != in.CustodyStoreID || existing.State != StateReplyOutcomeUnknown {
+				return ErrIdentityConflict
+			}
+			return nil
+		}
+		if err != sql.ErrNoRows {
+			return err
+		}
+		if _, err := tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", in.ReplyID, in.OriginalID, in.Digest, in.BodySize, in.Status, in.ReplyRoute, in.CustodyRoute, in.CustodyStoreID, "", "", int64(0), string(StateReplyOutcomeUnknown), now, now, in.ErrorCode); err != nil {
+			return err
+		}
+		return emit(tx, "reply.abandoned", "", in.ReplyID, StateReplyOutcomeUnknown, now)
+	})
+}
+
 func validateOriginalSelectedClaim(claim ReplyClaim, seq int64, native string, winner bool) error {
 	if mektup.ValidateID(claim.ReplyID, mektup.MessageIDPrefix) != nil || !validDigest(claim.Digest) || claim.BodySize < 0 || (claim.Status != "success" && claim.Status != "error") || (claim.Status == "success" && claim.ReplyErrorCode != "") || seq <= 0 {
 		return fmt.Errorf("%w: corrupt selected reply metadata", ErrCorrupt)

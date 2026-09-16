@@ -6,14 +6,24 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	mektup "github.com/agensfield/mektup/go"
+	"github.com/agensfield/mektup/go/internal/controlreceiver"
 	"github.com/agensfield/mektup/go/internal/endpoint"
 	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/sshproxy"
 )
+
+type canonicalStatusResolver struct {
+	store controlreceiver.Store
+}
+
+func (r canonicalStatusResolver) Resolve(context.Context, string, string) (controlreceiver.Store, error) {
+	return r.store, nil
+}
 
 const (
 	remoteCustodyEndpoint   = "ep_0198f0e0-0000-7000-8000-000000000071"
@@ -148,6 +158,148 @@ func TestRemoteJournalRejectsSwappedResponseAndRequiresMapping(t *testing.T) {
 	missing := &RemoteJournal{Local: router.Local, Endpoints: endpoint.NewStore(filepath.Join(root, "missing", "endpoints.json"), filepath.Join(root, "missing-state")), LocalEndpointID: bodyDestinationEndpoint}
 	if _, err := missing.ClaimReply(context.Background(), ReplyClaimInput{ReplyID: remoteReply, OriginalID: remoteOriginal, Digest: op.Digest, BodySize: 1, Status: "success", ReplyRoute: op.ReplyRoute, CustodyRoute: remoteCustodyEndpoint, CustodyStoreID: remoteCustodyStore, Owner: "sender"}); err == nil {
 		t.Fatal("unmapped remote custody accepted")
+	}
+}
+
+func TestRemoteJournalOriginalStatusUsesCanonicalReceiverSelections(t *testing.T) {
+	root := t.TempDir()
+	server, err := journal.Open(context.Background(), journal.Options{StateDir: filepath.Join(root, "server")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	client, err := journal.Open(context.Background(), journal.Options{StateDir: filepath.Join(root, "client")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	store := endpoint.NewStore(filepath.Join(root, "config", "endpoints.json"), filepath.Join(root, "state"))
+	remoteRoute, _ := endpoint.SSHRoute("custody.example")
+	if err := store.Add(endpoint.Endpoint{ID: remoteCustodyEndpoint, Alias: "custody", Route: remoteRoute, Herdr: endpoint.HerdrDisabled}); err != nil {
+		t.Fatal(err)
+	}
+	bodyRoute, _ := endpoint.UnixRoute(filepath.Join(root, "body.sock"))
+	if err := store.Add(endpoint.Endpoint{ID: bodyDestinationEndpoint, Alias: "body", Route: bodyRoute, Herdr: endpoint.HerdrDisabled}); err != nil {
+		t.Fatal(err)
+	}
+	resolver := canonicalStatusResolver{store: controlreceiver.Store{Journal: server, StoreID: server.StoreID(), EndpointID: remoteCustodyEndpoint, CloseFunc: func() error { return nil }}}
+	receiver := controlreceiver.Receiver{
+		Registry:        resolver,
+		LocalEndpointID: remoteCustodyEndpoint,
+		Destination: controlreceiver.DestinationResolverFunc(func(_ context.Context, endpointID, uri, threadID string) error {
+			if endpointID != bodyDestinationEndpoint || uri != "codex://body/thread/source" || threadID != "source" {
+				return controlreceiver.ErrRelationshipMismatch
+			}
+			return nil
+		}),
+	}
+	router := &RemoteJournal{
+		Local:           &SQLiteJournal{Inner: client},
+		Endpoints:       store,
+		LocalEndpointID: bodyDestinationEndpoint,
+		Invoke: func(ctx context.Context, _ endpoint.Route, request sshproxy.ControlRequest) ([]byte, error) {
+			data, err := json.Marshal(request)
+			if err != nil {
+				return nil, err
+			}
+			// The canonical receiver contract requires the optional
+			// replyMessageId key to be absent on originalStatus requests.
+			// The shared wire struct on this base still serializes its empty
+			// value; model the approved wire document at this seam.
+			var document map[string]json.RawMessage
+			if err := json.Unmarshal(data, &document); err != nil {
+				return nil, err
+			}
+			delete(document, "replyMessageId")
+			data, err = json.Marshal(document)
+			if err != nil {
+				return nil, err
+			}
+			return receiver.Receive(ctx, data)
+		},
+	}
+	newOperation := func(operationID, messageID string) Operation {
+		return Operation{OperationID: operationID, MessageID: messageID, SourceRoute: "codex://body/thread/source", TargetRoute: "codex://body/thread/target", Semantics: "message", ReplyRoute: "codex://body/thread/source", ReplyEndpointID: bodyDestinationEndpoint, CustodyRoute: remoteCustodyEndpoint, CustodyStoreID: server.StoreID(), Digest: "sha256:" + strings.Repeat("a", 64), BodySize: 4, SourceEndpointID: bodyDestinationEndpoint, TargetEndpointID: bodyDestinationEndpoint}
+	}
+	importOriginal := func(op Operation) {
+		err := server.ImportOperation(context.Background(), journal.Operation{OperationID: op.OperationID, MessageID: op.MessageID, SourceRoute: op.SourceRoute, TargetRoute: op.TargetRoute, Semantics: op.Semantics, SourceEndpointID: op.SourceEndpointID, TargetEndpointID: op.TargetEndpointID, ReplyRoute: op.ReplyRoute, ReplyEndpointID: op.ReplyEndpointID, ReplyThreadID: "source", CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID, Digest: op.Digest, BodySize: op.BodySize}, journal.StatePrepared, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	pending := newOperation("op_0198f0e0-0000-7000-8000-000000000081", "msg_0198f0e0-0000-7000-8000-000000000082")
+	importOriginal(pending)
+	if err := client.ImportOperation(context.Background(), journal.Operation{OperationID: pending.OperationID, MessageID: pending.MessageID, SourceRoute: pending.SourceRoute, TargetRoute: pending.TargetRoute, Semantics: pending.Semantics, SourceEndpointID: pending.SourceEndpointID, TargetEndpointID: pending.TargetEndpointID, ReplyRoute: pending.ReplyRoute, ReplyEndpointID: pending.ReplyEndpointID, ReplyThreadID: "source", CustodyRoute: pending.CustodyRoute, CustodyStoreID: pending.CustodyStoreID, Digest: pending.Digest, BodySize: pending.BodySize}, journal.StatePrepared, "portable_import"); err != nil {
+		t.Fatal(err)
+	}
+	if imported, err := client.Operation(context.Background(), pending.OperationID); err != nil || imported.SourceEndpointID == "" || imported.TargetEndpointID == "" {
+		t.Fatalf("client imported operation=%+v err=%v", imported, err)
+	}
+	result, err := router.OriginalStatus(context.Background(), pending)
+	if err != nil || result.Selection != "pending" {
+		t.Fatalf("pending result=%+v err=%v", result, err)
+	}
+	if status, err := router.Lookup(context.Background(), pending.OperationID); err != nil || status.State != mektup.StatePrepared {
+		t.Fatalf("cacheless pending lookup=%+v err=%v", status, err)
+	}
+	pendingClaim, err := server.ClaimReply(context.Background(), journal.ClaimInput{ReplyID: "msg_0198f0e0-0000-7000-8000-000000000089", OriginalID: pending.MessageID, Digest: pending.Digest, BodySize: pending.BodySize, Status: "success", ReplyRoute: pending.ReplyRoute, CustodyRoute: pending.CustodyRoute, CustodyStoreID: pending.CustodyStoreID, Owner: "receiver"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.CommitReply(context.Background(), pendingClaim.ReplyID, pendingClaim.Owner, pendingClaim.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	client, err = journal.Open(context.Background(), journal.Options{StateDir: filepath.Join(root, "client")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restarted := &RemoteJournal{Local: &SQLiteJournal{Inner: client}, Endpoints: store, LocalEndpointID: bodyDestinationEndpoint, Invoke: func(ctx context.Context, _ endpoint.Route, request sshproxy.ControlRequest) ([]byte, error) {
+		data, err := json.Marshal(request)
+		if err != nil {
+			return nil, err
+		}
+		var document map[string]json.RawMessage
+		if err := json.Unmarshal(data, &document); err != nil {
+			return nil, err
+		}
+		delete(document, "replyMessageId")
+		data, err = json.Marshal(document)
+		if err != nil {
+			return nil, err
+		}
+		return receiver.Receive(ctx, data)
+	}}
+	if status, err := restarted.Lookup(context.Background(), pending.OperationID); err != nil || status.State != mektup.StateReplyAccepted || status.ReplyID != pendingClaim.ReplyID {
+		t.Fatalf("restart winner lookup=%+v err=%v", status, err)
+	}
+	winner := newOperation("op_0198f0e0-0000-7000-8000-000000000083", "msg_0198f0e0-0000-7000-8000-000000000084")
+	importOriginal(winner)
+	winnerClaim, err := server.ClaimReply(context.Background(), journal.ClaimInput{ReplyID: "msg_0198f0e0-0000-7000-8000-000000000085", OriginalID: winner.MessageID, Digest: winner.Digest, BodySize: winner.BodySize, Status: "success", ReplyRoute: winner.ReplyRoute, CustodyRoute: winner.CustodyRoute, CustodyStoreID: winner.CustodyStoreID, Owner: "receiver"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.CommitReply(context.Background(), winnerClaim.ReplyID, winnerClaim.Owner, winnerClaim.Token); err != nil {
+		t.Fatal(err)
+	}
+	result, err = router.OriginalStatus(context.Background(), winner)
+	if err != nil || result.Selection != "winner" || result.ReplyID != winnerClaim.ReplyID || result.CommitSeq < 1 {
+		t.Fatalf("winner result=%+v err=%v", result, err)
+	}
+	unknown := newOperation("op_0198f0e0-0000-7000-8000-000000000086", "msg_0198f0e0-0000-7000-8000-000000000087")
+	importOriginal(unknown)
+	unknownClaim, err := server.ClaimReply(context.Background(), journal.ClaimInput{ReplyID: "msg_0198f0e0-0000-7000-8000-000000000088", OriginalID: unknown.MessageID, Digest: unknown.Digest, BodySize: unknown.BodySize, Status: "error", ErrorCode: "E_REMOTE", ReplyRoute: unknown.ReplyRoute, CustodyRoute: unknown.CustodyRoute, CustodyStoreID: unknown.CustodyStoreID, Owner: "receiver"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.AbandonReply(context.Background(), unknownClaim.ReplyID, unknownClaim.Owner, unknownClaim.Token); err != nil {
+		t.Fatal(err)
+	}
+	result, err = router.OriginalStatus(context.Background(), unknown)
+	if err != nil || result.Selection != "terminal_unknown" || result.ReplyID != unknownClaim.ReplyID || result.EventSeq < 1 || result.ErrorCode != "E_REMOTE" {
+		t.Fatalf("unknown result=%+v err=%v", result, err)
 	}
 }
 

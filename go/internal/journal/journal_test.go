@@ -130,6 +130,31 @@ func TestPreparedAndDispatchRecoveryIsConservative(t *testing.T) {
 	}
 }
 
+func TestImportOperationCreatesNoDispatchAttempt(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	op := Operation{OperationID: "op_0198f0e0-0000-7000-8000-000000000091", MessageID: "msg_0198f0e0-0000-7000-8000-000000000092", SourceRoute: "codex://source/thread/source", TargetRoute: "codex://target/thread/target", Semantics: "message", SourceEndpointID: "ep_0198f0e0-0000-7000-8000-000000000093", TargetEndpointID: "ep_0198f0e0-0000-7000-8000-000000000094", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", BodySize: 4}
+	if err := j.ImportOperation(context.Background(), op, StatePrepared, "portable_import"); err != nil {
+		t.Fatal(err)
+	}
+	stored, err := j.Operation(context.Background(), op.OperationID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != StatePrepared || stored.AttemptOwner != "" || stored.AttemptToken != "" || stored.AttemptLeaseUntil != 0 {
+		t.Fatalf("import created dispatch authority: %+v", stored)
+	}
+	var attempts int
+	if err := j.db.QueryRow("SELECT COUNT(*) FROM attempts WHERE operation_id=?", op.OperationID).Scan(&attempts); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Fatalf("import created %d attempt rows", attempts)
+	}
+}
+
 func TestRecoveryDoesNotTouchLiveAttempt(t *testing.T) {
 	dir := t.TempDir()
 	var now atomic.Int64

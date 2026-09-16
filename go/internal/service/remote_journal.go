@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -59,6 +60,21 @@ type remoteClaim struct {
 	lease     *sshproxy.Lease
 	state     mektup.EvidenceState
 	joined    bool
+	portable  bool
+	validated *OperationStatus
+}
+
+type OriginalStatusResult struct {
+	Selection    string
+	ReplyID      string
+	Digest       string
+	BodySize     int64
+	Status       string
+	ErrorCode    string
+	State        mektup.EvidenceState
+	CommitSeq    int64
+	EventSeq     int64
+	NativeItemID string
 }
 
 func (c remoteClaim) activeOwner() bool { return c.input.Owner != "" && c.lease != nil }
@@ -131,7 +147,112 @@ func (r *RemoteJournal) Lookup(ctx context.Context, ref string) (OperationStatus
 	if err := r.init(); err != nil {
 		return OperationStatus{}, err
 	}
-	return r.Local.Lookup(ctx, ref)
+	status, err := r.Local.Lookup(ctx, ref)
+	if err != nil {
+		return OperationStatus{}, err
+	}
+	if status.ReplyID != "" && status.ReplyCommitSeq > 0 && (status.State == mektup.StateReplyAccepted || status.State == mektup.StateReplyObserved) {
+		return status, nil
+	}
+	claims := r.claimsForOriginal(status.MessageID)
+	var terminal []OperationStatus
+	for _, claim := range claims {
+		_, remote, routeErr := r.route(claim.input.CustodyRoute)
+		if routeErr != nil {
+			return OperationStatus{}, routeErr
+		}
+		if !remote {
+			continue
+		}
+		remoteStatus, statusErr := r.status(ctx, claim, false)
+		if statusErr != nil {
+			return OperationStatus{}, statusErr
+		}
+		if remoteStatus.State == mektup.StateReplyAccepted || remoteStatus.State == mektup.StateReplyObserved || remoteStatus.State == mektup.StateReplyOutcomeUnknown {
+			terminal = append(terminal, remoteStatus)
+		}
+	}
+	// A cacheless/restarted portable wait has no in-memory claim to drive the
+	// ordinary status path.  The original-scoped control operation is the
+	// durable authority in that case.  It is metadata-only and can never create
+	// a dispatch attempt.
+	needsOriginalStatus := len(terminal) == 0
+	for _, candidate := range terminal {
+		if candidate.State == mektup.StateReplyOutcomeUnknown && candidate.ReplyCommitSeq == 0 {
+			needsOriginalStatus = true
+			break
+		}
+	}
+	if needsOriginalStatus && status.Operation.ReplyRoute != "" && status.Operation.CustodyRoute != "" {
+		_, remote, routeErr := r.route(status.Operation.CustodyRoute)
+		if routeErr != nil {
+			return OperationStatus{}, routeErr
+		}
+		if remote {
+			original, statusErr := r.OriginalStatus(ctx, status.Operation)
+			if statusErr != nil {
+				return OperationStatus{}, statusErr
+			}
+			if original.Selection != "pending" {
+				if statusErr := r.PersistOriginalStatus(ctx, status.Operation, original); statusErr != nil {
+					return OperationStatus{}, statusErr
+				}
+				status.State = original.State
+				status.ReplyID = original.ReplyID
+				status.ReplyStatus = original.Status
+				status.ReplyErrorCode = original.ErrorCode
+				status.ReplyDigest = original.Digest
+				status.ReplyBodySize = original.BodySize
+				status.ReplyCommitSeq = original.CommitSeq
+				status.ReplyNativeID = original.NativeItemID
+				terminal = nil
+			} else if len(terminal) > 0 {
+				return OperationStatus{}, journal.ErrIdentityConflict
+			}
+		}
+	}
+	if len(terminal) > 0 {
+		sort.SliceStable(terminal, func(i, j int) bool {
+			leftSeq, rightSeq := terminal[i].ReplyCommitSeq, terminal[j].ReplyCommitSeq
+			if leftSeq == 0 {
+				return false
+			}
+			if rightSeq == 0 {
+				return true
+			}
+			if leftSeq != rightSeq {
+				return leftSeq < rightSeq
+			}
+			return terminal[i].ReplyID < terminal[j].ReplyID
+		})
+		winner := terminal[0]
+		if winner.ReplyCommitSeq > 0 {
+			for _, candidate := range terminal[1:] {
+				if candidate.ReplyCommitSeq == winner.ReplyCommitSeq && candidate.ReplyID != winner.ReplyID {
+					return OperationStatus{}, journal.ErrIdentityConflict
+				}
+			}
+		}
+		status.State, status.ReplyID, status.ReplyStatus, status.ReplyErrorCode = winner.State, winner.ReplyID, winner.ReplyStatus, winner.ReplyErrorCode
+		status.ReplyDigest, status.ReplyBodySize, status.ReplyCommitSeq, status.ReplyNativeID = winner.ReplyDigest, winner.ReplyBodySize, winner.ReplyCommitSeq, winner.ReplyNativeID
+		if err := r.persistRemoteStatus(ctx, status.Operation, winner); err != nil {
+			return OperationStatus{}, err
+		}
+	}
+	return status, nil
+}
+
+func (r *RemoteJournal) claimsForOriginal(originalID string) []remoteClaim {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	claims := make([]remoteClaim, 0)
+	for _, claim := range r.claims {
+		if claim.input.OriginalID == originalID {
+			claims = append(claims, claim)
+		}
+	}
+	sort.SliceStable(claims, func(i, j int) bool { return claims[i].input.ReplyID < claims[j].input.ReplyID })
+	return claims
 }
 
 func (r *RemoteJournal) ClaimReply(ctx context.Context, input ReplyClaimInput) (ReplyClaim, error) {
@@ -338,6 +459,255 @@ func (r *RemoteJournal) ObserveVerifiedReply(ctx context.Context, status Operati
 	r.claims[input.ReplyID] = remoteClaim{input: input, operation: status.Operation, request: request, route: route, state: mektup.StateReplyObserved}
 	r.mu.Unlock()
 	return nil
+}
+
+// ImportPortableClaim seeds tokenless metadata for querying an existing remote
+// claim. It never creates a claim or transfers dispatch authority.
+func (r *RemoteJournal) ImportPortableClaim(ctx context.Context, op Operation, input ReplyClaimInput, state mektup.EvidenceState) error {
+	if err := r.init(); err != nil {
+		return err
+	}
+	if input.ReplyID == "" || input.OriginalID == "" {
+		return ErrRemoteCustodyBinding
+	}
+	if input.ReplyRoute == "" {
+		input.ReplyRoute = op.ReplyRoute
+	}
+	if input.CustodyRoute == "" {
+		input.CustodyRoute = op.CustodyRoute
+	}
+	if input.CustodyStoreID == "" {
+		input.CustodyStoreID = op.CustodyStoreID
+	}
+	if input.ReplyRoute == "" || input.CustodyRoute == "" || input.CustodyStoreID == "" {
+		return ErrRemoteCustodyBinding
+	}
+	route, remote, err := r.route(input.CustodyRoute)
+	if err != nil {
+		return err
+	}
+	if !remote {
+		return ErrRemoteCustodyUnavailable
+	}
+	request, err := r.request(op, input, "status", op.ReplyEndpointID)
+	if err != nil {
+		return err
+	}
+	claim := remoteClaim{input: input, operation: op, request: request, route: route, state: state, portable: true}
+	r.mu.Lock()
+	existing, exists := r.claims[input.ReplyID]
+	r.mu.Unlock()
+	if exists {
+		if existing.input.OriginalID != input.OriginalID || existing.input.ReplyRoute != input.ReplyRoute || existing.input.CustodyRoute != input.CustodyRoute || existing.input.CustodyStoreID != input.CustodyStoreID {
+			return journal.ErrIdentityConflict
+		}
+		observed, err := r.status(ctx, claim, false)
+		if err == nil {
+			claim.validated = &observed
+			r.mu.Lock()
+			r.claims[input.ReplyID] = claim
+			r.mu.Unlock()
+		}
+		return err
+	}
+	r.mu.Lock()
+	r.claims[input.ReplyID] = claim
+	r.mu.Unlock()
+	observed, err := r.status(ctx, claim, false)
+	if err != nil {
+		r.mu.Lock()
+		if current, ok := r.claims[input.ReplyID]; ok && current.portable {
+			delete(r.claims, input.ReplyID)
+		}
+		r.mu.Unlock()
+		return err
+	}
+	r.mu.Lock()
+	if current, ok := r.claims[input.ReplyID]; ok && current.portable {
+		observedCopy := observed
+		current.validated = &observedCopy
+		r.claims[input.ReplyID] = current
+	}
+	r.mu.Unlock()
+	return nil
+}
+
+func (r *RemoteJournal) ForgetPortableClaim(replyID string) {
+	if r == nil || replyID == "" {
+		return
+	}
+	r.mu.Lock()
+	if claim, ok := r.claims[replyID]; ok && claim.portable {
+		delete(r.claims, replyID)
+	}
+	r.mu.Unlock()
+}
+
+func (r *RemoteJournal) PersistPortableClaim(ctx context.Context, op Operation, replyID string) error {
+	r.mu.Lock()
+	claim, ok := r.claims[replyID]
+	r.mu.Unlock()
+	if !ok {
+		return ErrRemoteCustodyBinding
+	}
+	status := OperationStatus{}
+	if claim.validated != nil {
+		status = *claim.validated
+	} else {
+		var err error
+		status, err = r.status(ctx, claim, false)
+		if err != nil {
+			return err
+		}
+	}
+	return r.persistRemoteStatus(ctx, op, status)
+}
+
+func (r *RemoteJournal) PersistOriginalStatus(ctx context.Context, op Operation, result OriginalStatusResult) error {
+	if r == nil || r.Local == nil || r.Local.Inner == nil {
+		return ErrRemoteCustodyUnavailable
+	}
+	if result.Selection == "pending" {
+		return nil
+	}
+	in := journal.ClaimInput{ReplyID: result.ReplyID, OriginalID: op.MessageID, Digest: result.Digest, BodySize: result.BodySize, Status: result.Status, ErrorCode: result.ErrorCode, ReplyRoute: op.ReplyRoute, CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID}
+	if result.Selection == "winner" {
+		return r.Local.Inner.RecordObservedWinner(ctx, op.MessageID, result.ReplyID, result.Digest, result.Status, result.ErrorCode, op.ReplyRoute, op.CustodyRoute, op.CustodyStoreID, result.NativeItemID, op.ReplyEndpointID, op.CustodyRoute, result.CommitSeq, result.BodySize)
+	}
+	if result.Selection == "terminal_unknown" {
+		return r.Local.Inner.ImportTerminalUnknown(ctx, in)
+	}
+	return sshproxy.ErrControlValidation
+}
+
+func (r *RemoteJournal) persistRemoteStatus(ctx context.Context, op Operation, status OperationStatus) error {
+	if status.State != mektup.StateReplyAccepted && status.State != mektup.StateReplyObserved && status.State != mektup.StateReplyOutcomeUnknown {
+		return nil
+	}
+	in := journal.ClaimInput{ReplyID: status.ReplyID, OriginalID: op.MessageID, Digest: status.ReplyDigest, BodySize: status.ReplyBodySize, Status: status.ReplyStatus, ErrorCode: status.ReplyErrorCode, ReplyRoute: op.ReplyRoute, CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID}
+	if status.State == mektup.StateReplyOutcomeUnknown {
+		return r.Local.Inner.ImportTerminalUnknown(ctx, in)
+	}
+	return r.Local.Inner.RecordObservedWinner(ctx, op.MessageID, status.ReplyID, status.ReplyDigest, status.ReplyStatus, status.ReplyErrorCode, op.ReplyRoute, op.CustodyRoute, op.CustodyStoreID, status.ReplyNativeID, op.ReplyEndpointID, op.CustodyRoute, status.ReplyCommitSeq, status.ReplyBodySize)
+}
+
+func (r *RemoteJournal) OriginalStatus(ctx context.Context, op Operation) (OriginalStatusResult, error) {
+	if err := r.init(); err != nil {
+		return OriginalStatusResult{}, err
+	}
+	if op.OperationID == "" || op.MessageID == "" || op.ReplyRoute == "" || op.ReplyEndpointID == "" || op.CustodyRoute == "" || op.CustodyStoreID == "" {
+		return OriginalStatusResult{}, ErrRemoteCustodyBinding
+	}
+	route, remote, err := r.route(op.CustodyRoute)
+	if err != nil {
+		return OriginalStatusResult{}, err
+	}
+	if !remote {
+		return OriginalStatusResult{}, ErrRemoteCustodyUnavailable
+	}
+	thread, err := mektup.ParseThreadURI(op.ReplyRoute)
+	if err != nil {
+		return OriginalStatusResult{}, ErrRemoteCustodyBinding
+	}
+	request := sshproxy.ControlRequest{Schema: "mektup/control/v1", Kind: "request", Operation: "originalStatus", OperationID: op.OperationID, OriginalMessageID: op.MessageID, Custody: sshproxy.CustodyRef{EndpointID: op.CustodyRoute, StoreID: op.CustodyStoreID}, ReplyDestination: sshproxy.DestinationRef{EndpointID: op.ReplyEndpointID, ThreadID: thread.ThreadID, URI: op.ReplyRoute}, RequestedAt: r.Now().UTC().Format(time.RFC3339Nano)}
+	response, err := r.invoke(ctx, route, request)
+	if err != nil {
+		return OriginalStatusResult{}, err
+	}
+	return decodeCanonicalOriginalStatus(response.Result)
+}
+
+func decodeCanonicalOriginalStatus(data json.RawMessage) (OriginalStatusResult, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil || raw == nil {
+		return OriginalStatusResult{}, sshproxy.ErrControlValidation
+	}
+	var selection string
+	if value, ok := raw["selection"]; !ok || json.Unmarshal(value, &selection) != nil || (selection != "winner" && selection != "terminal_unknown" && selection != "pending") {
+		return OriginalStatusResult{}, sshproxy.ErrControlValidation
+	}
+	if selection == "pending" {
+		if len(raw) != 1 {
+			return OriginalStatusResult{}, sshproxy.ErrControlValidation
+		}
+		return OriginalStatusResult{Selection: selection}, nil
+	}
+	getString := func(name string) (string, error) {
+		value, ok := raw[name]
+		if !ok || bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return "", sshproxy.ErrControlValidation
+		}
+		var text string
+		if json.Unmarshal(value, &text) != nil || text == "" {
+			return "", sshproxy.ErrControlValidation
+		}
+		return text, nil
+	}
+	replyID, err := getString("replyMessageId")
+	if err != nil || mektup.ValidateID(replyID, mektup.MessageIDPrefix) != nil {
+		return OriginalStatusResult{}, sshproxy.ErrControlValidation
+	}
+	status, err := getString("replyStatus")
+	if err != nil || (status != "success" && status != "error") {
+		return OriginalStatusResult{}, sshproxy.ErrControlValidation
+	}
+	digest, err := getString("bodySha256")
+	if err != nil || !validRemoteDigest(digest) {
+		return OriginalStatusResult{}, sshproxy.ErrControlValidation
+	}
+	_, err = getString("state")
+	if err != nil {
+		return OriginalStatusResult{}, err
+	}
+	var state mektup.EvidenceState
+	if json.Unmarshal(raw["state"], &state) != nil || !state.Valid() {
+		return OriginalStatusResult{}, sshproxy.ErrControlValidation
+	}
+	var bodySize int64
+	if value, ok := raw["bodyBytes"]; !ok || json.Unmarshal(value, &bodySize) != nil || bodySize < 0 {
+		return OriginalStatusResult{}, sshproxy.ErrControlValidation
+	}
+	out := OriginalStatusResult{Selection: selection, ReplyID: replyID, Digest: digest, BodySize: bodySize, Status: status, State: state}
+	if value, ok := raw["replyErrorCode"]; ok {
+		if status != "error" || json.Unmarshal(value, &out.ErrorCode) != nil || out.ErrorCode == "" {
+			return OriginalStatusResult{}, sshproxy.ErrControlValidation
+		}
+	}
+	if selection == "winner" {
+		if state != mektup.StateReplyAccepted && state != mektup.StateReplyObserved {
+			return OriginalStatusResult{}, sshproxy.ErrControlValidation
+		}
+		if value, ok := raw["commitSeq"]; !ok || json.Unmarshal(value, &out.CommitSeq) != nil || out.CommitSeq < 1 {
+			return OriginalStatusResult{}, sshproxy.ErrControlValidation
+		}
+		if _, present := raw["eventSeq"]; present {
+			return OriginalStatusResult{}, sshproxy.ErrControlValidation
+		}
+		if value, ok := raw["nativeItemId"]; ok {
+			if json.Unmarshal(value, &out.NativeItemID) != nil || out.NativeItemID == "" {
+				return OriginalStatusResult{}, sshproxy.ErrControlValidation
+			}
+		}
+		if state == mektup.StateReplyObserved {
+			if out.NativeItemID == "" {
+				return OriginalStatusResult{}, sshproxy.ErrControlValidation
+			}
+		}
+	} else {
+		if state != mektup.StateReplyOutcomeUnknown {
+			return OriginalStatusResult{}, sshproxy.ErrControlValidation
+		}
+		if value, ok := raw["eventSeq"]; !ok || json.Unmarshal(value, &out.EventSeq) != nil || out.EventSeq < 1 {
+			return OriginalStatusResult{}, sshproxy.ErrControlValidation
+		}
+		if _, present := raw["commitSeq"]; present {
+			return OriginalStatusResult{}, sshproxy.ErrControlValidation
+		}
+		if _, present := raw["nativeItemId"]; present {
+			return OriginalStatusResult{}, sshproxy.ErrControlValidation
+		}
+	}
+	return out, nil
 }
 
 func (r *RemoteJournal) ReconcileReplyObservation(ctx context.Context, replyID, nativeID, digest string) error {
@@ -730,18 +1100,119 @@ func (r *RemoteJournal) status(ctx context.Context, claim remoteClaim, reconcile
 	request.BodyBytes = nil
 	request.BodySHA256 = ""
 	request.ReplyStatus = ""
+	request.ReplyErrorCode = ""
 	request.AttemptOwner = ""
 	response, err := r.invoke(ctx, claim.route, request)
 	if err != nil {
 		return OperationStatus{}, err
 	}
-	var result struct {
-		State          mektup.EvidenceState `json:"state"`
-		ReplyStatus    string               `json:"replyStatus"`
-		ReplyErrorCode string               `json:"replyErrorCode"`
-	}
-	if err := json.Unmarshal(response.Result, &result); err != nil || !result.State.Valid() {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(response.Result, &raw); err != nil || raw == nil {
 		return OperationStatus{}, sshproxy.ErrControlValidation
 	}
-	return OperationStatus{Operation: op, State: result.State, ReplyStatus: result.ReplyStatus, ReplyErrorCode: result.ReplyErrorCode, ReplyDigest: claim.input.Digest, ReplyBodySize: claim.input.BodySize}, nil
+	getString := func(name string) (string, bool, error) {
+		value, ok := raw[name]
+		if !ok {
+			return "", false, nil
+		}
+		var result string
+		if json.Unmarshal(value, &result) != nil || result == "" {
+			return "", true, sshproxy.ErrControlValidation
+		}
+		return result, true, nil
+	}
+	stateText, ok, err := getString("state")
+	if err != nil || !ok {
+		return OperationStatus{}, sshproxy.ErrControlValidation
+	}
+	state := mektup.EvidenceState(stateText)
+	if !state.Valid() {
+		return OperationStatus{}, sshproxy.ErrControlValidation
+	}
+	replyID, present, err := getString("replyId")
+	if err != nil {
+		return OperationStatus{}, sshproxy.ErrControlValidation
+	}
+	if present && replyID != claim.input.ReplyID {
+		return OperationStatus{}, journal.ErrIdentityConflict
+	}
+	if !present {
+		replyID = claim.input.ReplyID
+	}
+	replyStatus, present, err := getString("replyStatus")
+	if err != nil {
+		return OperationStatus{}, sshproxy.ErrControlValidation
+	}
+	if present && replyStatus != "success" && replyStatus != "error" {
+		return OperationStatus{}, sshproxy.ErrControlValidation
+	}
+	if !present {
+		replyStatus = claim.input.Status
+	}
+	errorCode := ""
+	errorPresent := false
+	if rawError, present := raw["replyErrorCode"]; present {
+		errorPresent = true
+		if json.Unmarshal(rawError, &errorCode) != nil {
+			return OperationStatus{}, sshproxy.ErrControlValidation
+		}
+	}
+	if errorPresent && errorCode != "" && claim.input.ErrorCode != "" && errorCode != claim.input.ErrorCode {
+		return OperationStatus{}, journal.ErrIdentityConflict
+	}
+	if errorPresent && errorCode == "" && claim.input.ErrorCode != "" {
+		return OperationStatus{}, journal.ErrIdentityConflict
+	}
+	if !errorPresent {
+		errorCode = claim.input.ErrorCode
+	}
+	digest, present, err := getString("bodySha256")
+	if err != nil {
+		return OperationStatus{}, sshproxy.ErrControlValidation
+	}
+	if present && !validRemoteDigest(digest) {
+		return OperationStatus{}, sshproxy.ErrControlValidation
+	}
+	if present && claim.input.Digest != "" && digest != claim.input.Digest {
+		return OperationStatus{}, journal.ErrIdentityConflict
+	}
+	if !present {
+		digest = claim.input.Digest
+	}
+	bodySize := claim.input.BodySize
+	if rawBody, present := raw["bodyBytes"]; present {
+		var value int64
+		if json.Unmarshal(rawBody, &value) != nil || value < 0 {
+			return OperationStatus{}, sshproxy.ErrControlValidation
+		}
+		if claim.input.BodySizeKnown && value != claim.input.BodySize {
+			return OperationStatus{}, journal.ErrIdentityConflict
+		}
+		bodySize = value
+	}
+	commitSeq := int64(0)
+	if rawCommit, present := raw["commitSeq"]; present {
+		if json.Unmarshal(rawCommit, &commitSeq) != nil || commitSeq < 0 {
+			return OperationStatus{}, sshproxy.ErrControlValidation
+		}
+	}
+	nativeID := ""
+	if rawNative, present := raw["nativeItemId"]; present {
+		if json.Unmarshal(rawNative, &nativeID) != nil || nativeID == "" {
+			return OperationStatus{}, sshproxy.ErrControlValidation
+		}
+	}
+	return OperationStatus{Operation: op, State: state, ReplyID: replyID, ReplyStatus: replyStatus, ReplyErrorCode: errorCode, ReplyDigest: digest, ReplyBodySize: bodySize, ReplyCommitSeq: commitSeq, ReplyNativeID: nativeID}, nil
+}
+
+func validRemoteDigest(value string) bool {
+	if len(value) != len("sha256:")+64 || !strings.HasPrefix(value, "sha256:") || strings.ToLower(value) != value {
+		return false
+	}
+	for _, char := range value[len("sha256:"):] {
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
