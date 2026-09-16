@@ -49,21 +49,27 @@ func (s Store) Inspect(ctx context.Context, target string, inspector TargetInspe
 	if strings.TrimSpace(target) == "" || inspector == nil {
 		return InspectResult{}, fmt.Errorf("%w: target and read-only inspector are required", ErrInvalidArguments)
 	}
-	limit, err := boundedLimit(options.ReceiptLimit)
-	if err != nil {
-		return InspectResult{}, err
+	if options.ReceiptLimit < 0 || options.ReceiptLimit > MaxLimit {
+		return InspectResult{}, ErrLimit
 	}
 	identity, err := inspector.Inspect(ctx, target)
 	if err != nil {
 		return InspectResult{}, err
 	}
-	receipts, err := s.Journal.ListReceipts(ctx, journal.ReceiptQuery{EndpointID: identity.EndpointID, ThreadID: identity.ThreadID, Limit: limit})
-	if err != nil {
-		return InspectResult{}, err
+	related := make([]mektup.Receipt, 0)
+	if options.ReceiptLimit > 0 {
+		related, err = s.Journal.ListReceipts(ctx, journal.ReceiptQuery{EndpointID: identity.EndpointID, ThreadID: identity.ThreadID, Limit: options.ReceiptLimit})
+		if err != nil {
+			return InspectResult{}, err
+		}
 	}
-	result := InspectResult{Target: identity, Receipts: receipts}
+	result := InspectResult{Target: identity, Receipts: related}
 	if options.Blockers {
-		result.Blockers, err = s.Journal.ListBlockers(ctx, journal.BlockerQuery{EndpointID: identity.EndpointID, ThreadID: identity.ThreadID, Limit: limit})
+		blockerLimit := options.ReceiptLimit
+		if blockerLimit == 0 {
+			blockerLimit = 10
+		}
+		result.Blockers, err = s.Journal.ListBlockers(ctx, journal.BlockerQuery{EndpointID: identity.EndpointID, ThreadID: identity.ThreadID, Limit: blockerLimit})
 		if err != nil {
 			return InspectResult{}, err
 		}

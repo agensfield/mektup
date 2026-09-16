@@ -111,12 +111,15 @@ func (e *DeliveryError) Unwrap() error {
 // ResolvedTarget is a target identity after resolution.  URI and ThreadID are
 // pinned for the entire operation; retries never invoke a resolver again.
 type ResolvedTarget struct {
-	Requested  string
-	EndpointID string
-	URI        string
-	ThreadID   string
-	Loaded     bool
-	Persistent bool
+	Requested     string
+	EndpointID    string
+	EndpointAlias string
+	Transport     string
+	URI           string
+	ThreadID      string
+	Loaded        bool
+	Persistent    bool
+	HerdrEvidence map[string]any
 }
 
 type SourceIdentity struct {

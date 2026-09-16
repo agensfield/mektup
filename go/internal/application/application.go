@@ -728,7 +728,7 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 		return runtimeHistory{observe: observe}, nil
 	}
 	inspectorFactory := func(_ context.Context, operation cli.Invocation) (receipts.TargetInspector, error) {
-		return runtimeInspector{resolver: resolverFor(operation), observe: observe}, nil
+		return runtimeInspector{resolver: resolverFor(operation), observe: observe, facts: facts}, nil
 	}
 	var gateFactory messageexecutor.HumanGateFactory
 	if e.options.HumanGate != nil {
@@ -893,6 +893,7 @@ func (h runtimeHistory) FullHistory(ctx context.Context, endpointID, threadID st
 type runtimeInspector struct {
 	resolver runtime.ResolverAdapter
 	observe  *runtime.ObservationAdapter
+	facts    *connectionFacts
 }
 
 func (i runtimeInspector) Inspect(ctx context.Context, selector string) (receipts.TargetIdentity, error) {
@@ -900,7 +901,12 @@ func (i runtimeInspector) Inspect(ctx context.Context, selector string) (receipt
 	if err != nil {
 		return receipts.TargetIdentity{}, err
 	}
-	return receipts.TargetIdentity{EndpointID: target.EndpointID, ThreadID: target.ThreadID, Requested: selector, Resolved: target.URI, Loaded: target.Loaded, Status: "resolved"}, nil
+	identity := receipts.TargetIdentity{EndpointID: target.EndpointID, EndpointAlias: target.EndpointAlias, Transport: target.Transport, ThreadID: target.ThreadID, Requested: selector, Resolved: target.URI, Loaded: target.Loaded, Status: "resolved", HerdrEvidence: target.HerdrEvidence}
+	if info, ok := i.facts.Get(target.EndpointID); ok {
+		identity.ServerVersion = info.DaemonVersion
+		identity.Compatibility = string(info.Compatibility.Class)
+	}
+	return identity, nil
 }
 
 type applicationImportResolver struct {

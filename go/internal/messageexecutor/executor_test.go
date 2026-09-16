@@ -11,6 +11,8 @@ import (
 
 	mektup "github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/internal/cli"
+	"github.com/agensfield/mektup/go/internal/endpoint"
+	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/receipts"
 	"github.com/agensfield/mektup/go/internal/service"
 )
@@ -121,6 +123,9 @@ type fakeReceipts struct {
 	resolveCalls int
 	lastResolve  receipts.ResolveRequest
 	receipt      mektup.Receipt
+	inspect      receipts.InspectResult
+	inspectErr   error
+	lastInspect  receipts.InspectOptions
 }
 
 func (f *fakeReceipts) List(context.Context, receipts.ListOptions) ([]mektup.Receipt, error) {
@@ -143,8 +148,9 @@ func (f *fakeReceipts) Resolve(_ context.Context, req receipts.ResolveRequest) (
 	}
 	return f.receipt, nil
 }
-func (f *fakeReceipts) Inspect(context.Context, string, receipts.TargetInspector, receipts.InspectOptions) (receipts.InspectResult, error) {
-	return receipts.InspectResult{}, nil
+func (f *fakeReceipts) Inspect(_ context.Context, _ string, _ receipts.TargetInspector, options receipts.InspectOptions) (receipts.InspectResult, error) {
+	f.lastInspect = options
+	return f.inspect, f.inspectErr
 }
 
 type fakeOriginal struct{}
@@ -353,6 +359,63 @@ func TestHumanReceiptListAndContentHaveOutput(t *testing.T) {
 	contentApp := &cli.App{Out: &contentOut, Err: &contentErr, Executor: exec}
 	if code := contentApp.Run([]string{"receipt", "show", store.receipt.ReceiptID, "--content", "--human"}); code != int(cli.ExitSuccess) || !strings.Contains(contentOut.String(), "content bytes=") {
 		t.Fatalf("human content exit=%d stderr=%q output=%q", code, contentErr.String(), contentOut.String())
+	}
+}
+
+func TestInspectZeroReceiptsIsIdentityOnlyAndDefaultIsBounded(t *testing.T) {
+	store := &fakeReceipts{inspect: receipts.InspectResult{Target: receipts.TargetIdentity{
+		EndpointID: "ep_01999999-9999-7999-8999-999999999999", EndpointAlias: "local", Transport: "unix",
+		ServerVersion: "0.154.0", Compatibility: "tested", ThreadID: "thread-1", Requested: "mektup-sage",
+		Resolved: "codex://local/thread/thread-1", Loaded: true, Status: "idle",
+	}}}
+	exec := New(Ports{Receipts: store, Inspector: func(context.Context, cli.Invocation) (receipts.TargetInspector, error) { return nil, nil }})
+	var out, errOut bytes.Buffer
+	app := &cli.App{Out: &out, Err: &errOut, Executor: exec}
+	if code := app.Run([]string{"inspect", "mektup-sage", "--receipts", "0", "--human"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("identity-only inspect exit=%d stderr=%q", code, errOut.String())
+	}
+	if store.lastInspect.ReceiptLimit != 0 || !strings.Contains(out.String(), "target mektup-sage") || !strings.Contains(out.String(), "receipts: 0") {
+		t.Fatalf("identity-only options=%+v output=%q", store.lastInspect, out.String())
+	}
+	out.Reset()
+	if code := app.Run([]string{"inspect", "mektup-sage", "--human"}); code != int(cli.ExitSuccess) || store.lastInspect.ReceiptLimit != 10 {
+		t.Fatalf("default inspect exit=%d options=%+v stderr=%q", code, store.lastInspect, errOut.String())
+	}
+}
+
+func TestHumanInspectShowsRoutingReceiptsAndBlockers(t *testing.T) {
+	now := time.Date(2026, 9, 16, 10, 0, 0, 0, time.UTC)
+	receipt := testReceipt(mektup.StateAccepted)
+	receipt.Target.Alias = "local"
+	result := receipts.InspectResult{
+		Target:   receipts.TargetIdentity{EndpointID: receipt.Target.EndpointID, EndpointAlias: "local", Transport: "unix", ServerVersion: "0.154.0", Compatibility: "tested", ThreadID: receipt.Target.ThreadID, Requested: "mektup-sage", Resolved: receipt.Target.Resolved, Loaded: true, Status: "idle", HerdrEvidence: map[string]any{"name": "mektup-sage", "paneId": "w3:p28", "status": "working"}},
+		Receipts: []mektup.Receipt{receipt},
+		Blockers: []journal.Blocker{{Method: "item/tool/requestUserInput", CorrelationID: "7", TurnID: "turn-1", LastSeen: now}},
+	}
+	got := humanInspect(result)
+	for _, want := range []string{"target mektup-sage", "local (", "0.154.0", "herdr: name=mektup-sage pane=w3:p28", "RECEIPT", receipt.ReceiptID, "BLOCKERS", "item/tool/requestUserInput", "pending"} {
+		if !strings.Contains(strings.ToUpper(got), strings.ToUpper(want)) {
+			t.Fatalf("inspect output missing %q: %q", want, got)
+		}
+	}
+}
+
+func TestInspectResolverErrorsAreTypedAndNonMutating(t *testing.T) {
+	tests := []struct {
+		err  error
+		code string
+		exit cli.ExitCode
+	}{
+		{endpoint.ErrResolverNotFound, "endpoint_unavailable", cli.ExitRejected},
+		{endpoint.ErrResolverAmbiguous, "target_ambiguous", cli.ExitRejected},
+		{endpoint.ErrInvalidTarget, "invalid_target", cli.ExitUsage},
+	}
+	for _, test := range tests {
+		mapped := mapError(test.err)
+		var cliError *cli.Error
+		if !errors.As(mapped, &cliError) || cliError.Code != test.code || cliError.Effect != "not_sent" || cliError.Exit != test.exit {
+			t.Fatalf("%v mapped to %#v", test.err, mapped)
+		}
 	}
 }
 

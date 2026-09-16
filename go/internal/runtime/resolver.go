@@ -52,7 +52,15 @@ func (r ResolverAdapter) Resolve(ctx context.Context, selector string) (service.
 			return service.ResolvedTarget{}, fmt.Errorf("runtime: target runtime-state preflight failed: %w", err)
 		}
 	}
-	return service.ResolvedTarget{Requested: selector, EndpointID: resolved.Endpoint.ID, URI: uri, ThreadID: resolved.ThreadID, Loaded: loaded, Persistent: persistent}, nil
+	var herdrEvidence map[string]any
+	if resolved.Herdr != nil {
+		herdrEvidence = map[string]any{
+			"name": resolved.Herdr.Name, "workspaceId": resolved.Herdr.Workspace,
+			"tabId": resolved.Herdr.Tab, "paneId": resolved.Herdr.Pane,
+			"codexThreadId": resolved.Herdr.ThreadID, "status": resolved.Herdr.Status,
+		}
+	}
+	return service.ResolvedTarget{Requested: selector, EndpointID: resolved.Endpoint.ID, EndpointAlias: resolved.Endpoint.Alias, Transport: string(resolved.Endpoint.Route.Kind), URI: uri, ThreadID: resolved.ThreadID, Loaded: loaded, Persistent: persistent, HerdrEvidence: herdrEvidence}, nil
 }
 
 func (r ResolverAdapter) ResolveSource(ctx context.Context, source string) (service.SourceIdentity, error) {

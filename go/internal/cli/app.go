@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/mattn/go-isatty"
 	"golang.org/x/mod/semver"
 )
 
@@ -218,6 +219,7 @@ type Globals struct {
 	Debug    bool
 	Audit    bool
 	Help     bool
+	Color    string
 }
 
 // ResolvedGlobals records effective configuration without reading or writing
@@ -234,6 +236,8 @@ type ResolvedGlobals struct {
 	CodexHome       string
 	CurrentThreadID string
 	AgentMode       bool
+	Color           bool
+	ErrorColor      bool
 }
 
 // PathSource records which input won path precedence. It is intentionally
@@ -293,7 +297,7 @@ func resolvePresentation(explicitJSON, explicitHuman bool, env map[string]string
 	return DetectPresentation(false, false, env)
 }
 
-func resolveGlobals(inv Invocation, env map[string]string) (Invocation, *Error) {
+func resolveGlobals(inv Invocation, env map[string]string, outputTerminal, errorTerminal bool) (Invocation, *Error) {
 	config, state := defaultStatePaths(env)
 	configSource, stateSource := PathDefault, PathDefault
 	endpoint := "local"
@@ -323,8 +327,51 @@ func resolveGlobals(inv Invocation, env map[string]string) (Invocation, *Error) 
 	if err != nil {
 		return inv, normalizeError(err)
 	}
-	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, EndpointSource: endpointSource, Config: config, StateDir: state, ConfigSource: configSource, StateSource: stateSource, CodexHome: strings.TrimSpace(env["CODEX_HOME"]), CurrentThreadID: strings.TrimSpace(env["CODEX_THREAD_ID"]), AgentMode: env["MEKTUP_AGENT"] == "1"}
+	color, colorErr := resolveColor(inv.Global.Color, env, output, outputTerminal)
+	if colorErr != nil {
+		return inv, colorErr
+	}
+	errorColor, colorErr := resolveColor(inv.Global.Color, env, output, errorTerminal)
+	if colorErr != nil {
+		return inv, colorErr
+	}
+	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, EndpointSource: endpointSource, Config: config, StateDir: state, ConfigSource: configSource, StateSource: stateSource, CodexHome: strings.TrimSpace(env["CODEX_HOME"]), CurrentThreadID: strings.TrimSpace(env["CODEX_THREAD_ID"]), AgentMode: env["MEKTUP_AGENT"] == "1", Color: color, ErrorColor: errorColor}
 	return inv, nil
+}
+
+func resolveColor(explicit string, env map[string]string, output Presentation, terminal bool) (bool, *Error) {
+	if output != PresentationHuman {
+		return false, nil
+	}
+	choice := strings.ToLower(strings.TrimSpace(explicit))
+	if choice == "" {
+		choice = strings.ToLower(strings.TrimSpace(env["MEKTUP_COLOR"]))
+	}
+	if choice == "" {
+		choice = "auto"
+	}
+	switch choice {
+	case "always":
+		return true, nil
+	case "never":
+		return false, nil
+	case "auto":
+		if _, disabled := env["NO_COLOR"]; disabled || strings.EqualFold(strings.TrimSpace(env["TERM"]), "dumb") {
+			return false, nil
+		}
+		return terminal, nil
+	default:
+		return false, usageError("--color and MEKTUP_COLOR must be auto, always, or never")
+	}
+}
+
+func writerIsTerminal(writer io.Writer) bool {
+	file, ok := writer.(*os.File)
+	if !ok {
+		return false
+	}
+	fd := file.Fd()
+	return isatty.IsTerminal(fd) || isatty.IsCygwinTerminal(fd)
 }
 
 func (a *App) env() map[string]string {
@@ -407,17 +454,17 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 			return a.finish(presentation, parsed, presentationErr)
 		}
 	}
-	resolved, resolveErr := resolveGlobals(parsed, env)
+	resolved, resolveErr := resolveGlobals(parsed, env, writerIsTerminal(a.Out), writerIsTerminal(a.Err))
 	if resolveErr != nil {
 		return a.finish(presentation, parsed, resolveErr)
 	}
 	parsed = resolved
 
 	if has(parsed, "skill") {
-		if parsed.Command != "--skill" || len(parsed.Position) != 0 || !onlyOptions(parsed, "skill", "json", "human") {
+		if parsed.Command != "--skill" || len(parsed.Position) != 0 || !onlyOptions(parsed, "skill", "json", "human", "color") {
 			return a.finish(presentation, parsed, usageError("use mektup --skill without operational arguments"))
 		}
-		return a.writeGuide()
+		return a.writeGuide(parsed.Resolved.Color)
 	}
 	if parsed.Global.Help || parsed.Command == "" || parsed.Command == "help" {
 		if parsed.Command == "help" && len(parsed.Position) > 1 {
@@ -427,16 +474,16 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 		if parsed.Global.Help && parsed.Command != "" && parsed.Command != "help" {
 			topic = []string{parsed.Command}
 		}
-		return a.help(presentation, topic)
+		return a.help(presentation, topic, parsed.Resolved.Color, parsed.Resolved.ErrorColor)
 	}
 	switch parsed.Command {
 	case "version":
-		if len(parsed.Position) != 0 || !onlyOptions(parsed, "json", "human") {
+		if len(parsed.Position) != 0 || !onlyOptions(parsed, "json", "human", "color") {
 			return a.finish(presentation, parsed, usageError("usage: mektup version [--json]"))
 		}
-		return a.version(presentation)
+		return a.version(presentation, parsed.Resolved.Color)
 	case "completion":
-		if len(parsed.Position) != 1 || !onlyOptions(parsed, "json", "human") {
+		if len(parsed.Position) != 1 || !onlyOptions(parsed, "json", "human", "color") {
 			return a.finish(presentation, parsed, usageError("usage: mektup completion <zsh|bash|fish>"))
 		}
 		return a.completion(presentation, parsed.Position[0])
@@ -486,27 +533,28 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 	return a.finish(presentation, parsed, normalizeError(err))
 }
 
-func (a *App) help(p Presentation, position []string) int {
+func (a *App) help(p Presentation, position []string, color, errorColor bool) int {
 	text := usageText
 	if len(position) == 1 {
 		if detail, ok := helpTopics[position[0]]; ok {
 			text = detail
 		} else {
-			return a.finish(p, Invocation{Command: "help"}, usageError("unknown help topic: "+position[0]))
+			return a.finish(p, Invocation{Command: "help", Resolved: ResolvedGlobals{Color: color, ErrorColor: errorColor}}, usageError("unknown help topic: "+position[0]))
 		}
 	}
 	if p == PresentationJSON {
 		return a.writeJSON(map[string]any{"schema": "mektup/help/v1", "ok": true, "topic": "help", "text": text})
 	}
-	_, _ = io.WriteString(a.Out, ensureFinalNewline(text))
+	_, _ = io.WriteString(a.Out, ensureFinalNewline(StyleHuman(text, color)))
 	return int(ExitSuccess)
 }
 
-func (a *App) version(p Presentation) int {
+func (a *App) version(p Presentation, color bool) int {
 	if p == PresentationJSON {
 		return a.writeJSON(map[string]any{"schema": "mektup/version/v1", "ok": true, "version": a.Build.Version, "commit": a.Build.Commit, "install_kind": a.Build.InstallKind, "contract_version": a.Build.ContractVersion, "tested_codex_versions": a.Build.TestedCodexServers})
 	}
-	_, _ = fmt.Fprintf(a.Out, "mektup %s (commit %s, %s, contract %s; tested Codex %s)\n", a.Build.Version, a.Build.Commit, a.Build.InstallKind, a.Build.ContractVersion, strings.Join(a.Build.TestedCodexServers, ", "))
+	line := fmt.Sprintf("mektup %s (commit %s, %s, contract %s; tested Codex %s)", a.Build.Version, a.Build.Commit, a.Build.InstallKind, a.Build.ContractVersion, strings.Join(a.Build.TestedCodexServers, ", "))
+	_, _ = fmt.Fprintln(a.Out, StyleHuman(line, color))
 	return int(ExitSuccess)
 }
 
@@ -525,45 +573,39 @@ func (a *App) docs(p Presentation, inv Invocation) int {
 	if len(inv.Position) != 1 {
 		return a.finish(p, inv, usageError("usage: mektup docs agents|commands|envelopes|receipts [--json]"))
 	}
-	if !onlyOptions(inv, "json", "human") {
+	if !onlyOptions(inv, "json", "human", "color") {
 		return a.finish(p, inv, usageError("docs accepts only a documentation topic and presentation options"))
 	}
 	switch inv.Position[0] {
 	case "agents":
-		return a.writeGuide()
+		return a.writeGuide(inv.Resolved.Color)
 	case "commands":
-		var data []byte
-		var err error
-		if inv.Global.JSON {
-			data, err = json.Marshal(commandContract())
-		} else {
-			data, err = json.MarshalIndent(commandContract(), "", "  ")
-		}
-		if err != nil {
-			return a.finish(p, inv, &Error{Code: "internal_error", Message: err.Error(), Exit: ExitInternal})
-		}
-		if inv.Global.JSON {
+		if p == PresentationJSON {
+			data, err := json.Marshal(commandContract())
+			if err != nil {
+				return a.finish(p, inv, &Error{Code: "internal_error", Message: err.Error(), Exit: ExitInternal})
+			}
 			_, _ = a.Out.Write(append(data, '\n'))
 			return int(ExitSuccess)
 		}
-		_, _ = a.Out.Write(append(data, '\n'))
+		_, _ = io.WriteString(a.Out, ensureFinalNewline(StyleHuman(commandContractHuman(commandContract()), inv.Resolved.Color)))
 		return int(ExitSuccess)
 	case "envelopes":
-		return a.writeAsset(envelopeDocs)
+		return a.writeAsset(envelopeDocs, inv.Resolved.Color)
 	case "receipts":
-		return a.writeAsset(receiptDocs)
+		return a.writeAsset(receiptDocs, inv.Resolved.Color)
 	default:
 		return a.finish(p, inv, usageError("unknown docs topic: "+inv.Position[0]))
 	}
 }
 
-func (a *App) writeGuide() int {
-	_, _ = io.WriteString(a.Out, ensureFinalNewline(agentGuide))
+func (a *App) writeGuide(color bool) int {
+	_, _ = io.WriteString(a.Out, ensureFinalNewline(StyleHuman(agentGuide, color)))
 	return int(ExitSuccess)
 }
 
-func (a *App) writeAsset(asset string) int {
-	_, _ = io.WriteString(a.Out, ensureFinalNewline(asset))
+func (a *App) writeAsset(asset string, color bool) int {
+	_, _ = io.WriteString(a.Out, ensureFinalNewline(StyleHuman(asset, color)))
 	return int(ExitSuccess)
 }
 
@@ -576,7 +618,7 @@ func (a *App) finish(p Presentation, inv Invocation, err error) int {
 		return a.writeEvent(inv, e)
 	}
 	if e.Message != "" {
-		_, _ = fmt.Fprintln(a.Err, "mektup: "+e.Message)
+		_, _ = fmt.Fprintln(a.Err, StyleHuman("mektup: "+e.Message, inv.Resolved.ErrorColor))
 	}
 	return int(e.Exit)
 }
@@ -615,21 +657,27 @@ func (a *App) writeExecutionResultState(p Presentation, inv Invocation, result E
 
 	hasOutput := strings.TrimSpace(result.Human) != ""
 	if result.Human != "" {
-		if _, err := io.WriteString(a.Out, ensureFinalNewline(result.Human)); err != nil {
+		if _, err := io.WriteString(a.Out, ensureFinalNewline(StyleHuman(result.Human, inv.Resolved.Color))); err != nil {
 			return int(ExitInternal)
 		}
 	}
 	for _, event := range result.Events {
 		if strings.TrimSpace(event.Human) != "" {
 			hasOutput = true
-			if _, err := io.WriteString(a.Out, ensureFinalNewline(event.Human)); err != nil {
+			if _, err := io.WriteString(a.Out, ensureFinalNewline(StyleHuman(event.Human, inv.Resolved.Color))); err != nil {
 				return int(ExitInternal)
 			}
 		}
 	}
+	for _, warning := range humanWarnings(result) {
+		hasOutput = true
+		if _, err := io.WriteString(a.Out, ensureFinalNewline(StyleHuman("warning: "+warning, inv.Resolved.Color))); err != nil {
+			return int(ExitInternal)
+		}
+	}
 	if result.Receipt != nil {
 		hasOutput = true
-		if _, err := io.WriteString(a.Out, ensureFinalNewline(receiptHuman(result.Receipt))); err != nil {
+		if _, err := io.WriteString(a.Out, ensureFinalNewline(StyleHuman(receiptHuman(result.Receipt), inv.Resolved.Color))); err != nil {
 			return a.internalFailure("unable to write receipt: " + err.Error())
 		}
 	}
@@ -800,7 +848,14 @@ func (a *App) lifecycleEventsState(inv Invocation, result ExecutionResult, state
 }
 
 func (a *App) writeStreamingFailure(p Presentation, inv Invocation, state *streamLifecycleState, err error) int {
-	if p != PresentationJSON || state == nil || state.terminal {
+	if p != PresentationJSON {
+		e := normalizeError(err)
+		if e.Message != "" {
+			_, _ = fmt.Fprintln(a.Err, StyleHuman("mektup: "+e.Message, inv.Resolved.ErrorColor))
+		}
+		return int(e.Exit)
+	}
+	if state == nil || state.terminal {
 		return int(normalizeError(err).Exit)
 	}
 	e := normalizeError(err)
@@ -848,12 +903,29 @@ func receiptHuman(receipt any) string {
 	if err := json.Unmarshal(encoded, &object); err != nil {
 		return "receipt emitted"
 	}
-	parts := []string{"receipt"}
-	if id, ok := object["receiptId"].(string); ok && id != "" {
-		parts = append(parts, id)
+	parts := make([]string, 0, 6)
+	if operation, ok := object["operation"].(string); ok && operation != "" {
+		parts = append(parts, operation)
+	} else {
+		parts = append(parts, "receipt")
 	}
 	if state, ok := object["state"].(string); ok && state != "" {
-		parts = append(parts, "state="+state)
+		parts = append(parts, string(state))
+	}
+	if message, ok := object["message"].(map[string]any); ok {
+		if id, ok := message["messageId"].(string); ok && id != "" {
+			parts = append(parts, "message="+id)
+		}
+	}
+	if target, ok := object["target"].(map[string]any); ok {
+		alias, _ := target["alias"].(string)
+		thread, _ := target["threadId"].(string)
+		if alias != "" || thread != "" {
+			parts = append(parts, "target="+strings.Trim(alias+"/"+thread, "/"))
+		}
+	}
+	if id, ok := object["receiptId"].(string); ok && id != "" {
+		parts = append(parts, "receipt="+id)
 	}
 	return strings.Join(parts, " ")
 }

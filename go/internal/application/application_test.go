@@ -23,6 +23,7 @@ import (
 	"github.com/agensfield/mektup/go/internal/artifact"
 	"github.com/agensfield/mektup/go/internal/cli"
 	"github.com/agensfield/mektup/go/internal/codexapi"
+	"github.com/agensfield/mektup/go/internal/compat"
 	"github.com/agensfield/mektup/go/internal/connection"
 	"github.com/agensfield/mektup/go/internal/controlreceiver"
 	"github.com/agensfield/mektup/go/internal/endpoint"
@@ -345,6 +346,62 @@ func TestDoctorDoesNotCreateStateAndCanReadCorruptJournal(t *testing.T) {
 		t.Fatalf("corrupt doctor exit=%d output=%s", code, out.String())
 	}
 	_ = env.Close()
+}
+
+func TestHumanDoctorAndEndpointListRenderSemanticContent(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	config := filepath.Join(root, "config", "endpoints.json")
+	codexHome := filepath.Join(root, "codex")
+	if err := os.MkdirAll(filepath.Join(codexHome, "app-server-control"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "app-server-control", "app-server-control.sock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	env := New(Options{CodexHome: codexHome, IdentityHome: filepath.Join(root, "identity")})
+	defer env.Close()
+
+	var doctorOut, doctorErr bytes.Buffer
+	doctorApp := &cli.App{Out: &doctorOut, Err: &doctorErr, Executor: env, Env: []string{"MEKTUP_STATE_DIR=" + state, "MEKTUP_CONFIG=" + config}}
+	if code := doctorApp.Run([]string{"doctor", "--human", "--color", "never"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("doctor exit=%d stderr=%s", code, doctorErr.String())
+	}
+	if !strings.Contains(doctorOut.String(), "doctor: ") || !strings.Contains(doctorOut.String(), "STATE") || strings.TrimSpace(doctorOut.String()) == "doctor" {
+		t.Fatalf("doctor human output=%q", doctorOut.String())
+	}
+
+	var endpointOut, endpointErr bytes.Buffer
+	endpointApp := &cli.App{Out: &endpointOut, Err: &endpointErr, Executor: env, Env: []string{"MEKTUP_STATE_DIR=" + state, "MEKTUP_CONFIG=" + config}}
+	if code := endpointApp.Run([]string{"endpoint", "list", "--human", "--color", "never"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("endpoint list exit=%d stderr=%s", code, endpointErr.String())
+	}
+	for _, want := range []string{"ALIAS", "ID", "ROUTE", "local", "unix:"} {
+		if !strings.Contains(endpointOut.String(), want) {
+			t.Fatalf("endpoint output missing %q: %q", want, endpointOut.String())
+		}
+	}
+}
+
+func TestRuntimeInspectorCarriesResolvedEndpointAndDaemonFacts(t *testing.T) {
+	root := t.TempDir()
+	store := endpoint.NewStore(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"))
+	ep := endpoint.Endpoint{ID: endpointID(), Alias: "devbox", Route: endpoint.Route{Kind: endpoint.RouteSSH, SSHHost: "devbox"}, Herdr: endpoint.HerdrDisabled}
+	if err := store.Add(ep); err != nil {
+		t.Fatal(err)
+	}
+	facts := &connectionFacts{values: make(map[string]connection.Info)}
+	facts.Set(ep.ID, connection.Info{DaemonVersion: "0.154.0", Compatibility: compat.Result{Class: compat.Tested}})
+	inspector := runtimeInspector{resolver: runtime.ResolverAdapter{Store: store, StateProbe: func(context.Context, string, string) (bool, bool, error) {
+		return true, true, nil
+	}}, facts: facts}
+	got, err := inspector.Inspect(context.Background(), "codex://devbox/thread/thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.EndpointID != ep.ID || got.EndpointAlias != "devbox" || got.Transport != "ssh" || got.ServerVersion != "0.154.0" || got.Compatibility != "tested" || !got.Loaded {
+		t.Fatalf("inspect identity=%+v", got)
+	}
 }
 
 func TestStorageCorruptOpenUsesStableCode(t *testing.T) {
