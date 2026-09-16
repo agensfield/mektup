@@ -315,6 +315,11 @@ func validateOriginalStatusResult(result map[string]json.RawMessage) error {
 			return fmt.Errorf("%w: originalStatus result forbids body field %s, including null", ErrControlValidation, field)
 		}
 	}
+	for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner"} {
+		if _, present := result[field]; present {
+			return fmt.Errorf("%w: originalStatus result forbids authority field %s, including null", ErrControlValidation, field)
+		}
+	}
 	selection, ok := result["selection"]
 	if !ok {
 		return fmt.Errorf("%w: originalStatus result requires selection", ErrControlValidation)
@@ -349,11 +354,11 @@ func validateOriginalStatusResult(result map[string]json.RawMessage) error {
 		if err := requireString("replyMessageId", "msg_"); err != nil {
 			return err
 		}
-		status, present := result["status"]
+		status, present := result["replyStatus"]
 		if !present {
 			return fmt.Errorf("%w: originalStatus result requires replyStatus", ErrControlValidation)
 		}
-		statusValue, err := rawString(status, "result.status")
+		statusValue, err := rawString(status, "result.replyStatus")
 		if err != nil || (statusValue != "success" && statusValue != "error") {
 			return fmt.Errorf("%w: originalStatus result has invalid replyStatus", ErrControlValidation)
 		}
@@ -380,7 +385,7 @@ func validateOriginalStatusResult(result map[string]json.RawMessage) error {
 		}
 		return nil
 	}
-	forbiddenSelected := []string{"replyMessageId", "replyStatus", "replyErrorCode", "status", "bodyBytes", "bodySha256", "commitSeq", "eventSeq", "nativeItemId", "state"}
+	forbiddenSelected := []string{"replyMessageId", "replyStatus", "replyErrorCode", "status", "bodyBytes", "bodySha256", "commitSeq", "eventSeq", "nativeItemId", "fencingToken", "lease", "requestedLease", "attemptOwner", "state"}
 	switch selectionValue {
 	case "winner":
 		if err := requireString("state", ""); err != nil {
@@ -575,8 +580,8 @@ func (r ControlRequest) Validate() error {
 				}
 			}
 		} else if r.Operation == "originalStatus" {
-			if _, present := resultObject["replyStatus"]; present {
-				return fmt.Errorf("%w: originalStatus result forbids replyStatus", ErrControlValidation)
+			if _, present := resultObject["status"]; present {
+				return fmt.Errorf("%w: originalStatus result forbids status", ErrControlValidation)
 			}
 			if _, present := resultObject["winner"]; present {
 				return fmt.Errorf("%w: originalStatus result forbids winner", ErrControlValidation)

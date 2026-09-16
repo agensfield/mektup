@@ -772,8 +772,8 @@ func validateControlFixture(data []byte) error {
 			if _, present := result["winner"]; present {
 				return errors.New("originalStatus result forbids winner")
 			}
-			if _, present := result["replyStatus"]; present {
-				return errors.New("originalStatus result forbids replyStatus")
+			if _, present := result["status"]; present {
+				return errors.New("originalStatus result forbids status")
 			}
 			if err := validateOriginalStatusResultRunner(result); err != nil {
 				return err
@@ -830,6 +830,11 @@ func validateOriginalStatusResultRunner(result map[string]any) error {
 			return fmt.Errorf("originalStatus result forbids body field %s", field)
 		}
 	}
+	for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner"} {
+		if _, present := result[field]; present {
+			return fmt.Errorf("originalStatus result forbids authority field %s", field)
+		}
+	}
 	selection, ok := result["selection"].(string)
 	if !ok || selection == "" {
 		return errors.New("originalStatus result requires selection")
@@ -853,7 +858,7 @@ func validateOriginalStatusResultRunner(result map[string]any) error {
 		if err != nil || mektup.ValidateID(messageID, mektup.MessageIDPrefix) != nil {
 			return errors.New("originalStatus selected result requires a valid replyMessageId")
 		}
-		status, err := requireString("status")
+		status, err := requireString("replyStatus")
 		if err != nil || (status != "success" && status != "error") {
 			return errors.New("originalStatus selected result requires success or error replyStatus")
 		}
@@ -917,7 +922,7 @@ func validateOriginalStatusResultRunner(result map[string]any) error {
 		return nil
 	}
 	if selection == "pending" {
-		for _, field := range []string{"state", "replyMessageId", "replyStatus", "replyErrorCode", "status", "bodyBytes", "bodySha256", "nativeItemId", "eventSeq", "commitSeq", "winner"} {
+		for _, field := range []string{"state", "replyMessageId", "replyStatus", "replyErrorCode", "status", "bodyBytes", "bodySha256", "nativeItemId", "eventSeq", "commitSeq", "fencingToken", "lease", "requestedLease", "attemptOwner", "winner"} {
 			if _, present := result[field]; present {
 				return fmt.Errorf("pending forbids %s", field)
 			}

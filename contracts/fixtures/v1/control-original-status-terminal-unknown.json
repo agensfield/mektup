@@ -17,7 +17,7 @@
     "selection": "terminal_unknown",
     "state": "reply_outcome_unknown",
     "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007",
-    "status": "error",
+    "replyStatus": "error",
     "replyErrorCode": "reply_rejected",
     "bodyBytes": 9,
     "bodySha256": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",

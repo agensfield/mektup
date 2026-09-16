@@ -200,10 +200,10 @@
                 "properties": {
                   "selection": { "const": "winner" },
                   "state": { "enum": ["reply_accepted", "reply_observed"] },
-                  "status": { "type": "string", "enum": ["success", "error"] },
+                  "replyStatus": { "enum": ["success", "error"] },
                   "replyErrorCode": { "type": "string", "minLength": 1 }
                 },
-                "required": ["state", "replyMessageId", "status", "bodyBytes", "bodySha256", "commitSeq"],
+                "required": ["state", "replyMessageId", "replyStatus", "bodyBytes", "bodySha256", "commitSeq"],
                 "allOf": [
                   {
                     "if": { "properties": { "state": { "const": "reply_observed" } } },
@@ -211,34 +211,34 @@
                   },
                   {
                     "if": { "required": ["replyErrorCode"] },
-                    "then": { "properties": { "status": { "const": "error" } } }
+                    "then": { "properties": { "replyStatus": { "const": "error" } } }
                   },
                   {
-                    "if": { "required": ["status"], "properties": { "status": { "const": "success" } } },
+                    "if": { "required": ["replyStatus"], "properties": { "replyStatus": { "const": "success" } } },
                     "then": { "not": { "required": ["replyErrorCode"] } }
                   }
                 ],
-                "not": { "anyOf": [{ "required": ["eventSeq"] }, { "required": ["replyStatus"] }, { "required": ["body"] }, { "required": ["bodyText"] }, { "required": ["bodyContent"] }, { "required": ["replyBody"] }, { "required": ["fencingToken"] }, { "required": ["lease"] }, { "required": ["winner"] }] }
+                "not": { "anyOf": [{ "required": ["eventSeq"] }, { "required": ["status"] }, { "required": ["body"] }, { "required": ["bodyText"] }, { "required": ["bodyContent"] }, { "required": ["replyBody"] }, { "required": ["fencingToken"] }, { "required": ["lease"] }, { "required": ["requestedLease"] }, { "required": ["attemptOwner"] }, { "required": ["winner"] }] }
               },
               {
                 "properties": {
                   "selection": { "const": "terminal_unknown" },
                   "state": { "const": "reply_outcome_unknown" },
-                  "status": { "type": "string", "enum": ["success", "error"] },
+                  "replyStatus": { "enum": ["success", "error"] },
                   "replyErrorCode": { "type": "string", "minLength": 1 }
                 },
-                "required": ["state", "replyMessageId", "status", "bodyBytes", "bodySha256", "eventSeq"],
+                "required": ["state", "replyMessageId", "replyStatus", "bodyBytes", "bodySha256", "eventSeq"],
                 "allOf": [
                   {
                     "if": { "required": ["replyErrorCode"] },
-                    "then": { "properties": { "status": { "const": "error" } } }
+                    "then": { "properties": { "replyStatus": { "const": "error" } } }
                   },
                   {
-                    "if": { "required": ["status"], "properties": { "status": { "const": "success" } } },
+                    "if": { "required": ["replyStatus"], "properties": { "replyStatus": { "const": "success" } } },
                     "then": { "not": { "required": ["replyErrorCode"] } }
                   }
                 ],
-                "not": { "anyOf": [{ "required": ["commitSeq"] }, { "required": ["nativeItemId"] }, { "required": ["replyStatus"] }, { "required": ["body"] }, { "required": ["bodyText"] }, { "required": ["bodyContent"] }, { "required": ["replyBody"] }, { "required": ["fencingToken"] }, { "required": ["lease"] }, { "required": ["winner"] }] }
+                "not": { "anyOf": [{ "required": ["commitSeq"] }, { "required": ["nativeItemId"] }, { "required": ["status"] }, { "required": ["body"] }, { "required": ["bodyText"] }, { "required": ["bodyContent"] }, { "required": ["replyBody"] }, { "required": ["fencingToken"] }, { "required": ["lease"] }, { "required": ["requestedLease"] }, { "required": ["attemptOwner"] }, { "required": ["winner"] }] }
               },
               {
                 "properties": { "selection": { "const": "pending" } },
@@ -254,9 +254,14 @@
                     { "required": ["bodyText"] },
                     { "required": ["bodyContent"] },
                     { "required": ["replyBody"] },
+                    { "required": ["status"] },
                     { "required": ["nativeItemId"] },
                     { "required": ["eventSeq"] },
                     { "required": ["commitSeq"] },
+                    { "required": ["fencingToken"] },
+                    { "required": ["lease"] },
+                    { "required": ["requestedLease"] },
+                    { "required": ["attemptOwner"] },
                     { "required": ["winner"] }
                   ]
                 }

@@ -3,5 +3,5 @@
   "operationId": "op_0198f0e0-0000-7000-8000-000000000038", "originalMessageId": "msg_0198f0e0-0000-7000-8000-000000000003",
   "custody": { "endpointId": "ep_0198f0e0-0000-7000-8000-000000000001", "storeId": "store_0198f0e0-0000-7000-8000-000000000002" },
   "replyDestination": { "endpointId": "ep_0198f0e0-0000-7000-8000-000000000001", "threadId": "thread-local-001", "uri": "codex://local/thread/thread-local-001" },
-  "result": { "selection": "winner", "state": "reply_observed", "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007", "status": "success", "bodyBytes": 7, "bodySha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "commitSeq": 1 }
+  "result": { "selection": "winner", "state": "reply_observed", "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007", "replyStatus": "success", "bodyBytes": 7, "bodySha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "commitSeq": 1 }
 }

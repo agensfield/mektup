@@ -86,7 +86,7 @@ func TestOriginalStatusResultUnion(t *testing.T) {
 	result := request
 	delete(result, "lease")
 	result["kind"] = "result"
-	result["result"] = map[string]any{"selection": "winner", "state": "reply_observed", "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007", "status": "success", "bodyBytes": 1, "bodySha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "commitSeq": 1, "nativeItemId": "native-1"}
+	result["result"] = map[string]any{"selection": "winner", "state": "reply_observed", "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007", "replyStatus": "success", "bodyBytes": 1, "bodySha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "commitSeq": 1, "nativeItemId": "native-1"}
 	if _, err := ValidateControlRequest(mustJSONValue(t, result)); err != nil {
 		t.Fatalf("valid originalStatus winner rejected: %v", err)
 	}

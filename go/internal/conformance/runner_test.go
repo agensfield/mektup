@@ -17,7 +17,7 @@ func TestRunFromRepositoryAndEmitDeterministicEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(summary.Fixtures) != 73 || len(summary.Scenarios) != 125 {
+	if len(summary.Fixtures) != 77 || len(summary.Scenarios) != 125 {
 		t.Fatalf("unexpected coverage: fixtures=%d scenarios=%d", len(summary.Fixtures), len(summary.Scenarios))
 	}
 	seen := make(map[string]bool, len(summary.Scenarios))
@@ -159,11 +159,14 @@ func TestOriginalStatusResultMutationsStayRejectedByRunner(t *testing.T) {
 		t.Fatal(err)
 	}
 	cases := map[string][]byte{
-		"winner zero commit":       bytes.Replace(winner, []byte(`"commitSeq": 3`), []byte(`"commitSeq": 0`), 1),
-		"observed missing native":  bytes.Replace(winner, []byte(",\n    \"nativeItemId\": \"item-reply-001\""), nil, 1),
-		"winner null body content": bytes.Replace(winner, []byte(`"provenance":`), []byte(`"bodyContent": null, "provenance":`), 1),
-		"pending selected reply":   bytes.Replace(pending, []byte(`"selection": "pending"`), []byte(`"selection": "pending", "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007"`), 1),
-		"request body metadata":    bytes.Replace(request, []byte(`"replyDestination": {`), []byte(`"bodyBytes": 1, "replyDestination": {`), 1),
+		"winner zero commit":          bytes.Replace(winner, []byte(`"commitSeq": 3`), []byte(`"commitSeq": 0`), 1),
+		"observed missing native":     bytes.Replace(winner, []byte(",\n    \"nativeItemId\": \"item-reply-001\""), nil, 1),
+		"winner null body content":    bytes.Replace(winner, []byte(`"provenance":`), []byte(`"bodyContent": null, "provenance":`), 1),
+		"winner null reply body":      bytes.Replace(winner, []byte(`"provenance":`), []byte(`"replyBody": null, "provenance":`), 1),
+		"winner null requested lease": bytes.Replace(winner, []byte(`"provenance":`), []byte(`"requestedLease": null, "provenance":`), 1),
+		"winner null attempt owner":   bytes.Replace(winner, []byte(`"provenance":`), []byte(`"attemptOwner": null, "provenance":`), 1),
+		"pending selected reply":      bytes.Replace(pending, []byte(`"selection": "pending"`), []byte(`"selection": "pending", "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007"`), 1),
+		"request body metadata":       bytes.Replace(request, []byte(`"replyDestination": {`), []byte(`"bodyBytes": 1, "replyDestination": {`), 1),
 	}
 	for name, data := range cases {
 		t.Run(name, func(t *testing.T) {

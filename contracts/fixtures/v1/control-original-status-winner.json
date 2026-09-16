@@ -17,7 +17,7 @@
     "selection": "winner",
     "state": "reply_observed",
     "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007",
-    "status": "success",
+    "replyStatus": "success",
     "bodyBytes": 7,
     "bodySha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     "commitSeq": 3,
