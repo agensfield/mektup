@@ -684,9 +684,6 @@ func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.Cont
 	if out.WinnerStatus == "success" && out.WinnerErrorCode != "" {
 		return out, sshproxy.ErrControlValidation
 	}
-	if out.WinnerStatus == "error" && out.WinnerErrorCode == "" {
-		return out, sshproxy.ErrControlValidation
-	}
 	provenanceRaw, ok := raw["provenance"]
 	if !ok || string(bytes.TrimSpace(provenanceRaw)) == "null" {
 		return out, sshproxy.ErrControlValidation

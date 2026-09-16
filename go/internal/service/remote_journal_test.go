@@ -149,3 +149,11 @@ func TestRemoteJournalRejectsSwappedResponseAndRequiresMapping(t *testing.T) {
 		t.Fatal("unmapped remote custody accepted")
 	}
 }
+
+func TestDecodeObserveResultAllowsErrorWinnerWithoutCode(t *testing.T) {
+	response := sshproxy.ControlRequest{Result: json.RawMessage(`{"state":"reply_observed","status":"observed","winner":{"replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000075","commitSeq":1,"status":"error","bodyBytes":4,"bodySha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","nativeItemId":"native-remote-1"},"provenance":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000072","controlRoute":"ep_0198f0e0-0000-7000-8000-000000000071"}}`)}
+	request := sshproxy.ControlRequest{Custody: sshproxy.CustodyRef{EndpointID: remoteCustodyEndpoint}, ReplyDestination: sshproxy.DestinationRef{EndpointID: bodyDestinationEndpoint}}
+	if _, err := decodeObserveResult(response, request); err != nil {
+		t.Fatalf("error winner without optional code rejected: %v", err)
+	}
+}
