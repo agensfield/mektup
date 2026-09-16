@@ -1029,7 +1029,7 @@ func mapError(err error, effect string) error {
 		return &cli.Error{Code: "resolver_unavailable", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
 	}
 	if errors.Is(err, endpoint.ErrResolverNotFound) {
-		return &cli.Error{Code: "target_not_found", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
+		return &cli.Error{Code: "endpoint_unavailable", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
 	}
 	if errors.Is(err, endpoint.ErrResolverAmbiguous) {
 		return &cli.Error{Code: "target_ambiguous", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}

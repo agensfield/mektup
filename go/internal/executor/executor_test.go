@@ -705,6 +705,28 @@ func TestExecutorRechecksPageAndCursorBounds(t *testing.T) {
 	}
 }
 
+func TestResolverNotFoundEmitsLockedWireErrorCode(t *testing.T) {
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{}}}, Targets: &fakeTargets{err: endpoint.ErrResolverNotFound}})
+	var out, errOut bytes.Buffer
+	a := &cli.App{Out: &out, Err: &errOut, Env: []string{"MEKTUP_AGENT=1"}, Executor: e}
+	if code := a.Run([]string{"--json", "thread", "read", "herdr://local/agent/missing"}); code != int(cli.ExitRejected) {
+		t.Fatalf("code=%d stderr=%q", code, errOut.String())
+	}
+	var event struct {
+		Data struct {
+			Error struct {
+				Code mektup.ErrorCode `json:"code"`
+			} `json:"error"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &event); err != nil {
+		t.Fatal(err)
+	}
+	if event.Data.Error.Code != mektup.ErrEndpointUnavailable || !event.Data.Error.Code.Valid() {
+		t.Fatalf("code=%q", event.Data.Error.Code)
+	}
+}
+
 type failingConnections struct{ err error }
 
 func (f failingConnections) Open(context.Context, string) (Connection, error) { return nil, f.err }
