@@ -30,6 +30,110 @@ type ReplyClaim struct {
 	Won            bool
 }
 
+type OriginalStatusResult struct {
+	Selection        string
+	Claim            ReplyClaim
+	EventSeq         int64
+	NativeItemID     string
+	TerminalEventSeq int64
+}
+
+// OriginalStatus expires every due claim for one original and selects the
+// authoritative winner, earliest terminal unknown, or pending from one
+// linearized custody transaction. It never creates or renews authority.
+func (j *Journal) OriginalStatus(ctx context.Context, originalID string) (OriginalStatusResult, error) {
+	if originalID == "" {
+		return OriginalStatusResult{}, ErrNotFound
+	}
+	var out OriginalStatusResult
+	err := j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
+		var exists int
+		if err := tx.QueryRow("SELECT 1 FROM operations WHERE message_id=?", originalID).Scan(&exists); err != nil {
+			if err == sql.ErrNoRows {
+				return ErrNotFound
+			}
+			return err
+		}
+		rows, err := tx.Query("SELECT reply_id FROM reply_claims WHERE original_id=? AND state=? AND lease_until<=?", originalID, string(StateReplyClaimed), now)
+		if err != nil {
+			return err
+		}
+		var due []string
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			due = append(due, id)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		for _, id := range due {
+			if err := expireClaimTx(tx, id, now); err != nil {
+				return err
+			}
+		}
+		var claim ReplyClaim
+		var native sql.NullString
+		var seq int64
+		err = scanClaim(tx.QueryRow(`SELECT c.reply_id,c.original_id,c.digest,c.body_size,c.status,c.reply_error_code,c.reply_route,c.custody_route,c.custody_store_id,c.owner,c.token,c.lease_until,c.state,c.created_at,c.updated_at,COALESCE(c.accepted_at,0),COALESCE(c.commit_seq,0) FROM reply_winners w JOIN reply_claims c ON c.reply_id=w.reply_id LEFT JOIN observations o ON o.reply_id=c.reply_id WHERE w.original_id=?`, originalID), &claim)
+		if err == nil {
+			if err := tx.QueryRow("SELECT w.commit_seq,COALESCE(o.native_item_id,'') FROM reply_winners w LEFT JOIN observations o ON o.reply_id=w.reply_id WHERE w.original_id=?", originalID).Scan(&seq, &native); err != nil {
+				return err
+			}
+			claim.Token = ""
+			out = OriginalStatusResult{Selection: "winner", Claim: claim, EventSeq: seq, NativeItemID: native.String}
+			return nil
+		}
+		if err != sql.ErrNoRows {
+			return err
+		}
+		rows, err = tx.Query(`SELECT c.reply_id,COALESCE((SELECT MIN(e.seq) FROM events e WHERE e.reply_id=c.reply_id AND e.state=?),0) FROM reply_claims c WHERE c.original_id=? AND c.state=? ORDER BY 2,c.reply_id`, string(StateReplyOutcomeUnknown), originalID, string(StateReplyOutcomeUnknown))
+		if err != nil {
+			return err
+		}
+		type unknown struct {
+			id  string
+			seq int64
+		}
+		var unknowns []unknown
+		for rows.Next() {
+			var u unknown
+			if err := rows.Scan(&u.id, &u.seq); err != nil {
+				rows.Close()
+				return err
+			}
+			if u.seq == 0 {
+				rows.Close()
+				return fmt.Errorf("%w: terminal unknown lacks custody event", ErrCorrupt)
+			}
+			unknowns = append(unknowns, u)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		if len(unknowns) != 0 {
+			var u ReplyClaim
+			if err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_error_code,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", unknowns[0].id), &u); err != nil {
+				return err
+			}
+			u.Token = ""
+			out = OriginalStatusResult{Selection: "terminal_unknown", Claim: u, TerminalEventSeq: unknowns[0].seq}
+			return nil
+		}
+		out.Selection = "pending"
+		return nil
+	})
+	return out, err
+}
+
 // ClaimInput is the complete identity fence. Every field is compared for a
 // duplicate reply ID, including routes and terminal status.
 type ClaimInput struct {

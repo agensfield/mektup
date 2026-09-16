@@ -162,6 +162,45 @@ func TestReceiverClaimHeartbeatCommitStatusAndDuplicate(t *testing.T) {
 	}
 }
 
+func TestReceiverOriginalStatusIsTokenlessAndWinnerFirst(t *testing.T) {
+	j, _ := openReceiverJournal(t, time.Minute)
+	prepareOriginal(t, j)
+	claim, err := j.ClaimReply(context.Background(), journal.ClaimInput{ReplyID: replyID, OriginalID: originalID, Digest: "sha256:" + strings.Repeat("c", 64), BodySize: 7, Status: "success", ReplyRoute: "codex://local/thread/source", CustodyRoute: receiverEndpoint, CustodyStoreID: j.StoreID(), Owner: "receiver-test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.CommitReply(context.Background(), claim.ReplyID, claim.Owner, claim.Token); err != nil {
+		t.Fatal(err)
+	}
+	receiver := Receiver{Registry: staticResolver{store: Store{Journal: j, StoreID: j.StoreID(), EndpointID: receiverEndpoint, CloseFunc: func() error { return nil }}}, LocalEndpointID: receiverEndpoint, Destination: localDestination()}
+	q := request(j)
+	q.Operation = "originalStatus"
+	q.ReplyMessageID = ""
+	q.BodyBytes = nil
+	q.BodySHA256 = ""
+	q.ReplyStatus = ""
+	q.AttemptOwner = ""
+	q.ReplyErrorCode = ""
+	response, err := receiver.Receive(context.Background(), mustMarshal(t, q))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := sshproxy.ValidateControlRequest(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result map[string]any
+	if err := json.Unmarshal(parsed.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result["selection"] != "winner" || result["replyMessageId"] != replyID {
+		t.Fatalf("originalStatus result %#v", result)
+	}
+	if _, ok := result["fencingToken"]; ok {
+		t.Fatal("originalStatus leaked token")
+	}
+}
+
 func TestReceiverObserveAcceptedIsTokenlessAndIdempotent(t *testing.T) {
 	j, _ := openReceiverJournal(t, time.Minute)
 	prepareOriginal(t, j)

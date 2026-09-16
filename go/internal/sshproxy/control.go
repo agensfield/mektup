@@ -171,6 +171,15 @@ func validateKnownFields(raw map[string]json.RawMessage) error {
 	}
 	for _, item := range stringChecks {
 		if value, present := raw[item.field]; present {
+			if item.field == "replyMessageId" {
+				var operation string
+				if opRaw, ok := raw["operation"]; ok {
+					_ = json.Unmarshal(opRaw, &operation)
+				}
+				if operation == "originalStatus" && bytes.Equal(bytes.TrimSpace(value), []byte(`""`)) {
+					continue
+				}
+			}
 			textValue, err := rawString(value, item.field)
 			if err != nil || !item.check(textValue) {
 				return fmt.Errorf("%w: invalid known field %s", ErrControlValidation, item.field)

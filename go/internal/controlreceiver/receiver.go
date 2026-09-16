@@ -165,6 +165,9 @@ func (r Receiver) validateOriginal(ctx context.Context, j *journal.Journal, req 
 	}
 	op, err := j.OperationByMessage(ctx, req.OriginalMessageID)
 	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			return journal.ErrNotFound
+		}
 		return fmt.Errorf("%w: original operation unavailable: %v", ErrRelationshipMismatch, err)
 	}
 	if op.CustodyRoute != req.Custody.EndpointID || op.CustodyStoreID != storeID || op.ReplyRoute == "" || op.ReplyRoute != req.ReplyDestination.URI || op.ReplyEndpointID == "" || op.ReplyEndpointID != req.ReplyDestination.EndpointID || op.ReplyThreadID == "" || op.ReplyThreadID != req.ReplyDestination.ThreadID {
@@ -342,6 +345,38 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 			return nil, err
 		}
 		return resultJSON(map[string]any{"state": claim.State, "replyStatus": claim.Status, "replyErrorCode": claim.ReplyErrorCode, "commitSeq": claim.CommitSeq})
+	case "originalStatus":
+		status, err := j.OriginalStatus(ctx, req.OriginalMessageID)
+		if err != nil {
+			return nil, err
+		}
+		result := map[string]any{"selection": status.Selection}
+		switch status.Selection {
+		case "winner":
+			result["replyMessageId"] = status.Claim.ReplyID
+			result["status"] = status.Claim.Status
+			result["bodyBytes"] = status.Claim.BodySize
+			result["bodySha256"] = status.Claim.Digest
+			result["state"] = status.Claim.State
+			result["commitSeq"] = status.EventSeq
+			if status.Claim.ReplyErrorCode != "" {
+				result["replyErrorCode"] = status.Claim.ReplyErrorCode
+			}
+			if status.NativeItemID != "" {
+				result["nativeItemId"] = status.NativeItemID
+			}
+		case "terminal_unknown":
+			result["replyMessageId"] = status.Claim.ReplyID
+			result["status"] = status.Claim.Status
+			result["bodyBytes"] = status.Claim.BodySize
+			result["bodySha256"] = status.Claim.Digest
+			result["state"] = status.Claim.State
+			result["eventSeq"] = status.TerminalEventSeq
+			if status.Claim.ReplyErrorCode != "" {
+				result["replyErrorCode"] = status.Claim.ReplyErrorCode
+			}
+		}
+		return resultJSON(result)
 	default:
 		return nil, fmt.Errorf("%w: unsupported operation", sshproxy.ErrControlValidation)
 	}
