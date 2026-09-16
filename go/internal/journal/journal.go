@@ -740,13 +740,40 @@ func validateV6Schema(ctx context.Context, tx *sql.Tx) error {
 	if err := validateV5Schema(ctx, tx); err != nil {
 		return err
 	}
-	for _, column := range []string{"reply_endpoint_id", "reply_thread_id"} {
-		var count int
-		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('operations') WHERE name=?", column).Scan(&count); err != nil {
-			return fmt.Errorf("journal schema validation: %w", err)
+	return validateReplyTupleColumns(ctx, tx)
+}
+
+func validateReplyTupleColumns(ctx context.Context, queryer schemaQueryer) error {
+	rows, err := queryer.QueryContext(ctx, "PRAGMA table_info('operations')")
+	if err != nil {
+		return fmt.Errorf("%w: inspect operations schema: %v", ErrCorrupt, err)
+	}
+	defer rows.Close()
+	type column struct {
+		typ          string
+		notNull      int
+		defaultValue any
+	}
+	columns := make(map[string]column)
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			return fmt.Errorf("%w: inspect operations schema: %v", ErrCorrupt, err)
 		}
-		if count != 1 {
-			return fmt.Errorf("%w: required v6 column operations.%s is missing", ErrCorrupt, column)
+		columns[name] = column{typ: strings.ToUpper(strings.TrimSpace(typ)), notNull: notNull, defaultValue: defaultValue}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("%w: inspect operations schema: %v", ErrCorrupt, err)
+	}
+	for _, name := range []string{"reply_endpoint_id", "reply_thread_id"} {
+		column, ok := columns[name]
+		if !ok {
+			return fmt.Errorf("%w: required v6 column operations.%s is missing", ErrCorrupt, name)
+		}
+		if column.typ != "TEXT" || column.notNull != 1 || fmt.Sprint(column.defaultValue) != "''" {
+			return fmt.Errorf("%w: malformed v6 column operations.%s", ErrCorrupt, name)
 		}
 	}
 	return nil

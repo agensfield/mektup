@@ -56,8 +56,16 @@ func (s EndpointStore) EnsureBuiltinLocal(codexHome string) (Endpoint, error) {
 	if s.StateHome == "" {
 		return Endpoint{}, errors.New("state home is required for built-in local identity")
 	}
+	identityHome := s.IdentityHome
+	if identityHome == "" {
+		var err error
+		identityHome, err = DefaultStateRoot()
+		if err != nil {
+			return Endpoint{}, err
+		}
+	}
 	var result Endpoint
-	err := withExclusiveLock(filepath.Join(s.StateHome, ".endpoint-identities.lock"), func() error {
+	err := withExclusiveLock(filepath.Join(identityHome, ".endpoint-identities.lock"), func() error {
 		var err error
 		result, err = s.ensureBuiltinLocal(codexHome)
 		return err

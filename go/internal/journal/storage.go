@@ -351,11 +351,8 @@ func validateReadOnlySchema(ctx context.Context, db *sql.DB) error {
 			return fmt.Errorf("%w: required v6 receipt column %s is missing", ErrStorageCorrupt, column)
 		}
 	}
-	for _, column := range []string{"reply_endpoint_id", "reply_thread_id"} {
-		var count int
-		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('operations') WHERE name=?", column).Scan(&count); err != nil || count != 1 {
-			return fmt.Errorf("%w: required v6 operation column %s is missing", ErrStorageCorrupt, column)
-		}
+	if err := validateReplyTupleColumns(ctx, db); err != nil {
+		return err
 	}
 	return nil
 }
