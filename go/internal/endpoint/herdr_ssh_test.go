@@ -128,6 +128,9 @@ func TestRemoteHerdrRunnerRejectsHostMismatchAndArbitraryCommands(t *testing.T) 
 	runner.Config.SSH.Host = "route.example"
 	for _, argv := range [][]string{
 		{"sh", "-c", "touch /tmp/pwned"},
+		{"herdr", "agent", "get", "--:p1"},
+		{"herdr", "agent", "get", "-x:p1"},
+		{"herdr", "agent", "get", "w:p1:extra"},
 		{"herdr", "agent", "get", "workspace:pane with spaces"},
 		{"herdr", "agent", "get", "workspace:p1/../../secret"},
 	} {
@@ -135,6 +138,25 @@ func TestRemoteHerdrRunnerRejectsHostMismatchAndArbitraryCommands(t *testing.T) 
 		if !errors.Is(err, ErrHerdrRunnerInvalidCommand) {
 			t.Errorf("argv %#v error = %v", argv, err)
 		}
+	}
+}
+
+func TestRemoteHerdrRunnerAcceptsNormalPaneID(t *testing.T) {
+	p := bufferedHerdrProcess([]byte(`{"agent":{}}`), nil)
+	var got []string
+	runner := RemoteHerdrRunner{
+		Config: HerdrRunnerConfig{SSH: sshproxy.Config{Host: "route.example"}},
+		Factory: sshproxy.ProcessFactoryFunc(func(argv []string) (sshproxy.Process, error) {
+			got = append([]string(nil), argv...)
+			return p, nil
+		}),
+	}
+	if _, err := runner.RunEndpoint(context.Background(), testEndpoint(t, "route.example"), []string{"herdr", "agent", "get", "w3:p1"}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ssh", "--", "route.example", "herdr", "agent", "get", "w3:p1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("argv = %#v, want %#v", got, want)
 	}
 }
 

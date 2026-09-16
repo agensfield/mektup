@@ -112,6 +112,9 @@ func (r RemoteHerdrRunner) RunEndpoint(ctx context.Context, ep Endpoint, argv []
 	if cfg.SSH.Host != "" && cfg.SSH.Host != ep.Route.SSHHost {
 		return nil, fmt.Errorf("%w: configured=%q route=%q", ErrHerdrRunnerHostMismatch, cfg.SSH.Host, ep.Route.SSHHost)
 	}
+	if cfg.SSH.SSHBinary == "" {
+		cfg.SSH.SSHBinary = sshproxy.DefaultSSHBinary
+	}
 	cfg.SSH.Host = ep.Route.SSHHost
 	if err := cfg.SSH.Validate(); err != nil {
 		return nil, err
@@ -154,7 +157,25 @@ func validateHerdrCommand(argv []string) ([]string, error) {
 }
 
 func validRemotePane(value string) bool {
-	return value != "" && len(value) <= 1024 && !strings.ContainsAny(value, "\x00\r\n\t /\\") && fullyQualifiedPane(value)
+	if value == "" || len(value) > 1024 || strings.Count(value, ":") != 1 {
+		return false
+	}
+	parts := strings.SplitN(value, ":", 2)
+	return validHerdrToken(parts[0]) && validHerdrToken(parts[1]) && strings.HasPrefix(parts[1], "p")
+}
+
+func validHerdrToken(value string) bool {
+	if value == "" || strings.HasPrefix(value, "-") {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 type herdrReadResult struct {
