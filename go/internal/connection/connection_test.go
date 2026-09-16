@@ -143,6 +143,19 @@ func TestConnectCapturesAuthorityExperimentalGenerationAndProxySeparately(t *tes
 	}
 }
 
+func TestConnectClassifiesPreHandshakeDialFailureAsEndpointUnavailable(t *testing.T) {
+	route := testRoute(t)
+	dialErr := errors.New("websocket handshake on unix socket \\\"/tmp/missing.sock\\\": dial unix /tmp/missing.sock: connect: no such file or directory")
+	_, err := Connect(context.Background(), route, Options{
+		ClientDialer: ClientDialFunc(func(context.Context, endpoint.Route, appserver.Options) (*appserver.Client, error) {
+			return nil, dialErr
+		}),
+	})
+	if !errors.Is(err, ErrEndpointUnavailable) || !errors.Is(err, dialErr) {
+		t.Fatalf("dial failure = %v, want endpoint-unavailable and underlying cause", err)
+	}
+}
+
 func TestUntestedAndUnknownVersionsProceedWithStableWarnings(t *testing.T) {
 	tests := []struct {
 		name    string

@@ -929,3 +929,74 @@ func TestMessagingPreservesInjectedHerdrEndpointRunner(t *testing.T) {
 		t.Fatalf("injected endpoint runner was replaced")
 	}
 }
+
+func TestAppThreadListMapsUnavailableUnixSocketWithoutFallback(t *testing.T) {
+	tests := []struct {
+		name      string
+		dialErr   error
+		wantCause string
+	}{
+		{name: "missing", wantCause: "no such file or directory"},
+		{name: "refused", dialErr: syscall.ECONNREFUSED, wantCause: "connection refused"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := t.TempDir()
+			state := filepath.Join(root, "state")
+			config := filepath.Join(root, "endpoints.json")
+			socketDir, err := os.MkdirTemp("/tmp", "mu-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(socketDir) })
+			socketPath := filepath.Join(socketDir, "isolated.sock")
+			route, err := endpoint.UnixRoute(socketPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := endpoint.NewStoreWithIdentityHome(config, state, filepath.Join(root, "identity"))
+			if err := store.Add(endpoint.Endpoint{ID: endpointID(), Alias: "isolated", Route: route, Herdr: endpoint.HerdrDisabled}); err != nil {
+				t.Fatal(err)
+			}
+
+			var out, errOut bytes.Buffer
+			envOptions := Options{CodexHome: filepath.Join(root, "codex"), IdentityHome: filepath.Join(root, "identity")}
+			if test.dialErr != nil {
+				envOptions.DialerForRoute = func(endpoint.Route, bool) connection.ClientDialer {
+					return connection.ClientDialFunc(func(context.Context, endpoint.Route, appserver.Options) (*appserver.Client, error) {
+						return nil, test.dialErr
+					})
+				}
+			}
+			env := New(envOptions)
+			app := &cli.App{
+				In:       strings.NewReader(""),
+				Out:      &out,
+				Err:      &errOut,
+				Executor: env,
+				Env:      []string{"MEKTUP_OUTPUT=json", "MEKTUP_CONFIG=" + config, "MEKTUP_STATE_DIR=" + state},
+			}
+			if code := app.Run([]string{"--endpoint", "isolated", "thread", "list", "--limit", "1"}); code != int(cli.ExitRejected) {
+				t.Fatalf("exit=%d stdout=%s stderr=%s", code, out.String(), errOut.String())
+			}
+			var event map[string]any
+			if err := json.Unmarshal([]byte(strings.TrimSpace(out.String())), &event); err != nil {
+				t.Fatalf("decode JSONL stdout %q: %v", out.String(), err)
+			}
+			data, ok := event["data"].(map[string]any)
+			if !ok {
+				t.Fatalf("event data = %#v", event["data"])
+			}
+			errData, ok := data["error"].(map[string]any)
+			if !ok || errData["code"] != "endpoint_unavailable" || errData["effectState"] != "not_sent" {
+				t.Fatalf("error data = %#v", data["error"])
+			}
+			if !strings.Contains(errData["message"].(string), test.wantCause) {
+				t.Fatalf("error message = %q, want %q", errData["message"], test.wantCause)
+			}
+			if _, err := os.Stat(filepath.Join(root, "codex")); !os.IsNotExist(err) {
+				t.Fatalf("missing/refused endpoint unexpectedly created codex home: %v", err)
+			}
+		})
+	}
+}

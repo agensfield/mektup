@@ -24,9 +24,10 @@ import (
 )
 
 var (
-	ErrNotReady      = errors.New("mektup connection is not ready")
-	ErrUnsupported   = errors.New("mektup connection server is unsupported")
-	ErrSSHUninjected = errors.New("mektup SSH dialing requires an injected dialer")
+	ErrNotReady            = errors.New("mektup connection is not ready")
+	ErrUnsupported         = errors.New("mektup connection server is unsupported")
+	ErrSSHUninjected       = errors.New("mektup SSH dialing requires an injected dialer")
+	ErrEndpointUnavailable = errors.New("mektup endpoint is unavailable")
 )
 
 // Dialer opens the transport for one already-resolved route. The adapter
@@ -270,7 +271,14 @@ func Connect(ctx context.Context, route endpoint.Route, options Options) (*Conne
 		client, err = (defaultClientDialer{}).DialClient(ctx, route, appOptions)
 	}
 	if err != nil {
-		return nil, err
+		// Dial errors happen before an app-server client exists, so no
+		// operation can have been written. Preserve the underlying cause for
+		// diagnostics and context cancellation while giving callers a stable
+		// route-unavailable classification.
+		if errors.Is(err, ErrSSHUninjected) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("%w: %w", ErrEndpointUnavailable, err)
 	}
 	if client == nil {
 		return nil, errors.New("mektup connection dialer returned a nil client")

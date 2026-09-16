@@ -1053,6 +1053,9 @@ func mapError(err error, effect string) error {
 	if errors.Is(err, connection.ErrUnsupported) {
 		return &cli.Error{Code: "unsupported_server_version", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
 	}
+	if errors.Is(err, connection.ErrEndpointUnavailable) {
+		return &cli.Error{Code: "endpoint_unavailable", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
+	}
 	if errors.Is(err, endpoint.ErrInvalidTarget) {
 		return &cli.Error{Code: "invalid_target", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitUsage}
 	}
