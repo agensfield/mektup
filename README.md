@@ -5,7 +5,7 @@ Messaging is its first product-critical workflow; thread control is its reusable
 foundation.
 
 The repository is being implemented against Mektup specification revision
-1.0.4 and Codex app-server 0.154.0. No stable release exists yet.
+1.0.5 and Codex app-server 0.154.0. No stable release exists yet.
 
 ## Repository layout
 

@@ -22,6 +22,7 @@ import (
 
 	mektup "github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/internal/cli"
+	"github.com/agensfield/mektup/go/internal/sshproxy"
 )
 
 const (
@@ -574,6 +575,9 @@ func validateErrorFixture(data []byte) error {
 }
 
 func validateControlFixture(data []byte) error {
+	if _, err := sshproxy.ValidateControlRequest(data); err != nil {
+		return err
+	}
 	var value map[string]any
 	if err := json.Unmarshal(data, &value); err != nil {
 		return err
@@ -596,10 +600,13 @@ func validateControlFixture(data []byte) error {
 	if err != nil {
 		return err
 	}
-	if op != "claim" && op != "heartbeat" && op != "commit" && op != "abandon" && op != "status" && op != "reconcile" && op != "observe" {
+	if op != "claim" && op != "heartbeat" && op != "commit" && op != "abandon" && op != "status" && op != "reconcile" && op != "observe" && op != "originalStatus" {
 		return fmt.Errorf("invalid control operation %q", op)
 	}
 	for _, item := range []struct{ name, prefix string }{{"operationId", mektup.OperationIDPrefix}, {"replyMessageId", mektup.MessageIDPrefix}, {"originalMessageId", mektup.MessageIDPrefix}} {
+		if op == "originalStatus" && item.name == "replyMessageId" {
+			continue
+		}
 		v, err := stringValue(item.name)
 		if err != nil {
 			return err
@@ -653,6 +660,13 @@ func validateControlFixture(data []byte) error {
 		for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner"} {
 			if _, present := value[field]; present {
 				return fmt.Errorf("observe forbids %s", field)
+			}
+		}
+	}
+	if kind == "request" && op == "originalStatus" {
+		for _, field := range []string{"replyMessageId", "bodyBytes", "bodySha256", "replyStatus", "replyErrorCode", "nativeItemId", "fencingToken", "lease", "requestedLease", "attemptOwner", "result"} {
+			if _, present := value[field]; present {
+				return fmt.Errorf("originalStatus forbids %s", field)
 			}
 		}
 	}
@@ -754,6 +768,17 @@ func validateControlFixture(data []byte) error {
 				}
 			}
 		}
+		if op == "originalStatus" {
+			if _, present := result["winner"]; present {
+				return errors.New("originalStatus result forbids winner")
+			}
+			if _, present := result["replyStatus"]; present {
+				return errors.New("originalStatus result forbids replyStatus")
+			}
+			if err := validateOriginalStatusResultRunner(result); err != nil {
+				return err
+			}
+		}
 	}
 	if kind == "request" && (op == "claim" || op == "heartbeat" || op == "commit" || op == "abandon" || op == "observe") {
 		_, bodyBytesPresent := value["bodyBytes"]
@@ -799,12 +824,110 @@ func validateControlFixture(data []byte) error {
 	return nil
 }
 
+func validateOriginalStatusResultRunner(result map[string]any) error {
+	selection, ok := result["selection"].(string)
+	if !ok || selection == "" {
+		return errors.New("originalStatus result requires selection")
+	}
+	positive := func(field string) error {
+		number, ok := result[field].(float64)
+		if !ok || number <= 0 || number != float64(uint64(number)) {
+			return fmt.Errorf("originalStatus %s must be a positive integer", field)
+		}
+		return nil
+	}
+	requireString := func(field string) (string, error) {
+		text, ok := result[field].(string)
+		if !ok || text == "" {
+			return "", fmt.Errorf("originalStatus %s requires nonempty %s", selection, field)
+		}
+		return text, nil
+	}
+	requireEvidence := func() error {
+		messageID, err := requireString("replyMessageId")
+		if err != nil || mektup.ValidateID(messageID, mektup.MessageIDPrefix) != nil {
+			return errors.New("originalStatus selected result requires a valid replyMessageId")
+		}
+		status, err := requireString("status")
+		if err != nil || (status != "success" && status != "error") {
+			return errors.New("originalStatus selected result requires success or error replyStatus")
+		}
+		bodyBytes, ok := result["bodyBytes"].(float64)
+		if !ok || bodyBytes < 0 || bodyBytes != float64(uint64(bodyBytes)) {
+			return errors.New("originalStatus selected result requires nonnegative bodyBytes")
+		}
+		bodyDigest, ok := result["bodySha256"].(string)
+		if !ok || !validDigest(bodyDigest) {
+			return errors.New("originalStatus selected result requires valid bodySha256")
+		}
+		if errorCode, present := result["replyErrorCode"]; present {
+			code, ok := errorCode.(string)
+			if !ok || code == "" || status != "error" {
+				return errors.New("replyErrorCode requires error replyStatus")
+			}
+		}
+		return nil
+	}
+	if selection == "winner" {
+		state, err := requireString("state")
+		if err != nil || (state != "reply_accepted" && state != "reply_observed") {
+			return errors.New("winner requires reply_accepted or reply_observed state")
+		}
+		if err := requireEvidence(); err != nil {
+			return err
+		}
+		if err := positive("commitSeq"); err != nil {
+			return err
+		}
+		if state == "reply_observed" {
+			if _, err := requireString("nativeItemId"); err != nil {
+				return err
+			}
+		} else if native, present := result["nativeItemId"]; present {
+			if text, ok := native.(string); !ok || text == "" {
+				return errors.New("winner nativeItemId must be a nonempty string")
+			}
+		}
+		if _, present := result["eventSeq"]; present {
+			return errors.New("winner forbids eventSeq")
+		}
+		return nil
+	}
+	if selection == "terminal_unknown" {
+		state, err := requireString("state")
+		if err != nil || state != "reply_outcome_unknown" {
+			return errors.New("terminal_unknown requires reply_outcome_unknown state")
+		}
+		if err := requireEvidence(); err != nil {
+			return err
+		}
+		if err := positive("eventSeq"); err != nil {
+			return err
+		}
+		for _, field := range []string{"commitSeq", "nativeItemId"} {
+			if _, present := result[field]; present {
+				return fmt.Errorf("terminal_unknown forbids %s", field)
+			}
+		}
+		return nil
+	}
+	if selection == "pending" {
+		for _, field := range []string{"state", "replyMessageId", "replyStatus", "replyErrorCode", "status", "bodyBytes", "bodySha256", "nativeItemId", "eventSeq", "commitSeq", "winner"} {
+			if _, present := result[field]; present {
+				return fmt.Errorf("pending forbids %s", field)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("unsupported originalStatus selection %q", selection)
+}
+
 func validateScenarioDocuments(s scenariosDocument, t transitionsDocument) error {
-	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.4" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
+	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.5" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
 		return errors.New("scenarios document metadata is incomplete")
 	}
-	if t.SpecVersion != "1.0.4" {
-		return errors.New("transitions document spec revision is not 1.0.4")
+	if t.SpecVersion != "1.0.5" {
+		return errors.New("transitions document spec revision is not 1.0.5")
 	}
 	states := map[string]bool{"none": true}
 	for _, state := range t.States {

@@ -1,6 +1,6 @@
-# Mektup v1 language-neutral contracts (spec revision 1.0.4)
+# Mektup v1 language-neutral contracts (spec revision 1.0.5)
 
-The locked product specification revision is 1.0.4. The wire schema identifiers
+The locked product specification revision is 1.0.5. The wire schema identifiers
 remain versioned as `.../v1`; the revision is contract metadata, not a new wire
 schema family.
 
@@ -30,6 +30,11 @@ returns tokenless state/status/winner metadata. `receiptId` is optional on
 control documents, including status/reconcile, because custody authority is the
 operation plus original/reply message identity rather than a local receipt
 handle.
+
+Portable reply recovery uses the tokenless `originalStatus` control operation.
+It requires the exact original custody and reply-destination tuple, never reads
+body content or revives authority, and returns only the strict `winner`,
+`terminal_unknown`, or `pending` selection union.
 
 Fixtures are intended to be consumed by Go, future Rust, and other
 implementations without changing their native APIs.

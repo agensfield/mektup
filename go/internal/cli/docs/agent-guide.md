@@ -1,4 +1,4 @@
-# Mektup agent guide (contract 1.0.4)
+# Mektup agent guide (contract 1.0.5)
 
 Mektup delivers messages to Codex threads and preserves evidence. Use ordinary
 `mektup send <target> <message>` for one-way delivery. Use
@@ -34,6 +34,11 @@ Remote exact-history strengthening uses an internal tokenless `observe` control
 operation. It carries the native item identity and verified tuple/digest, never
 a fencing token, lease, body, or dispatch owner. Repeated identical evidence is
 idempotent; conflicting native identity or digest is rejected.
+
+Portable reply recovery uses the tokenless `originalStatus` control operation.
+It requires the exact original custody and reply-destination tuple, never reads
+body content or revives authority, and returns only the strict `winner`,
+`terminal_unknown`, or `pending` selection union.
 
 Run `mektup docs commands --json` for version-matched command metadata and
 `mektup version --json` for build and tested Codex metadata. Embedded docs work

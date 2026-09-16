@@ -1,7 +1,7 @@
 {
   "schema": "mektup/conformance/v1/state-transitions",
   "contract": "wire-contract-v1",
-  "specVersion": "1.0.4",
+  "specVersion": "1.0.5",
   "states": [
     "not_sent",
     "prepared",

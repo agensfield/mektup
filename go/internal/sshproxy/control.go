@@ -107,6 +107,13 @@ func ValidateControlRequest(data []byte) (ControlRequest, error) {
 			}
 		}
 	}
+	if req.Kind == "request" && req.Operation == "originalStatus" {
+		for _, field := range []string{"replyMessageId", "bodyBytes", "bodySha256", "replyStatus", "replyErrorCode", "nativeItemId", "fencingToken", "lease", "requestedLease", "attemptOwner", "result"} {
+			if _, present := raw[field]; present {
+				return ControlRequest{}, fmt.Errorf("%w: originalStatus cannot contain %s, including null", ErrControlValidation, field)
+			}
+		}
+	}
 	if req.Operation == "observe" {
 		for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner"} {
 			if _, present := raw[field]; present {
@@ -125,6 +132,13 @@ func ValidateControlRequest(data []byte) (ControlRequest, error) {
 				return ControlRequest{}, fmt.Errorf("%w: result cannot contain top-level %s", ErrControlValidation, field)
 			}
 		}
+		if req.Operation == "originalStatus" {
+			for _, field := range []string{"replyMessageId", "nativeItemId", "bodyBytes", "bodySha256", "replyStatus", "replyErrorCode", "requestedLease", "attemptOwner"} {
+				if _, present := raw[field]; present {
+					return ControlRequest{}, fmt.Errorf("%w: originalStatus result forbids top-level %s", ErrControlValidation, field)
+				}
+			}
+		}
 	}
 	return req, nil
 }
@@ -138,7 +152,7 @@ func validateKnownFields(raw map[string]json.RawMessage) error {
 		{"kind", func(v string) bool { return v == "request" || v == "result" }},
 		{"operation", func(v string) bool {
 			switch v {
-			case "claim", "heartbeat", "commit", "abandon", "status", "reconcile", "observe":
+			case "claim", "heartbeat", "commit", "abandon", "status", "reconcile", "observe", "originalStatus":
 				return true
 			}
 			return false
@@ -214,6 +228,8 @@ func validateKnownFields(raw map[string]json.RawMessage) error {
 			if err != nil || !validURI(textValue) {
 				return fmt.Errorf("%w: invalid replyDestination.uri", ErrControlValidation)
 			}
+		} else {
+			return fmt.Errorf("%w: replyDestination requires uri", ErrControlValidation)
 		}
 	}
 	if value, present := raw["result"]; present {
@@ -293,11 +309,137 @@ func validateLeaseObject(value json.RawMessage) error {
 	return nil
 }
 
+func validateOriginalStatusResult(result map[string]json.RawMessage) error {
+	selection, ok := result["selection"]
+	if !ok {
+		return fmt.Errorf("%w: originalStatus result requires selection", ErrControlValidation)
+	}
+	selectionValue, err := rawString(selection, "result.selection")
+	if err != nil {
+		return err
+	}
+	requireString := func(field, prefix string) error {
+		value, present := result[field]
+		if !present {
+			return fmt.Errorf("%w: originalStatus %s requires %s", ErrControlValidation, selectionValue, field)
+		}
+		textValue, err := rawString(value, "result."+field)
+		if err != nil || (prefix != "" && !validID(textValue, prefix)) {
+			return fmt.Errorf("%w: invalid originalStatus result %s", ErrControlValidation, field)
+		}
+		return nil
+	}
+	requirePositive := func(field string) error {
+		value, present := result[field]
+		if !present {
+			return fmt.Errorf("%w: originalStatus %s requires %s", ErrControlValidation, selectionValue, field)
+		}
+		number, err := rawInt(value, "result."+field)
+		if err != nil || number <= 0 {
+			return fmt.Errorf("%w: originalStatus result %s must be positive", ErrControlValidation, field)
+		}
+		return nil
+	}
+	validateReplyEvidence := func() error {
+		if err := requireString("replyMessageId", "msg_"); err != nil {
+			return err
+		}
+		status, present := result["status"]
+		if !present {
+			return fmt.Errorf("%w: originalStatus result requires replyStatus", ErrControlValidation)
+		}
+		statusValue, err := rawString(status, "result.status")
+		if err != nil || (statusValue != "success" && statusValue != "error") {
+			return fmt.Errorf("%w: originalStatus result has invalid replyStatus", ErrControlValidation)
+		}
+		bodyBytes, present := result["bodyBytes"]
+		if !present {
+			return fmt.Errorf("%w: originalStatus result requires bodyBytes", ErrControlValidation)
+		}
+		if number, err := rawInt(bodyBytes, "result.bodyBytes"); err != nil || number < 0 {
+			return fmt.Errorf("%w: originalStatus result bodyBytes must be nonnegative", ErrControlValidation)
+		}
+		bodyDigest, present := result["bodySha256"]
+		if !present {
+			return fmt.Errorf("%w: originalStatus result requires bodySha256", ErrControlValidation)
+		}
+		digestValue, err := rawString(bodyDigest, "result.bodySha256")
+		if err != nil || !validSHA256(digestValue) {
+			return fmt.Errorf("%w: originalStatus result bodySha256 is invalid", ErrControlValidation)
+		}
+		if errorCode, present := result["replyErrorCode"]; present {
+			code, err := rawString(errorCode, "result.replyErrorCode")
+			if err != nil || code == "" || statusValue != "error" {
+				return fmt.Errorf("%w: replyErrorCode requires error replyStatus", ErrControlValidation)
+			}
+		}
+		return nil
+	}
+	forbiddenSelected := []string{"replyMessageId", "replyStatus", "replyErrorCode", "status", "bodyBytes", "bodySha256", "commitSeq", "eventSeq", "nativeItemId", "state"}
+	switch selectionValue {
+	case "winner":
+		if err := requireString("state", ""); err != nil {
+			return err
+		}
+		state, _ := rawString(result["state"], "result.state")
+		if state != "reply_accepted" && state != "reply_observed" {
+			return fmt.Errorf("%w: winner state must be reply_accepted or reply_observed", ErrControlValidation)
+		}
+		if err := validateReplyEvidence(); err != nil {
+			return err
+		}
+		if err := requirePositive("commitSeq"); err != nil {
+			return err
+		}
+		if state == "reply_observed" {
+			if err := requireString("nativeItemId", ""); err != nil {
+				return err
+			}
+		} else if native, present := result["nativeItemId"]; present {
+			if _, err := rawString(native, "result.nativeItemId"); err != nil {
+				return err
+			}
+		}
+		if _, present := result["eventSeq"]; present {
+			return fmt.Errorf("%w: winner forbids eventSeq", ErrControlValidation)
+		}
+	case "terminal_unknown":
+		if err := requireString("state", ""); err != nil {
+			return err
+		}
+		state, _ := rawString(result["state"], "result.state")
+		if state != "reply_outcome_unknown" {
+			return fmt.Errorf("%w: terminal_unknown state must be reply_outcome_unknown", ErrControlValidation)
+		}
+		if err := validateReplyEvidence(); err != nil {
+			return err
+		}
+		if err := requirePositive("eventSeq"); err != nil {
+			return err
+		}
+		if _, present := result["commitSeq"]; present {
+			return fmt.Errorf("%w: terminal_unknown forbids commitSeq", ErrControlValidation)
+		}
+		if _, present := result["nativeItemId"]; present {
+			return fmt.Errorf("%w: terminal_unknown forbids nativeItemId", ErrControlValidation)
+		}
+	case "pending":
+		for _, field := range forbiddenSelected {
+			if _, present := result[field]; present {
+				return fmt.Errorf("%w: pending forbids %s", ErrControlValidation, field)
+			}
+		}
+	default:
+		return fmt.Errorf("%w: unsupported originalStatus selection %q", ErrControlValidation, selectionValue)
+	}
+	return nil
+}
+
 func (r ControlRequest) Validate() error {
 	if r.Schema != "mektup/control/v1" || (r.Kind != "request" && r.Kind != "result") {
 		return fmt.Errorf("%w: schema and kind must identify a v1 document", ErrControlValidation)
 	}
-	if !validID(r.OperationID, "op_") || !validID(r.ReplyMessageID, "msg_") || !validID(r.OriginalMessageID, "msg_") {
+	if !validID(r.OperationID, "op_") || !validID(r.OriginalMessageID, "msg_") || (r.Operation != "originalStatus" && !validID(r.ReplyMessageID, "msg_")) {
 		return fmt.Errorf("%w: invalid operation or message identity", ErrControlValidation)
 	}
 	if r.ReceiptID != "" && !validID(r.ReceiptID, "rcpt_") {
@@ -333,11 +475,11 @@ func (r ControlRequest) Validate() error {
 	if r.ReplyStatus != "" && r.ReplyStatus != "success" && r.ReplyStatus != "error" {
 		return fmt.Errorf("%w: invalid reply status", ErrControlValidation)
 	}
-	if r.Operation != "claim" && r.Operation != "status" && r.Operation != "reconcile" && r.Operation != "observe" && r.RequestedLease != nil {
+	if r.Operation != "claim" && r.Operation != "status" && r.Operation != "reconcile" && r.Operation != "observe" && r.Operation != "originalStatus" && r.RequestedLease != nil {
 		return fmt.Errorf("%w: %s cannot contain requestedLease", ErrControlValidation, r.Operation)
 	}
 	switch r.Operation {
-	case "claim", "heartbeat", "commit", "abandon", "status", "reconcile", "observe":
+	case "claim", "heartbeat", "commit", "abandon", "status", "reconcile", "observe", "originalStatus":
 	default:
 		return fmt.Errorf("%w: unsupported operation %q", ErrControlValidation, r.Operation)
 	}
@@ -427,6 +569,16 @@ func (r ControlRequest) Validate() error {
 					}
 				}
 			}
+		} else if r.Operation == "originalStatus" {
+			if _, present := resultObject["replyStatus"]; present {
+				return fmt.Errorf("%w: originalStatus result forbids replyStatus", ErrControlValidation)
+			}
+			if _, present := resultObject["winner"]; present {
+				return fmt.Errorf("%w: originalStatus result forbids winner", ErrControlValidation)
+			}
+			if err := validateOriginalStatusResult(resultObject); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -447,6 +599,10 @@ func (r ControlRequest) Validate() error {
 			}
 		}
 	case "status", "reconcile":
+	case "originalStatus":
+		if r.ReplyMessageID != "" || r.BodyBytes != nil || r.BodySHA256 != "" || r.ReplyStatus != "" || r.ReplyErrorCode != "" || r.NativeItemID != "" || r.FencingToken != "" || r.Lease != nil || r.RequestedLease != nil || r.AttemptOwner != "" || len(r.Result) != 0 {
+			return fmt.Errorf("%w: originalStatus is metadata-only and original-scoped", ErrControlValidation)
+		}
 	case "observe":
 		if r.NativeItemID == "" || r.BodyBytes == nil || r.BodySHA256 == "" || r.ReplyStatus == "" || r.FencingToken != "" || r.Lease != nil || r.RequestedLease != nil || r.AttemptOwner != "" {
 			return fmt.Errorf("%w: observe requires native item evidence without dispatch authority", ErrControlValidation)

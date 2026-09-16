@@ -17,7 +17,7 @@ func TestRunFromRepositoryAndEmitDeterministicEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(summary.Fixtures) != 56 || len(summary.Scenarios) != 117 {
+	if len(summary.Fixtures) != 73 || len(summary.Scenarios) != 125 {
 		t.Fatalf("unexpected coverage: fixtures=%d scenarios=%d", len(summary.Fixtures), len(summary.Scenarios))
 	}
 	seen := make(map[string]bool, len(summary.Scenarios))
@@ -33,7 +33,7 @@ func TestRunFromRepositoryAndEmitDeterministicEvidence(t *testing.T) {
 		"endpoint.remote-control-cannot-rewrite-mapping",
 	} {
 		if !seen[id] {
-			t.Fatalf("missing spec 1.0.4 scenario %q", id)
+			t.Fatalf("missing spec 1.0.5 scenario %q", id)
 		}
 	}
 	var first, second bytes.Buffer
@@ -141,6 +141,38 @@ func TestClaimResultMutationsStayRejectedByRunner(t *testing.T) {
 	}
 }
 
+func TestOriginalStatusResultMutationsStayRejectedByRunner(t *testing.T) {
+	root, err := Root()
+	if err != nil {
+		t.Fatal(err)
+	}
+	winner, err := os.ReadFile(filepath.Join(root, fixturesDir, "control-original-status-winner.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	pending, err := os.ReadFile(filepath.Join(root, fixturesDir, "control-original-status-pending.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := os.ReadFile(filepath.Join(root, fixturesDir, "control-original-status-request.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string][]byte{
+		"winner zero commit":      bytes.Replace(winner, []byte(`"commitSeq": 3`), []byte(`"commitSeq": 0`), 1),
+		"observed missing native": bytes.Replace(winner, []byte(",\n    \"nativeItemId\": \"item-reply-001\""), nil, 1),
+		"pending selected reply":  bytes.Replace(pending, []byte(`"selection": "pending"`), []byte(`"selection": "pending", "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007"`), 1),
+		"request body metadata":   bytes.Replace(request, []byte(`"replyDestination": {`), []byte(`"bodyBytes": 1, "replyDestination": {`), 1),
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := validateControlFixture(data); err == nil {
+				t.Fatal("tampered originalStatus fixture unexpectedly passed runner validation")
+			}
+		})
+	}
+}
+
 func TestMissingExpectedInvalidFixtureIsManifestFailure(t *testing.T) {
 	root, err := Root()
 	if err != nil {
@@ -218,7 +250,7 @@ func TestManifestAndScenarioDecodeUnknownAdditiveFields(t *testing.T) {
 	if err := json.Unmarshal(augmented, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Schema != "mektup/conformance/v1/scenarios" || decoded.SpecVersion != "1.0.4" || len(decoded.Scenarios) != 117 {
+	if decoded.Schema != "mektup/conformance/v1/scenarios" || decoded.SpecVersion != "1.0.5" || len(decoded.Scenarios) != 125 {
 		t.Fatalf("additive scenario field changed stable content: %#v", decoded.Schema)
 	}
 }

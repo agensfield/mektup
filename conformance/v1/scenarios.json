@@ -1,7 +1,7 @@
 {
   "schema": "mektup/conformance/v1/scenarios",
   "version": "1.0.0",
-  "specVersion": "1.0.4",
+  "specVersion": "1.0.5",
   "source": "acceptance-v1.md",
   "profiles": {
     "plain_accept": {
@@ -91,6 +91,14 @@
     { "id": "reply.observe-accepted-to-observed", "matrix": "reply", "profile": "reply_observed_success", "observable": ["exact native evidence strengthens reply_accepted to reply_observed", "body is not resubmitted"] },
     { "id": "reply.observe-winner-never-replaced", "matrix": "reply", "profile": "reply_observed_success", "observable": ["first observation selects a winner only when none exists", "earlier winner remains stable"] },
     { "id": "reply.observe-no-dispatch-authority", "matrix": "reply", "profile": "usage_rejected", "observable": ["fencingToken, lease, requestedLease, and attemptOwner are forbidden", "summary/search/receipt claims cannot substitute native evidence"] },
+    { "id": "reply.original-status-winner", "matrix": "reply", "profile": "read_complete", "observable": ["authoritative winner is selected before terminal unknown", "accepted/observed winner union includes positive commitSeq", "observed winner includes nativeItemId"] },
+    { "id": "reply.original-status-terminal-unknown", "matrix": "reply", "profile": "read_complete", "observable": ["earliest durable terminal unknown is selected", "positive terminal event sequence and exact body metadata are returned", "expired fencing is never revived"] },
+    { "id": "reply.original-status-pending", "matrix": "reply", "profile": "read_complete", "observable": ["no winner or unknown returns pending", "pending contains no selected-reply metadata", "operation remains idempotent"] },
+    { "id": "reply.original-status-message-not-found", "matrix": "reply", "profile": "usage_rejected", "observable": ["absent original returns message_not_found", "missing original is never presented as pending", "no dispatch or lease effect"] },
+    { "id": "reply.original-status-identity-conflict", "matrix": "reply", "profile": "usage_rejected", "observable": ["tuple or route mismatch returns message_identity_conflict", "cached or caller-supplied selection is ignored", "no authority effect"] },
+    { "id": "reply.original-status-no-dispatch-authority", "matrix": "reply", "profile": "usage_rejected", "observable": ["request forbids reply identity, body metadata, native evidence, and authority including null", "result forbids fencing and lease authority", "originalStatus cannot dispatch or read body"] },
+    { "id": "reply.original-status-error-code", "matrix": "reply", "profile": "read_complete", "observable": ["replyErrorCode is allowed only with error status", "success selection forbids error code", "terminal selection remains tokenless"] },
+    { "id": "reply.original-status-sequence-shape", "matrix": "reply", "profile": "usage_rejected", "observable": ["zero or non-integer sequence/commitSeq is rejected", "observed selection requires nonempty nativeItemId", "strict selection union rejects additive authority"] },
 
     { "id": "transport.before-connection-write", "matrix": "transport", "profile": "usage_rejected", "observable": ["not_sent", "retry may be safe"] },
     { "id": "transport.prepared-process-dies", "matrix": "transport", "profile": "not_sent_recovered", "observable": ["recovery maps orphaned prepared attempt to not_sent", "message identity is retained"] },

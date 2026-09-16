@@ -59,6 +59,57 @@ func TestControlV1Fixtures(t *testing.T) {
 	}
 }
 
+func TestOriginalStatusResultUnion(t *testing.T) {
+	base, err := json.Marshal(validControlRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request map[string]any
+	if err := json.Unmarshal(base, &request); err != nil {
+		t.Fatal(err)
+	}
+	request["operation"] = "originalStatus"
+	delete(request, "replyMessageId")
+	delete(request, "bodyBytes")
+	delete(request, "bodySha256")
+	delete(request, "replyStatus")
+	delete(request, "attemptOwner")
+	delete(request, "requestedLease")
+	if _, err := ValidateControlRequest(mustJSONValue(t, request)); err != nil {
+		t.Fatalf("valid originalStatus request rejected: %v", err)
+	}
+	request["lease"] = nil
+	if _, err := ValidateControlRequest(mustJSONValue(t, request)); !errors.Is(err, ErrControlValidation) {
+		t.Fatalf("originalStatus request authority accepted: %v", err)
+	}
+
+	result := request
+	delete(result, "lease")
+	result["kind"] = "result"
+	result["result"] = map[string]any{"selection": "winner", "state": "reply_observed", "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007", "status": "success", "bodyBytes": 1, "bodySha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "commitSeq": 1, "nativeItemId": "native-1"}
+	if _, err := ValidateControlRequest(mustJSONValue(t, result)); err != nil {
+		t.Fatalf("valid originalStatus winner rejected: %v", err)
+	}
+	for name, mutation := range map[string]func(map[string]any){
+		"zero commitSeq":       func(raw map[string]any) { raw["result"].(map[string]any)["commitSeq"] = 0 },
+		"observed null native": func(raw map[string]any) { raw["result"].(map[string]any)["nativeItemId"] = nil },
+		"pending selected reply": func(raw map[string]any) {
+			raw["result"] = map[string]any{"selection": "pending", "replyMessageId": "msg_0198f0e0-0000-7000-8000-000000000007"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := make(map[string]any, len(result))
+			for key, value := range result {
+				data[key] = value
+			}
+			mutation(data)
+			if _, err := ValidateControlRequest(mustJSONValue(t, data)); !errors.Is(err, ErrControlValidation) {
+				t.Fatalf("invalid originalStatus result accepted: %v", err)
+			}
+		})
+	}
+}
+
 func TestControlClaimExistingResultIsTokenless(t *testing.T) {
 	result := []byte(`{"schema":"mektup/control/v1","kind":"result","operation":"claim","operationId":"op_0198f0e0-0000-7000-8000-000000000013","replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007","originalMessageId":"msg_0198f0e0-0000-7000-8000-000000000003","custody":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","storeId":"store_0198f0e0-0000-7000-8000-000000000002"},"replyDestination":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","threadId":"thread-local-001","uri":"codex://local/thread/thread-local-001"},"result":{"disposition":"existing","state":"reply_accepted","status":"accepted","winner":{"replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007"}}}`)
 	if _, err := ValidateControlRequest(result); err != nil {
@@ -251,6 +302,15 @@ func TestURIWhitespaceMatchesSchemaWhitespaceClass(t *testing.T) {
 }
 
 func mustJSON(t *testing.T, value ControlRequest) []byte {
+	t.Helper()
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+func mustJSONValue(t *testing.T, value any) []byte {
 	t.Helper()
 	data, err := json.Marshal(value)
 	if err != nil {
