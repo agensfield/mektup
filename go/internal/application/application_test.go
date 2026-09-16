@@ -426,6 +426,39 @@ func TestConnectionFactoryAcceptsPinnedBuiltinAndConfiguredSelectors(t *testing.
 	}
 }
 
+func TestResolvedEndpointIDCannotRetargetAfterAliasReplacement(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	store := endpoint.NewStoreWithIdentityHome(filepath.Join(root, "endpoints.json"), state, filepath.Join(root, "identity"))
+	routeA, _ := endpoint.UnixRoute(filepath.Join(root, "a.sock"))
+	routeB, _ := endpoint.UnixRoute(filepath.Join(root, "b.sock"))
+	idA := "ep_0198f0e0-0000-7000-8000-000000000071"
+	idB := "ep_0198f0e0-0000-7000-8000-000000000072"
+	if err := store.Add(endpoint.Endpoint{ID: idA, Alias: "remote", Route: routeA, Herdr: endpoint.HerdrDisabled}); err != nil {
+		t.Fatal(err)
+	}
+	old, err := store.ResolveEndpoint("remote", filepath.Join(root, "codex"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Remove("remote"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(endpoint.Endpoint{ID: idB, Alias: "remote", Route: routeB, Herdr: endpoint.HerdrDisabled}); err != nil {
+		t.Fatal(err)
+	}
+	dialer := &recordingDialer{transport: newFakeTransport()}
+	factory := &connectionFactory{store: store, codexHome: filepath.Join(root, "codex"), dialerForRoute: func(endpoint.Route, bool) connection.ClientDialer { return dialer }}
+	opened, err := factory.OpenPinned(context.Background(), old, executor.OpenOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.Close()
+	if got := opened.(*appConnection).endpoint.ID; got != old.ID || dialer.routes[0].UnixSocket != routeA.UnixSocket {
+		t.Fatalf("opened endpoint=%s route=%+v want id=%s route=%+v", got, dialer.routes[0], old.ID, routeA)
+	}
+}
+
 func TestEndpointRemovePinsIdentityBeforeEffect(t *testing.T) {
 	root := t.TempDir()
 	state := filepath.Join(root, "state")

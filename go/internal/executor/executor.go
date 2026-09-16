@@ -97,6 +97,7 @@ type ThreadTarget struct {
 	EndpointID string
 	ThreadID   string
 	URI        string
+	Resolved   endpoint.Endpoint
 }
 
 // ThreadTargetResolver converts presentation selectors to a pinned endpoint
@@ -107,6 +108,10 @@ type ThreadTargetResolver interface {
 
 type ExplicitThreadTargetResolver interface {
 	ResolveThreadWithOptions(context.Context, string, string, bool) (ThreadTarget, error)
+}
+
+type PinnedConnectionFactory interface {
+	OpenPinned(context.Context, endpoint.Endpoint, OpenOptions) (Connection, error)
 }
 
 type StoragePort interface {
@@ -243,11 +248,30 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		return cli.ExecutionResult{}, missing("receipt journal")
 	}
 	needsExperimental := inv.Position[0] == "fork" && inv.Option("before-turn") != ""
-	endpointSelector, endpointID, threadID, err := e.resolveThreadTarget(ctx, inv)
+	endpointSelector, endpointID, threadID, resolvedEndpoint, err := e.resolveThreadTarget(ctx, inv)
 	if err != nil {
 		return cli.ExecutionResult{}, err
 	}
-	conn, api, err := e.openWithOptions(ctx, endpointSelector, OpenOptions{ExperimentalAPI: needsExperimental})
+	var conn Connection
+	var api Codex
+	if resolvedEndpoint.ID != "" {
+		if pinned, ok := e.ports.Connections.(PinnedConnectionFactory); ok {
+			conn, err = pinned.OpenPinned(ctx, resolvedEndpoint, OpenOptions{ExperimentalAPI: needsExperimental})
+			if err == nil {
+				api = conn.Codex()
+			}
+		} else {
+			conn, api, err = e.openWithOptions(ctx, endpointSelector, OpenOptions{ExperimentalAPI: needsExperimental})
+		}
+	} else {
+		conn, api, err = e.openWithOptions(ctx, endpointSelector, OpenOptions{ExperimentalAPI: needsExperimental})
+	}
+	if err == nil && (conn == nil || api == nil) {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return cli.ExecutionResult{}, missing("codex")
+	}
 	if err != nil {
 		return cli.ExecutionResult{}, err
 	}
@@ -362,13 +386,13 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 	return e.result(ctx, kind, data, cursor, warnings, mutating, endpointID)
 }
 
-func (e *Executor) resolveThreadTarget(ctx context.Context, inv cli.Invocation) (string, string, string, error) {
+func (e *Executor) resolveThreadTarget(ctx context.Context, inv cli.Invocation) (string, string, string, endpoint.Endpoint, error) {
 	sub := inv.Position[0]
 	if sub == "list" || sub == "start" {
-		return inv.Resolved.Endpoint, inv.Resolved.Endpoint, "", nil
+		return inv.Resolved.Endpoint, inv.Resolved.Endpoint, "", endpoint.Endpoint{}, nil
 	}
 	if len(inv.Position) < 2 {
-		return "", "", "", usage("thread target is required")
+		return "", "", "", endpoint.Endpoint{}, usage("thread target is required")
 	}
 	selector := inv.Position[1]
 	if e.ports.Targets != nil {
@@ -380,18 +404,18 @@ func (e *Executor) resolveThreadTarget(ctx context.Context, inv cli.Invocation) 
 			resolved, err = e.ports.Targets.ResolveThread(ctx, selector, inv.Resolved.Endpoint)
 		}
 		if err != nil {
-			return "", "", "", mapError(err, "not_sent")
+			return "", "", "", endpoint.Endpoint{}, mapError(err, "not_sent")
 		}
 		endpointID := resolved.EndpointID
 		if endpointID == "" {
 			endpointID = resolved.Endpoint
 		}
-		return resolved.Endpoint, endpointID, resolved.ThreadID, nil
+		return resolved.Endpoint, endpointID, resolved.ThreadID, resolved.Resolved, nil
 	}
 	if strings.Contains(selector, "://") {
-		return "", "", "", &cli.Error{Code: "invalid_target", Message: "thread target resolver is required for URI targets", Effect: "not_sent", Exit: cli.ExitUsage}
+		return "", "", "", endpoint.Endpoint{}, &cli.Error{Code: "invalid_target", Message: "thread target resolver is required for URI targets", Effect: "not_sent", Exit: cli.ExitUsage}
 	}
-	return inv.Resolved.Endpoint, inv.Resolved.Endpoint, selector, nil
+	return inv.Resolved.Endpoint, inv.Resolved.Endpoint, selector, endpoint.Endpoint{}, nil
 }
 
 func (e *Executor) search(ctx context.Context, inv cli.Invocation) (result cli.ExecutionResult, execErr error) {

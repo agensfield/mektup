@@ -979,7 +979,7 @@ func (r threadTargetResolver) ResolveThreadWithOptions(ctx context.Context, sele
 		if err != nil {
 			return executor.ThreadTarget{}, err
 		}
-		return executor.ThreadTarget{Endpoint: ep.Alias, EndpointID: ep.ID, ThreadID: selector, URI: "codex://" + ep.Alias + "/thread/" + selector}, nil
+		return executor.ThreadTarget{Endpoint: ep.ID, EndpointID: ep.ID, Resolved: ep, ThreadID: selector, URI: "codex://" + ep.Alias + "/thread/" + selector}, nil
 	}
 	target, err := endpoint.ParseTarget(selector)
 	if err != nil {
@@ -996,7 +996,7 @@ func (r threadTargetResolver) ResolveThreadWithOptions(ctx context.Context, sele
 	if err != nil {
 		return executor.ThreadTarget{}, err
 	}
-	return executor.ThreadTarget{Endpoint: resolved.Endpoint.Alias, EndpointID: resolved.Endpoint.ID, ThreadID: resolved.ThreadID, URI: target.String()}, nil
+	return executor.ThreadTarget{Endpoint: resolved.Endpoint.ID, EndpointID: resolved.Endpoint.ID, Resolved: resolved.Endpoint, ThreadID: resolved.ThreadID, URI: target.String()}, nil
 }
 
 func isNativeThreadID(value string) bool {
@@ -1052,10 +1052,24 @@ func (f *connectionFactory) OpenWithOptions(ctx context.Context, selector string
 	if f.openOverride != nil {
 		return f.openOverride(ctx, selector, open)
 	}
-	ep, err := f.store.ResolveEndpoint(selector, f.codexHome)
+	ep, err := f.store.ResolveEndpointID(selector, f.codexHome)
+	if err != nil {
+		ep, err = f.store.ResolveEndpoint(selector, f.codexHome)
+	}
 	if err != nil {
 		return nil, err
 	}
+	return f.openEndpoint(ctx, selector, ep, open)
+}
+
+func (f *connectionFactory) OpenPinned(ctx context.Context, ep endpoint.Endpoint, open executor.OpenOptions) (executor.Connection, error) {
+	if f.openOverride != nil {
+		return f.openOverride(ctx, ep.ID, open)
+	}
+	return f.openEndpoint(ctx, ep.ID, ep, open)
+}
+
+func (f *connectionFactory) openEndpoint(ctx context.Context, selector string, ep endpoint.Endpoint, open executor.OpenOptions) (executor.Connection, error) {
 	if err := ep.Validate(); err != nil {
 		return nil, err
 	}
@@ -1189,7 +1203,10 @@ func (s receiptStore) save(ctx context.Context, operation, endpointSelector stri
 	ep, ok := s.pinned(endpointSelector)
 	if !ok {
 		var err error
-		ep, err = s.endpoints.ResolveEndpoint(endpointSelector, s.codexHome)
+		ep, err = s.endpoints.ResolveEndpointID(endpointSelector, s.codexHome)
+		if err != nil {
+			ep, err = s.endpoints.ResolveEndpoint(endpointSelector, s.codexHome)
+		}
 		if err != nil {
 			return mektup.Receipt{}, err
 		}
@@ -1288,6 +1305,7 @@ func readFileBounded(ctx context.Context, name string, max int64) ([]byte, error
 }
 
 var _ executor.ConnectionFactory = (*connectionFactory)(nil)
+var _ executor.PinnedConnectionFactory = (*connectionFactory)(nil)
 var _ executor.EndpointChecker = endpointHealth{}
 var _ executor.ReceiptPort = receiptStore{}
 var _ executor.ReadReceiptPort = receiptStore{}
