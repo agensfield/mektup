@@ -54,10 +54,10 @@ func validateObservedEnvelope(item ObservedItem, original OperationStatus, accep
 	if original.ReplyDigest != "" && e.PayloadSHA256 != original.ReplyDigest {
 		return mektup.Envelope{}, fmt.Errorf("reply body digest mismatch")
 	}
-	if original.ReplyBodySize > 0 && int64(e.PayloadBytes) != original.ReplyBodySize {
+	if original.ReplyDigest != "" && int64(e.PayloadBytes) != original.ReplyBodySize {
 		return mektup.Envelope{}, fmt.Errorf("reply body size mismatch")
 	}
-	if item.ThreadID != "" && item.ThreadID != threadID(expectedRoute) {
+	if item.ThreadID == "" || item.ThreadID != threadID(expectedRoute) {
 		return mektup.Envelope{}, fmt.Errorf("reply was observed in a different thread")
 	}
 	if item.ClientMessageID != "" && item.ClientMessageID != e.MessageID {

@@ -166,7 +166,7 @@ func (s *Service) reply(ctx context.Context, resolver OriginalResolver, req Repl
 	if owner == "" {
 		owner = "reply-" + replyID
 	}
-	claim, err := s.Journal.ClaimReply(ctx, ReplyClaimInput{ReplyID: replyID, OriginalID: original.Envelope.MessageID, Digest: digest(req.Body), BodySize: int64(len([]byte(req.Body))), Status: string(req.Status), ReplyRoute: original.Envelope.ReplyTo, CustodyRoute: original.Envelope.ReplyCustodyEndpointID, CustodyStoreID: original.Envelope.ReplyCustodyStoreID, Owner: owner})
+	claim, err := s.Journal.ClaimReply(ctx, ReplyClaimInput{ReplyID: replyID, OriginalID: original.Envelope.MessageID, Digest: digest(req.Body), BodySize: int64(len([]byte(req.Body))), Status: string(req.Status), ErrorCode: req.ErrorCode, ReplyRoute: original.Envelope.ReplyTo, CustodyRoute: original.Envelope.ReplyCustodyEndpointID, CustodyStoreID: original.Envelope.ReplyCustodyStoreID, Owner: owner})
 	if err != nil {
 		if errors.Is(err, ErrClaimExpired) {
 			return ReplyResult{}, semantic(mektup.ErrReplyOutcomeUnknown, "reply claim expired and will not be replayed", nil, err)

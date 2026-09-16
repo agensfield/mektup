@@ -357,6 +357,9 @@ func validateReadOnlySchema(ctx context.Context, db *sql.DB) error {
 	if err := validateEndpointColumns(ctx, db); err != nil {
 		return err
 	}
+	if err := validateObservationColumns(ctx, db); err != nil {
+		return err
+	}
 	return nil
 }
 

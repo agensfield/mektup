@@ -630,8 +630,148 @@ func TestObservationDoesNotReviveUnknown(t *testing.T) {
 	if err := j.ExpireClaims(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := j.ObserveReply(context.Background(), c.ReplyID, "native-1", c.Digest); !errors.Is(err, ErrInvalidTransition) {
+	if err := j.ObserveReply(context.Background(), c.ReplyID, "native-1", c.Digest); err != nil {
 		t.Fatalf("unknown observation: %v", err)
+	}
+	observed, err := j.Reply(context.Background(), c.ReplyID)
+	if err != nil || observed.State != StateReplyObserved || observed.Token != "" {
+		t.Fatalf("unknown observation revived authority: %+v, %v", observed, err)
+	}
+}
+
+func TestObservationIdentityConflictAndWinnerStability(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	first := claimInput()
+	first.ReplyID = "reply-first"
+	c1, err := j.ClaimReply(context.Background(), first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.CommitReply(context.Background(), c1.ReplyID, c1.Owner, c1.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.ObserveReply(context.Background(), c1.ReplyID, "native-first", c1.Digest); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.ObserveReply(context.Background(), c1.ReplyID, "native-first", c1.Digest); err != nil {
+		t.Fatalf("same observation was not idempotent: %v", err)
+	}
+	if err := j.ObserveReply(context.Background(), c1.ReplyID, "native-other", c1.Digest); !errors.Is(err, ErrIdentityConflict) {
+		t.Fatalf("native conflict = %v", err)
+	}
+
+	second := first
+	second.ReplyID = "reply-second"
+	c2, err := j.ClaimReply(context.Background(), second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.CommitReply(context.Background(), c2.ReplyID, c2.Owner, c2.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.ObserveReply(context.Background(), c2.ReplyID, "native-second", c2.Digest); err != nil {
+		t.Fatal(err)
+	}
+	winner, native, _, err := j.Winner(context.Background(), first.OriginalID)
+	if err != nil || winner != c1.ReplyID || native != "native-first" {
+		t.Fatalf("winner replaced: id=%q native=%q err=%v", winner, native, err)
+	}
+}
+
+func TestV7ToV8ObservationTupleMigrationPreservesLegacyErrorCode(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	in := claimInput()
+	in.Status = "error"
+	in.ErrorCode = "remote-bad"
+	if _, err := j.ClaimReply(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("UPDATE reply_claims SET error_code='reply_outcome_unknown' WHERE reply_id=?", in.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("ALTER TABLE reply_claims DROP COLUMN reply_error_code"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("ALTER TABLE observations DROP COLUMN endpoint_id"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("ALTER TABLE observations DROP COLUMN control_route"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("PRAGMA user_version=7"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(context.Background(), Options{StateDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	var version int
+	if err := reopened.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil || version != 8 {
+		t.Fatalf("schema version=%d err=%v", version, err)
+	}
+	var replyError, legacyError string
+	if err := reopened.db.QueryRow("SELECT reply_error_code,error_code FROM reply_claims LIMIT 1").Scan(&replyError, &legacyError); err != nil {
+		t.Fatal(err)
+	}
+	if replyError != "" || legacyError != "reply_outcome_unknown" {
+		t.Fatalf("v7 fields changed: reply=%q legacy=%q", replyError, legacyError)
+	}
+}
+
+func TestReplyErrorCodeRemainsSeparateFromOutcomeErrorCode(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	in := claimInput()
+	in.Status = "error"
+	in.ErrorCode = "remote-bad"
+	c, err := j.ClaimReply(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now.Add(2 * int64(time.Second))
+	if err := j.ExpireClaims(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var declared, outcome string
+	if err := j.db.QueryRow("SELECT reply_error_code,error_code FROM reply_claims WHERE reply_id=?", c.ReplyID).Scan(&declared, &outcome); err != nil {
+		t.Fatal(err)
+	}
+	if declared != "remote-bad" || outcome != "reply_outcome_unknown" {
+		t.Fatalf("error-code domains conflated: declared=%q outcome=%q", declared, outcome)
+	}
+}
+
+func TestV8SchemaRejectsMissingObservationProvenanceColumns(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	if _, err := j.db.Exec("ALTER TABLE observations DROP COLUMN control_route"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.db.Exec("PRAGMA user_version=8"); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(context.Background(), Options{StateDir: dir}); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("malformed v8 accepted: %v", err)
 	}
 }
 

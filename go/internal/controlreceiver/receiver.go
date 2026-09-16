@@ -112,6 +112,10 @@ func (r Receiver) Receive(ctx context.Context, data []byte) ([]byte, error) {
 		if err := validateClaimTuple(ctx, store.Journal, request, canonical); err != nil {
 			return nil, err
 		}
+	} else if request.Operation == "observe" {
+		if err := validateObserveTuple(ctx, store.Journal, request, canonical); err != nil {
+			return nil, err
+		}
 	} else if request.Operation == "status" || request.Operation == "reconcile" {
 		if err := validateClaimIdentity(ctx, store.Journal, request, canonical); err != nil {
 			return nil, err
@@ -129,6 +133,7 @@ func (r Receiver) Receive(ctx context.Context, data []byte) ([]byte, error) {
 	response.BodySHA256 = ""
 	response.ReplyStatus = ""
 	response.ReplyErrorCode = ""
+	response.NativeItemID = ""
 	response.RequestedLease = nil
 	response.FencingToken = ""
 	response.Lease = nil
@@ -162,7 +167,7 @@ func (r Receiver) validateOriginal(ctx context.Context, j *journal.Journal, req 
 	if err != nil {
 		return fmt.Errorf("%w: original operation unavailable: %v", ErrRelationshipMismatch, err)
 	}
-	if op.CustodyRoute != req.Custody.EndpointID || op.CustodyStoreID != storeID || op.ReplyRoute == "" || op.ReplyRoute != req.ReplyDestination.URI || op.ReplyEndpointID == "" || op.ReplyEndpointID != req.ReplyDestination.EndpointID || op.ReplyThreadID == "" || op.ReplyThreadID != req.ReplyDestination.ThreadID {
+	if op.OperationID != req.OperationID || op.CustodyRoute != req.Custody.EndpointID || op.CustodyStoreID != storeID || op.ReplyRoute == "" || op.ReplyRoute != req.ReplyDestination.URI || op.ReplyEndpointID == "" || op.ReplyEndpointID != req.ReplyDestination.EndpointID || op.ReplyThreadID == "" || op.ReplyThreadID != req.ReplyDestination.ThreadID {
 		return ErrRelationshipMismatch
 	}
 	return nil
@@ -219,6 +224,23 @@ func validateClaimJoinTuple(ctx context.Context, j *journal.Journal, req sshprox
 	return nil
 }
 
+func validateObserveTuple(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) error {
+	if err := validateClaimJoinTuple(ctx, j, req, storeID); err != nil {
+		return err
+	}
+	code, err := j.ReplyErrorCode(ctx, req.ReplyMessageID)
+	if err != nil {
+		if errors.Is(err, journal.ErrNotFound) {
+			return journal.ErrNotFound
+		}
+		return fmt.Errorf("%w: selected claim error metadata unavailable: %v", ErrRelationshipMismatch, err)
+	}
+	if code != req.ReplyErrorCode {
+		return ErrRelationshipMismatch
+	}
+	return nil
+}
+
 func validateClaimIdentity(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest, storeID string) error {
 	claim, err := j.Reply(ctx, req.ReplyMessageID)
 	if err != nil {
@@ -241,7 +263,7 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 				return nil, journal.ErrIdentityConflict
 			}
 		}
-		claim, err := j.ClaimReply(ctx, journal.ClaimInput{ReplyID: req.ReplyMessageID, OriginalID: req.OriginalMessageID, Digest: req.BodySHA256, BodySize: deref(req.BodyBytes), Status: req.ReplyStatus, ReplyRoute: req.ReplyDestination.URI, CustodyRoute: req.Custody.EndpointID, CustodyStoreID: storeID, Owner: req.AttemptOwner})
+		claim, err := j.ClaimReply(ctx, journal.ClaimInput{ReplyID: req.ReplyMessageID, OriginalID: req.OriginalMessageID, Digest: req.BodySHA256, BodySize: deref(req.BodyBytes), Status: req.ReplyStatus, ReplyRoute: req.ReplyDestination.URI, CustodyRoute: req.Custody.EndpointID, CustodyStoreID: storeID, Owner: req.AttemptOwner, ErrorCode: req.ReplyErrorCode})
 		if err != nil {
 			if errors.Is(err, journal.ErrClaimExpired) {
 				if terminal, inspectErr := j.Reply(ctx, req.ReplyMessageID); inspectErr == nil {
@@ -275,6 +297,34 @@ func apply(ctx context.Context, j *journal.Journal, req sshproxy.ControlRequest,
 			return nil, err
 		}
 		return resultJSON(map[string]any{"state": journal.StateReplyOutcomeUnknown})
+	case "observe":
+		if err := j.ObserveReplyWithProvenance(ctx, req.ReplyMessageID, req.NativeItemID, req.BodySHA256, req.ReplyDestination.EndpointID, req.ReplyDestination.URI); err != nil {
+			return nil, err
+		}
+		claim, err := j.Reply(ctx, req.ReplyMessageID)
+		if err != nil {
+			return nil, err
+		}
+		observedNative, _, observedEndpoint, observedRoute, err := j.Observation(ctx, req.ReplyMessageID)
+		if err != nil {
+			return nil, err
+		}
+		winnerID, winnerNative, winnerSeq, winnerErr := j.Winner(ctx, claim.OriginalID)
+		if winnerErr != nil && !errors.Is(winnerErr, journal.ErrNotFound) {
+			return nil, winnerErr
+		}
+		result := map[string]any{"state": claim.State, "status": "observed", "provenance": map[string]any{"endpointId": observedEndpoint, "controlRoute": observedRoute}}
+		if winnerErr == nil {
+			winner := map[string]any{"replyMessageId": winnerID, "commitSeq": winnerSeq}
+			if winnerNative != "" {
+				winner["nativeItemId"] = winnerNative
+			}
+			if winnerID == claim.ReplyID && observedNative != "" && winnerNative == "" {
+				winner["nativeItemId"] = observedNative
+			}
+			result["winner"] = winner
+		}
+		return resultJSON(result)
 	case "status", "reconcile":
 		if req.Operation == "reconcile" {
 			if err := j.ExpireClaims(ctx); err != nil {

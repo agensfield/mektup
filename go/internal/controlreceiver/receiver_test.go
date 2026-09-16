@@ -162,6 +162,86 @@ func TestReceiverClaimHeartbeatCommitStatusAndDuplicate(t *testing.T) {
 	}
 }
 
+func TestReceiverObserveAcceptedIsTokenlessAndIdempotent(t *testing.T) {
+	j, _ := openReceiverJournal(t, time.Minute)
+	prepareOriginal(t, j)
+	receiver := Receiver{Registry: staticResolver{store: Store{Journal: j, StoreID: j.StoreID(), EndpointID: receiverEndpoint, CloseFunc: func() error { return nil }}}, LocalEndpointID: receiverEndpoint, Destination: localDestination()}
+	claimRequest := request(j)
+	claimResult := receive(t, receiver, claimRequest)
+	var claimed struct {
+		FencingToken string         `json:"fencingToken"`
+		Lease        sshproxy.Lease `json:"lease"`
+	}
+	if err := json.Unmarshal(claimResult.Result, &claimed); err != nil {
+		t.Fatal(err)
+	}
+	commit := claimRequest
+	commit.Operation = "commit"
+	commit.FencingToken = claimed.FencingToken
+	commit.Lease = &claimed.Lease
+	if _, err := receiver.Receive(context.Background(), mustMarshal(t, commit)); err != nil {
+		t.Fatal(err)
+	}
+	observe := claimRequest
+	observe.Operation = "observe"
+	observe.NativeItemID = "native-reply-1"
+	observe.AttemptOwner = ""
+	observe.FencingToken = ""
+	observe.Lease = nil
+	first := receive(t, receiver, observe)
+	var result struct {
+		State      string         `json:"state"`
+		Status     string         `json:"status"`
+		Winner     map[string]any `json:"winner"`
+		Provenance map[string]any `json:"provenance"`
+	}
+	if err := json.Unmarshal(first.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.State != string(journal.StateReplyObserved) || result.Status != "observed" || result.Winner["nativeItemId"] != observe.NativeItemID || result.Provenance["controlRoute"] != observe.ReplyDestination.URI {
+		t.Fatalf("observe result = %s", first.Result)
+	}
+	_, _, storedEndpoint, storedRoute, err := j.Observation(context.Background(), observe.ReplyMessageID)
+	if err != nil || storedEndpoint != observe.ReplyDestination.EndpointID || storedRoute != observe.ReplyDestination.URI {
+		t.Fatalf("observation provenance not durable: endpoint=%q route=%q err=%v", storedEndpoint, storedRoute, err)
+	}
+	if _, err := receiver.Receive(context.Background(), mustMarshal(t, observe)); err != nil {
+		t.Fatalf("same observation was not idempotent: %v", err)
+	}
+	conflict := observe
+	conflict.NativeItemID = "native-reply-2"
+	if _, err := receiver.Receive(context.Background(), mustMarshal(t, conflict)); !errors.Is(err, journal.ErrIdentityConflict) {
+		t.Fatalf("conflicting observation error = %v", err)
+	}
+}
+
+func TestReceiverObserveRejectsSelectedClaimTupleMismatch(t *testing.T) {
+	j, _ := openReceiverJournal(t, time.Minute)
+	prepareOriginal(t, j)
+	receiver := Receiver{Registry: staticResolver{store: Store{Journal: j, StoreID: j.StoreID(), EndpointID: receiverEndpoint, CloseFunc: func() error { return nil }}}, LocalEndpointID: receiverEndpoint, Destination: localDestination()}
+	claimRequest := request(j)
+	if _, err := receiver.Receive(context.Background(), mustMarshal(t, claimRequest)); err != nil {
+		t.Fatal(err)
+	}
+	observe := claimRequest
+	observe.Operation = "observe"
+	observe.NativeItemID = "native-reply-1"
+	observe.AttemptOwner = ""
+	observe.FencingToken = ""
+	observe.Lease = nil
+	wrong := observe
+	wrong.BodyBytes = new(int64)
+	*wrong.BodyBytes = 8
+	if _, err := receiver.Receive(context.Background(), mustMarshal(t, wrong)); !errors.Is(err, ErrRelationshipMismatch) {
+		t.Fatalf("tuple mismatch error = %v", err)
+	}
+	wrongOperation := observe
+	wrongOperation.OperationID = "op_0198f0e0-0000-7000-8000-00000000000d"
+	if _, err := receiver.Receive(context.Background(), mustMarshal(t, wrongOperation)); !errors.Is(err, ErrRelationshipMismatch) {
+		t.Fatalf("operation tuple mismatch error = %v", err)
+	}
+}
+
 func TestReceiverTerminalClaimDuplicatesAreStatusOnly(t *testing.T) {
 	for _, terminal := range []string{"accepted", "observed", "unknown"} {
 		t.Run(terminal, func(t *testing.T) {
@@ -295,6 +375,7 @@ func TestReceiverAllowsDistinctTrustedReplyEndpointTopology(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := request(j)
+	q.OperationID = "op_0198f0e0-0000-7000-8000-000000000088"
 	q.OriginalMessageID = otherOriginal
 	q.ReplyDestination.EndpointID = trustedEndpoint
 	q.ReplyDestination.URI = "codex://replyhost/thread/source"

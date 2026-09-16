@@ -413,6 +413,20 @@ func (r ControlRequest) Validate() error {
 					return fmt.Errorf("%w: observe result winner must be an object", ErrControlValidation)
 				}
 			}
+			if raw, present := resultObject["provenance"]; present {
+				provenance, err := rawObject(raw, "result.provenance")
+				if err != nil {
+					return err
+				}
+				for _, field := range []string{"endpointId", "controlRoute"} {
+					if value, exists := provenance[field]; exists {
+						text, textErr := rawString(value, "result.provenance."+field)
+						if textErr != nil || text == "" {
+							return fmt.Errorf("%w: observe result provenance.%s must be a nonempty string", ErrControlValidation, field)
+						}
+					}
+				}
+			}
 		}
 		return nil
 	}

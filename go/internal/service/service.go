@@ -224,6 +224,7 @@ type ReplyClaimInput struct {
 	CustodyRoute   string
 	CustodyStoreID string
 	Owner          string
+	ErrorCode      string
 }
 
 type ReplyClaim struct {

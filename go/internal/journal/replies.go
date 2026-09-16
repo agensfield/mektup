@@ -41,6 +41,7 @@ type ClaimInput struct {
 	CustodyRoute   string
 	CustodyStoreID string
 	Owner          string
+	ErrorCode      string
 }
 
 func (in ClaimInput) valid() bool {
@@ -61,7 +62,11 @@ func (j *Journal) ClaimReply(ctx context.Context, in ClaimInput) (ReplyClaim, er
 		var existing ReplyClaim
 		err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", in.ReplyID), &existing)
 		if err == nil {
-			if existing.OriginalID != in.OriginalID || existing.Digest != in.Digest || existing.BodySize != in.BodySize || existing.Status != in.Status || existing.ReplyRoute != in.ReplyRoute || existing.CustodyRoute != in.CustodyRoute || existing.CustodyStoreID != in.CustodyStoreID {
+			var existingErrorCode string
+			if err := tx.QueryRow("SELECT reply_error_code FROM reply_claims WHERE reply_id=?", in.ReplyID).Scan(&existingErrorCode); err != nil {
+				return err
+			}
+			if existing.OriginalID != in.OriginalID || existing.Digest != in.Digest || existing.BodySize != in.BodySize || existing.Status != in.Status || existing.ReplyRoute != in.ReplyRoute || existing.CustodyRoute != in.CustodyRoute || existing.CustodyStoreID != in.CustodyStoreID || existingErrorCode != in.ErrorCode {
 				return ErrIdentityConflict
 			}
 			if existing.State == StateReplyAccepted || existing.State == StateReplyObserved {
@@ -110,7 +115,7 @@ func (j *Journal) ClaimReply(ctx context.Context, in ClaimInput) (ReplyClaim, er
 			return err
 		}
 		lease := now + j.leaseDuration.Nanoseconds()
-		_, err = tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", in.ReplyID, in.OriginalID, in.Digest, in.BodySize, in.Status, in.ReplyRoute, in.CustodyRoute, in.CustodyStoreID, in.Owner, token, lease, string(StateReplyClaimed), now, now)
+		_, err = tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", in.ReplyID, in.OriginalID, in.Digest, in.BodySize, in.Status, in.ReplyRoute, in.CustodyRoute, in.CustodyStoreID, in.Owner, token, lease, string(StateReplyClaimed), now, now, in.ErrorCode)
 		if err != nil {
 			return err
 		}
@@ -320,6 +325,18 @@ func (j *Journal) Reply(ctx context.Context, replyID string) (ReplyClaim, error)
 	return out, err
 }
 
+// ReplyErrorCode returns the selected claim's declared terminal error code.
+// It is kept separate from ReplyClaim's stable metadata projection so older
+// callers cannot accidentally treat it as dispatch authority.
+func (j *Journal) ReplyErrorCode(ctx context.Context, replyID string) (string, error) {
+	var code string
+	err := j.db.QueryRowContext(ctx, "SELECT reply_error_code FROM reply_claims WHERE reply_id=?", replyID).Scan(&code)
+	if err == sql.ErrNoRows {
+		return "", ErrNotFound
+	}
+	return code, err
+}
+
 func (j *Journal) RepliesFor(ctx context.Context, originalID string) ([]ReplyClaim, error) {
 	rows, err := j.db.QueryContext(ctx, "SELECT reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE original_id=? ORDER BY created_at,reply_id", originalID)
 	if err != nil {
@@ -378,6 +395,13 @@ COALESCE(w.commit_seq,c.commit_seq,9223372036854775807), c.reply_id LIMIT 1`, or
 // ObserveReply is a separate strengthening transition. It cannot revive an
 // expired token or change first-winner ordering.
 func (j *Journal) ObserveReply(ctx context.Context, replyID, nativeItemID, digest string) error {
+	return j.ObserveReplyWithProvenance(ctx, replyID, nativeItemID, digest, "", "")
+}
+
+// ObserveReplyWithProvenance records exact configured destination identity
+// alongside the native evidence. The route is metadata only and never a
+// path/executable authority.
+func (j *Journal) ObserveReplyWithProvenance(ctx context.Context, replyID, nativeItemID, digest, endpointID, controlRoute string) error {
 	if nativeItemID == "" || digest == "" {
 		return fmt.Errorf("journal: invalid observation")
 	}
@@ -394,10 +418,13 @@ func (j *Journal) ObserveReply(ctx context.Context, replyID, nativeItemID, diges
 		if expected != digest {
 			return ErrIdentityConflict
 		}
-		if state != StateReplyAccepted && state != StateReplyObserved {
+		if state != StateReplyOutcomeUnknown && state != StateReplyAccepted && state != StateReplyObserved {
 			return ErrInvalidTransition
 		}
-		if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest) VALUES(?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET native_item_id=excluded.native_item_id,observed_at=excluded.observed_at", replyID, nativeItemID, now, digest); err != nil {
+		if err := validateObservationIdentityTx(tx, replyID, nativeItemID, digest, endpointID, controlRoute); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest,endpoint_id,control_route) VALUES(?,?,?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET observed_at=excluded.observed_at,endpoint_id=CASE WHEN observations.endpoint_id='' THEN excluded.endpoint_id ELSE observations.endpoint_id END,control_route=CASE WHEN observations.control_route='' THEN excluded.control_route ELSE observations.control_route END", replyID, nativeItemID, now, digest, endpointID, controlRoute); err != nil {
 			return err
 		}
 		if _, _, err := assignReplyCommitTx(tx, originalID, replyID, now); err != nil {
@@ -436,7 +463,10 @@ func (j *Journal) ReconcileReplyObservation(ctx context.Context, replyID, native
 		if state != StateReplyOutcomeUnknown && state != StateReplyAccepted && state != StateReplyObserved {
 			return ErrInvalidTransition
 		}
-		if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest) VALUES(?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET native_item_id=excluded.native_item_id,observed_at=excluded.observed_at,digest=excluded.digest", replyID, nativeItemID, now, digest); err != nil {
+		if err := validateObservationIdentityTx(tx, replyID, nativeItemID, digest, "", ""); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest) VALUES(?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET observed_at=excluded.observed_at", replyID, nativeItemID, now, digest); err != nil {
 			return err
 		}
 		if state == StateReplyObserved {
@@ -450,6 +480,46 @@ func (j *Journal) ReconcileReplyObservation(ctx context.Context, replyID, native
 		}
 		return emit(tx, "reply.reconciled", "", replyID, StateReplyObserved, now)
 	})
+}
+
+func validateObservationIdentityTx(tx *sql.Tx, replyID, nativeItemID, digest, endpointID, controlRoute string) error {
+	var existingItem, existingDigest, existingEndpoint, existingRoute string
+	err := tx.QueryRow("SELECT native_item_id,digest,endpoint_id,control_route FROM observations WHERE reply_id=?", replyID).Scan(&existingItem, &existingDigest, &existingEndpoint, &existingRoute)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if existingItem != nativeItemID || existingDigest != digest || (existingEndpoint != "" && endpointID != "" && existingEndpoint != endpointID) || (existingRoute != "" && controlRoute != "" && existingRoute != controlRoute) {
+		return ErrIdentityConflict
+	}
+	return nil
+}
+
+// Observation returns the exact native item identity already recorded for a
+// reply. It never returns native body content.
+func (j *Journal) Observation(ctx context.Context, replyID string) (string, string, string, string, error) {
+	var nativeID, digest, endpointID, controlRoute string
+	err := j.db.QueryRowContext(ctx, "SELECT native_item_id,digest,endpoint_id,control_route FROM observations WHERE reply_id=?", replyID).Scan(&nativeID, &digest, &endpointID, &controlRoute)
+	if err == sql.ErrNoRows {
+		return "", "", "", "", ErrNotFound
+	}
+	return nativeID, digest, endpointID, controlRoute, err
+}
+
+// Winner returns the durable first winner and its observed native item, when
+// one exists for an original. Observation never replaces this row.
+func (j *Journal) Winner(ctx context.Context, originalID string) (string, string, int64, error) {
+	var replyID, nativeID string
+	var seq int64
+	err := j.db.QueryRowContext(ctx, `SELECT w.reply_id,COALESCE(o.native_item_id,''),w.commit_seq
+FROM reply_winners w LEFT JOIN observations o ON o.reply_id=w.reply_id
+WHERE w.original_id=?`, originalID).Scan(&replyID, &nativeID, &seq)
+	if err == sql.ErrNoRows {
+		return "", "", 0, ErrNotFound
+	}
+	return replyID, nativeID, seq, err
 }
 
 // ReconcileReplyAccepted is the acceptance-side counterpart when a durable

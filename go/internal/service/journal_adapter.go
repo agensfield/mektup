@@ -211,7 +211,7 @@ func (a SQLiteJournal) ClaimReply(ctx context.Context, in ReplyClaimInput) (Repl
 	if err := a.valid(); err != nil {
 		return ReplyClaim{}, err
 	}
-	c, err := a.Inner.ClaimReply(ctx, journal.ClaimInput{ReplyID: in.ReplyID, OriginalID: in.OriginalID, Digest: in.Digest, BodySize: in.BodySize, Status: in.Status, ReplyRoute: in.ReplyRoute, CustodyRoute: in.CustodyRoute, CustodyStoreID: in.CustodyStoreID, Owner: in.Owner})
+	c, err := a.Inner.ClaimReply(ctx, journal.ClaimInput{ReplyID: in.ReplyID, OriginalID: in.OriginalID, Digest: in.Digest, BodySize: in.BodySize, Status: in.Status, ReplyRoute: in.ReplyRoute, CustodyRoute: in.CustodyRoute, CustodyStoreID: in.CustodyStoreID, Owner: in.Owner, ErrorCode: in.ErrorCode})
 	if err != nil {
 		return ReplyClaim{}, err
 	}

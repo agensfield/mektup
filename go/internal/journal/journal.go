@@ -43,7 +43,7 @@ const (
 
 type EvidenceState string
 
-const currentSchemaVersion = 7
+const currentSchemaVersion = 8
 
 func (s EvidenceState) Valid() bool {
 	switch s {
@@ -253,6 +253,9 @@ func (j *Journal) init(ctx context.Context) error {
 		if err = migrateV6ToV7(ctx, tx); err != nil {
 			return err
 		}
+		if err = migrateV7ToV8(ctx, tx); err != nil {
+			return err
+		}
 	} else if version == 1 {
 		if err = migrateV1ToV4(ctx, tx, j.leaseDuration); err != nil {
 			return err
@@ -264,6 +267,9 @@ func (j *Journal) init(ctx context.Context) error {
 			return err
 		}
 		if err = migrateV6ToV7(ctx, tx); err != nil {
+			return err
+		}
+		if err = migrateV7ToV8(ctx, tx); err != nil {
 			return err
 		}
 	} else if version == 2 {
@@ -279,6 +285,9 @@ func (j *Journal) init(ctx context.Context) error {
 		if err = migrateV6ToV7(ctx, tx); err != nil {
 			return err
 		}
+		if err = migrateV7ToV8(ctx, tx); err != nil {
+			return err
+		}
 	} else if version == 3 {
 		if err = migrateV3ToV4(ctx, tx); err != nil {
 			return err
@@ -292,6 +301,9 @@ func (j *Journal) init(ctx context.Context) error {
 		if err = migrateV6ToV7(ctx, tx); err != nil {
 			return err
 		}
+		if err = migrateV7ToV8(ctx, tx); err != nil {
+			return err
+		}
 	} else if version == 4 {
 		if err = migrateV4ToV5(ctx, tx); err != nil {
 			return err
@@ -302,6 +314,9 @@ func (j *Journal) init(ctx context.Context) error {
 		if err = migrateV6ToV7(ctx, tx); err != nil {
 			return err
 		}
+		if err = migrateV7ToV8(ctx, tx); err != nil {
+			return err
+		}
 	} else if version == 5 {
 		if err = migrateV5ToV6(ctx, tx); err != nil {
 			return err
@@ -309,12 +324,22 @@ func (j *Journal) init(ctx context.Context) error {
 		if err = migrateV6ToV7(ctx, tx); err != nil {
 			return err
 		}
+		if err = migrateV7ToV8(ctx, tx); err != nil {
+			return err
+		}
 	} else if version == 6 {
 		if err = migrateV6ToV7(ctx, tx); err != nil {
 			return err
 		}
+		if err = migrateV7ToV8(ctx, tx); err != nil {
+			return err
+		}
+	} else if version == 7 {
+		if err = migrateV7ToV8(ctx, tx); err != nil {
+			return err
+		}
 	} else if version == currentSchemaVersion {
-		if err = validateV7Schema(ctx, tx); err != nil {
+		if err = validateV8Schema(ctx, tx); err != nil {
 			return err
 		}
 	}
@@ -383,7 +408,8 @@ CREATE TABLE IF NOT EXISTS reply_claims (
  custody_store_id TEXT NOT NULL DEFAULT '',
  owner TEXT NOT NULL, token TEXT NOT NULL, lease_until INTEGER NOT NULL,
  state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
- accepted_at INTEGER, commit_seq INTEGER, error_code TEXT NOT NULL DEFAULT '',
+	accepted_at INTEGER, commit_seq INTEGER, error_code TEXT NOT NULL DEFAULT '',
+	reply_error_code TEXT NOT NULL DEFAULT '',
  UNIQUE(reply_id, original_id)
 );
 CREATE INDEX IF NOT EXISTS reply_claims_original ON reply_claims(original_id);
@@ -394,7 +420,7 @@ CREATE TABLE IF NOT EXISTS reply_winners (
 CREATE TABLE IF NOT EXISTS observations (
  reply_id TEXT PRIMARY KEY REFERENCES reply_claims(reply_id) ON DELETE CASCADE,
  native_item_id TEXT NOT NULL, observed_at INTEGER NOT NULL,
- digest TEXT NOT NULL
+ digest TEXT NOT NULL, endpoint_id TEXT NOT NULL DEFAULT '', control_route TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS events (
  seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
@@ -797,6 +823,88 @@ func validateV7Schema(ctx context.Context, tx *sql.Tx) error {
 		return err
 	}
 	return validateEndpointColumns(ctx, tx)
+}
+
+func migrateV7ToV8(ctx context.Context, tx *sql.Tx) error {
+	if err := validateV7Schema(ctx, tx); err != nil {
+		return err
+	}
+	for _, item := range []struct {
+		table  string
+		column string
+	}{
+		{table: "reply_claims", column: "reply_error_code"},
+		{table: "observations", column: "endpoint_id"},
+		{table: "observations", column: "control_route"},
+	} {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('"+item.table+"') WHERE name=?", item.column).Scan(&count); err != nil {
+			return fmt.Errorf("journal migration v8: %w", err)
+		}
+		if count == 0 {
+			if _, err := tx.ExecContext(ctx, "ALTER TABLE "+item.table+" ADD COLUMN "+item.column+" TEXT NOT NULL DEFAULT ''"); err != nil {
+				return fmt.Errorf("journal migration v8: %w", err)
+			}
+		} else if count != 1 {
+			return fmt.Errorf("%w: duplicate v8 column %s.%s", ErrCorrupt, item.table, item.column)
+		}
+	}
+	if err := validateV8Schema(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version=8"); err != nil {
+		return fmt.Errorf("journal migration v8: %w", err)
+	}
+	return nil
+}
+
+func validateV8Schema(ctx context.Context, tx *sql.Tx) error {
+	if err := validateV7Schema(ctx, tx); err != nil {
+		return err
+	}
+	return validateObservationColumns(ctx, tx)
+}
+
+func validateObservationColumns(ctx context.Context, queryer schemaQueryer) error {
+	for _, item := range []struct {
+		table  string
+		column string
+	}{
+		{table: "reply_claims", column: "reply_error_code"},
+		{table: "observations", column: "endpoint_id"},
+		{table: "observations", column: "control_route"},
+	} {
+		rows, err := queryer.QueryContext(ctx, "PRAGMA table_info('"+item.table+"')")
+		if err != nil {
+			return fmt.Errorf("%w: inspect v8 %s schema: %v", ErrCorrupt, item.table, err)
+		}
+		found := false
+		for rows.Next() {
+			var cid, notNull, pk int
+			var name, typ string
+			var def any
+			if err := rows.Scan(&cid, &name, &typ, &notNull, &def, &pk); err != nil {
+				rows.Close()
+				return fmt.Errorf("%w: inspect v8 %s schema: %v", ErrCorrupt, item.table, err)
+			}
+			if name == item.column {
+				if found || strings.ToUpper(strings.TrimSpace(typ)) != "TEXT" || notNull != 1 || fmt.Sprint(def) != "''" {
+					rows.Close()
+					return fmt.Errorf("%w: malformed v8 column %s.%s", ErrCorrupt, item.table, item.column)
+				}
+				found = true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return fmt.Errorf("%w: inspect v8 %s schema: %v", ErrCorrupt, item.table, err)
+		}
+		rows.Close()
+		if !found {
+			return fmt.Errorf("%w: required v8 column %s.%s is missing", ErrCorrupt, item.table, item.column)
+		}
+	}
+	return nil
 }
 
 func validateEndpointColumns(ctx context.Context, queryer schemaQueryer) error {

@@ -62,12 +62,20 @@ func TestRemoteJournalRoutesCustodyAndPreservesSeparateBodyEndpoint(t *testing.T
 			response.Result = json.RawMessage(`{"state":"reply_dispatch_claimed","lease":{"expiresAt":"2026-09-16T00:00:31.000000001Z"}}`)
 		case "commit":
 			response.Result = json.RawMessage(`{"state":"reply_accepted","wakeRecorded":true,"won":true}`)
+		case "observe":
+			response.Result = json.RawMessage(`{"state":"reply_observed","status":"observed","winner":{"nativeItemId":"native-remote-1"},"provenance":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000072","controlRoute":"codex://body/thread/reply"}}`)
 		case "status", "reconcile":
 			response.Result = json.RawMessage(`{"state":"reply_accepted","replyStatus":"success","commitSeq":1}`)
 		default:
 			t.Fatalf("unexpected operation %s", req.Operation)
 		}
-		return json.Marshal(response)
+		raw, marshalErr := json.Marshal(response)
+		if req.Operation == "observe" {
+			if _, validateErr := sshproxy.ValidateControlRequest(raw); validateErr != nil {
+				t.Fatalf("fake observe result invalid: %v raw=%s", validateErr, raw)
+			}
+		}
+		return raw, marshalErr
 	}
 	router := &RemoteJournal{Local: local, Endpoints: store, LocalEndpointID: bodyDestinationEndpoint, Invoke: invoker, Now: func() time.Time { return time.Date(2026, 9, 16, 0, 0, 0, 1, time.UTC) }}
 	op := Operation{OperationID: remoteOperation, MessageID: remoteOriginal, SourceRoute: "codex://body/thread/source", TargetRoute: "codex://body/thread/target", Semantics: "message", ReplyRoute: "codex://body/thread/reply", ReplyEndpointID: bodyDestinationEndpoint, CustodyRoute: remoteCustodyEndpoint, CustodyStoreID: remoteCustodyStore, AttemptOwner: "sender", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", BodySize: 4, SourceEndpointID: bodyDestinationEndpoint, TargetEndpointID: bodyDestinationEndpoint}
@@ -92,10 +100,13 @@ func TestRemoteJournalRoutesCustodyAndPreservesSeparateBodyEndpoint(t *testing.T
 	if committed.State != mektup.StateReplyAccepted || !committed.Won {
 		t.Fatalf("commit=%#v", committed)
 	}
+	if err := router.ObserveReply(context.Background(), remoteReply, "native-remote-1", op.Digest); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := router.WaitReply(context.Background(), remoteReply, time.Second); err == nil {
 		t.Fatal("own custody acceptance completed a child wait")
 	}
-	if len(operations) != 4 || operations[0] != "claim" || operations[1] != "heartbeat" || operations[2] != "commit" || operations[3] != "status" {
+	if len(operations) != 5 || operations[0] != "claim" || operations[1] != "heartbeat" || operations[2] != "commit" || operations[3] != "observe" || operations[4] != "status" {
 		t.Fatalf("operations=%v", operations)
 	}
 }

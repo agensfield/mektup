@@ -173,7 +173,19 @@ func (r *RemoteJournal) ClaimReply(ctx context.Context, input ReplyClaimInput) (
 		return claim, nil
 	}
 	op.ReplyEndpointID = replyEndpointID
-	request, err := r.request(op, input, "claim", replyEndpointID)
+	controlOp := op
+	if op.InReplyTo != "" {
+		// The receiver validates the original durable operation relationship.
+		// A reply operation may be the sender-side source of routing context,
+		// but its control document must still name the original operation that
+		// owns the custody tuple.
+		originalStatus, lookupErr := r.Local.Lookup(ctx, input.OriginalID)
+		if lookupErr != nil {
+			return ReplyClaim{}, fmt.Errorf("%w: original operation identity: %v", ErrRemoteCustodyBinding, lookupErr)
+		}
+		controlOp.OperationID = originalStatus.OperationID
+	}
+	request, err := r.request(controlOp, input, "claim", replyEndpointID)
 	if err != nil {
 		return ReplyClaim{}, err
 	}
@@ -277,10 +289,7 @@ func (r *RemoteJournal) ObserveReply(ctx context.Context, replyID, nativeID, dig
 	if !remote {
 		return r.Local.ObserveReply(ctx, replyID, nativeID, digest)
 	}
-	if claim.state == mektup.StateReplyAccepted || claim.state == mektup.StateReplyObserved {
-		return nil
-	}
-	return ErrRemoteObservationUnsupported
+	return r.observeRemote(ctx, claim, nativeID, digest)
 }
 
 func (r *RemoteJournal) ReconcileReplyObservation(ctx context.Context, replyID, nativeID, digest string) error {
@@ -291,10 +300,39 @@ func (r *RemoteJournal) ReconcileReplyObservation(ctx context.Context, replyID, 
 	if !remote {
 		return r.Local.ReconcileReplyObservation(ctx, replyID, nativeID, digest)
 	}
-	if claim.state == mektup.StateReplyAccepted || claim.state == mektup.StateReplyObserved {
-		return nil
+	// The sender has already performed exact full-history/live native-item
+	// validation. Remote control has one evidence transition for both paths;
+	// this method name is retained for the local JournalPort seam, while the
+	// wire operation remains the explicit tokenless observe operation.
+	return r.observeRemote(ctx, claim, nativeID, digest)
+}
+
+func (r *RemoteJournal) observeRemote(ctx context.Context, claim remoteClaim, nativeID, digest string) error {
+	if nativeID == "" || digest == "" {
+		return sshproxy.ErrControlValidation
 	}
-	return ErrRemoteObservationUnsupported
+	request := claim.request
+	request.Operation = "observe"
+	request.NativeItemID = nativeID
+	request.BodySHA256 = digest
+	request.AttemptOwner = ""
+	request.FencingToken = ""
+	request.Lease = nil
+	request.RequestedLease = nil
+	response, err := r.invoke(ctx, claim.route, request)
+	if err != nil {
+		return err
+	}
+	result, err := decodeObserveResult(response, request)
+	if err != nil {
+		return err
+	}
+	r.mu.Lock()
+	current := r.claims[claim.input.ReplyID]
+	current.state = result.State
+	r.claims[claim.input.ReplyID] = current
+	r.mu.Unlock()
+	return nil
 }
 
 func (r *RemoteJournal) WaitReply(ctx context.Context, replyID string, timeout time.Duration) (OperationStatus, error) {
@@ -407,7 +445,7 @@ func (r *RemoteJournal) request(op Operation, input ReplyClaimInput, operation, 
 	}
 	now := r.Now().UTC().Format(time.RFC3339Nano)
 	bytes := input.BodySize
-	return sshproxy.ControlRequest{Schema: "mektup/control/v1", Kind: "request", Operation: operation, OperationID: op.OperationID, ReplyMessageID: input.ReplyID, OriginalMessageID: input.OriginalID, Custody: sshproxy.CustodyRef{EndpointID: input.CustodyRoute, StoreID: input.CustodyStoreID}, ReplyDestination: sshproxy.DestinationRef{EndpointID: replyEndpointID, ThreadID: thread.ThreadID, URI: input.ReplyRoute}, BodyBytes: &bytes, BodySHA256: input.Digest, ReplyStatus: input.Status, AttemptOwner: input.Owner, RequestedAt: now}, nil
+	return sshproxy.ControlRequest{Schema: "mektup/control/v1", Kind: "request", Operation: operation, OperationID: op.OperationID, ReplyMessageID: input.ReplyID, OriginalMessageID: input.OriginalID, Custody: sshproxy.CustodyRef{EndpointID: input.CustodyRoute, StoreID: input.CustodyStoreID}, ReplyDestination: sshproxy.DestinationRef{EndpointID: replyEndpointID, ThreadID: thread.ThreadID, URI: input.ReplyRoute}, BodyBytes: &bytes, BodySHA256: input.Digest, ReplyStatus: input.Status, ReplyErrorCode: input.ErrorCode, AttemptOwner: input.Owner, RequestedAt: now}, nil
 }
 
 func (r *RemoteJournal) invoke(ctx context.Context, route endpoint.Route, request sshproxy.ControlRequest) (sshproxy.ControlRequest, error) {
@@ -526,6 +564,49 @@ func decodeMutationResult(response sshproxy.ControlRequest, input ReplyClaimInpu
 		return ReplyClaim{}, sshproxy.ErrControlValidation
 	}
 	return ReplyClaim{ReplyID: input.ReplyID, OriginalID: input.OriginalID, Digest: input.Digest, BodySize: input.BodySize, Status: input.Status, ReplyRoute: input.ReplyRoute, CustodyRoute: input.CustodyRoute, CustodyStoreID: input.CustodyStoreID, Owner: input.Owner, State: result.State, Joined: joined, Won: result.Won}, nil
+}
+
+func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.ControlRequest) (struct{ State mektup.EvidenceState }, error) {
+	var out struct{ State mektup.EvidenceState }
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(response.Result, &raw); err != nil || raw == nil {
+		return out, sshproxy.ErrControlValidation
+	}
+	stateRaw, ok := raw["state"]
+	if !ok || json.Unmarshal(stateRaw, &out.State) != nil || out.State != mektup.StateReplyObserved {
+		return out, sshproxy.ErrControlValidation
+	}
+	statusRaw, ok := raw["status"]
+	var status string
+	if !ok || json.Unmarshal(statusRaw, &status) != nil || status == "" {
+		return out, sshproxy.ErrControlValidation
+	}
+	winnerRaw, ok := raw["winner"]
+	if !ok || string(bytes.TrimSpace(winnerRaw)) == "null" {
+		return out, sshproxy.ErrControlValidation
+	}
+	var winner map[string]json.RawMessage
+	if json.Unmarshal(winnerRaw, &winner) != nil || winner == nil {
+		return out, sshproxy.ErrControlValidation
+	}
+	if nativeRaw, ok := winner["nativeItemId"]; ok {
+		var winnerNative string
+		if json.Unmarshal(nativeRaw, &winnerNative) != nil || winnerNative == "" {
+			return out, sshproxy.ErrControlValidation
+		}
+	}
+	provenanceRaw, ok := raw["provenance"]
+	if !ok || string(bytes.TrimSpace(provenanceRaw)) == "null" {
+		return out, sshproxy.ErrControlValidation
+	}
+	var provenance struct {
+		EndpointID   string `json:"endpointId"`
+		ControlRoute string `json:"controlRoute"`
+	}
+	if json.Unmarshal(provenanceRaw, &provenance) != nil || provenance.EndpointID != request.ReplyDestination.EndpointID || provenance.ControlRoute != request.ReplyDestination.URI {
+		return out, sshproxy.ErrControlValidation
+	}
+	return out, nil
 }
 
 func (r *RemoteJournal) status(ctx context.Context, claim remoteClaim, reconcile bool) (OperationStatus, error) {
