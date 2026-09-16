@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -331,7 +332,7 @@ func TestObservationIgnoresServerRequestsAndMapsVisibleCompletedItem(t *testing.
 	}
 	defer blockers.Close()
 	events := make(chan appserver.Event, 3)
-	events <- appserver.Event{Kind: appserver.EventServerRequest, Request: &appserver.ServerRequest{ID: "s1", Method: "item/permissions/requestApproval", Params: json.RawMessage(`{"secret":"must-not-persist"}`), Generation: 7}}
+	events <- appserver.Event{Kind: appserver.EventServerRequest, Request: &appserver.ServerRequest{ID: "s1", Method: "item/permissions/requestApproval", Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1","secret":"must-not-persist"}`), Generation: 7}}
 	resolved, _ := json.Marshal(map[string]any{"threadId": "thread-1", "requestId": "s1"})
 	events <- appserver.Event{Kind: appserver.EventNotification, Notification: &appserver.RPCNotification{Method: "serverRequest/resolved", Params: resolved, Generation: 7}}
 	params, _ := json.Marshal(map[string]any{
@@ -353,11 +354,11 @@ func TestObservationIgnoresServerRequestsAndMapsVisibleCompletedItem(t *testing.
 	if event.Item.Text != "hello" || event.Item.ClientMessageID != "msg-1" || event.Item.NativeItemID != "item-1" {
 		t.Fatalf("mapped item = %#v", event.Item)
 	}
-	rows, err := blockers.ListBlockers(context.Background(), journal.BlockerQuery{EndpointID: testTargetEndpoint, Generation: "7", ThreadID: "thread-1"})
+	rows, err := blockers.ListBlockers(context.Background(), journal.BlockerQuery{EndpointID: testTargetEndpoint, ThreadID: "thread-1"})
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("blocker metadata = %#v, %v", rows, err)
 	}
-	if rows[0].Method != "item/permissions/requestApproval" || rows[0].CorrelationID != `"s1"` || rows[0].ResolvedAt == nil {
+	if rows[0].Method != "item/permissions/requestApproval" || rows[0].CorrelationID != `"s1"` || !strings.HasSuffix(rows[0].Generation, "/7") || rows[0].TurnID != "turn-1" || rows[0].ItemID != "item-1" || rows[0].ResolvedAt == nil {
 		t.Fatalf("blocker metadata = %#v", rows[0])
 	}
 	entries, err := os.ReadDir(stateDir)
@@ -372,6 +373,82 @@ func TestObservationIgnoresServerRequestsAndMapsVisibleCompletedItem(t *testing.
 		if readErr == nil && bytes.Contains(data, []byte("must-not-persist")) {
 			t.Fatalf("server request payload persisted in %s", entry.Name())
 		}
+	}
+}
+
+func TestBlockerObserverIdentitySurvivesProcessLocalGenerationReuse(t *testing.T) {
+	ctx := context.Background()
+	store, err := journal.Open(ctx, journal.Options{StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	target := testTarget()
+	run := func(resolve bool) {
+		events := make(chan appserver.Event, 2)
+		events <- appserver.Event{Kind: appserver.EventServerRequest, Request: &appserver.ServerRequest{
+			ID: 1, Generation: 1, Method: "item/tool/requestUserInput",
+			Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","itemId":"item-1"}`),
+		}}
+		if resolve {
+			params, _ := json.Marshal(map[string]any{"threadId": target.ThreadID, "requestId": 1})
+			events <- appserver.Event{Kind: appserver.EventNotification, Notification: &appserver.RPCNotification{Generation: 1, Method: "serverRequest/resolved", Params: params}}
+		}
+		close(events)
+		stream := &eventStream{session: &fakeSession{endpoint: target.EndpointID, events: events}, target: target, blockers: store, ctx: ctx, cancel: func() {}}
+		event, nextErr := stream.Next(ctx)
+		if nextErr != nil || !event.Gap {
+			t.Fatalf("drain = %#v, %v", event, nextErr)
+		}
+	}
+	run(true)
+	run(false)
+	rows, err := store.ListBlockers(ctx, journal.BlockerQuery{EndpointID: target.EndpointID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("independent observers collapsed: %#v", rows)
+	}
+	resolved, pending := 0, 0
+	for _, row := range rows {
+		if row.ResolvedAt == nil {
+			pending++
+		} else {
+			resolved++
+		}
+	}
+	if resolved != 1 || pending != 1 {
+		t.Fatalf("blocker lifecycle rows = %#v", rows)
+	}
+}
+
+func TestBlockerUsesDeclaredThreadMetadata(t *testing.T) {
+	ctx := context.Background()
+	store, err := journal.Open(ctx, journal.Options{StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	events := make(chan appserver.Event, 1)
+	events <- appserver.Event{Kind: appserver.EventServerRequest, Request: &appserver.ServerRequest{
+		ID: 2, Generation: 2, Method: "item/tool/requestUserInput",
+		Params: json.RawMessage(`{"threadId":"other-thread","turnId":"other-turn","itemId":"other-item"}`),
+	}}
+	close(events)
+	target := testTarget()
+	stream := &eventStream{session: &fakeSession{endpoint: target.EndpointID, events: events}, target: target, blockers: store, ctx: ctx, cancel: func() {}}
+	_, _ = stream.Next(ctx)
+	wrong, err := store.ListBlockers(ctx, journal.BlockerQuery{EndpointID: target.EndpointID, ThreadID: target.ThreadID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wrong) != 0 {
+		t.Fatalf("other-thread request attributed to watched thread: %#v", wrong)
+	}
+	actual, err := store.ListBlockers(ctx, journal.BlockerQuery{EndpointID: target.EndpointID, ThreadID: "other-thread"})
+	if err != nil || len(actual) != 1 || actual[0].TurnID != "other-turn" || actual[0].ItemID != "other-item" {
+		t.Fatalf("declared blocker metadata = %#v, %v", actual, err)
 	}
 }
 

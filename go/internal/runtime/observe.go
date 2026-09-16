@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/appserver"
 	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/service"
@@ -106,6 +107,10 @@ type eventStream struct {
 	cancel   context.CancelFunc
 	mu       sync.Mutex
 	closed   bool
+
+	blockerOnce sync.Once
+	blockerID   string
+	blockerErr  error
 }
 
 func (s *eventStream) Next(ctx context.Context) (service.Event, error) {
@@ -156,10 +161,15 @@ func (s *eventStream) Next(ctx context.Context) (service.Event, error) {
 				if correlationErr != nil {
 					return service.Event{}, correlationErr
 				}
+				generation, generationErr := s.blockerGeneration(event.Request.Generation)
+				if generationErr != nil {
+					return service.Event{}, generationErr
+				}
+				threadID, turnID, itemID := serverRequestMetadata(event.Request.Method, event.Request.Params)
 				if blockerErr := s.blockers.UpsertBlocker(nextCtx, journal.BlockerObservation{
 					Method: event.Request.Method, CorrelationID: correlationID,
-					Generation: strconv.FormatUint(event.Request.Generation, 10),
-					EndpointID: s.target.EndpointID, ThreadID: s.target.ThreadID,
+					Generation: generation, EndpointID: s.target.EndpointID,
+					ThreadID: threadID, TurnID: turnID, ItemID: itemID,
 				}); blockerErr != nil {
 					return service.Event{}, blockerErr
 				}
@@ -171,14 +181,16 @@ func (s *eventStream) Next(ctx context.Context) (service.Event, error) {
 			}
 			if event.Notification.Method == "serverRequest/resolved" {
 				if s.blockers != nil {
-					threadID, requestID, resolvedErr := resolvedServerRequest(event.Notification.Params)
+					_, requestID, resolvedErr := resolvedServerRequest(event.Notification.Params)
 					if resolvedErr != nil {
 						return service.Event{}, resolvedErr
 					}
-					if threadID == s.target.ThreadID {
-						if blockerErr := s.blockers.ResolveBlocker(nextCtx, s.target.EndpointID, strconv.FormatUint(event.Notification.Generation, 10), requestID, time.Now()); blockerErr != nil {
-							return service.Event{}, blockerErr
-						}
+					generation, generationErr := s.blockerGeneration(event.Notification.Generation)
+					if generationErr != nil {
+						return service.Event{}, generationErr
+					}
+					if blockerErr := s.blockers.ResolveBlocker(nextCtx, s.target.EndpointID, generation, requestID, time.Now()); blockerErr != nil {
+						return service.Event{}, blockerErr
 					}
 				}
 				continue
@@ -195,6 +207,49 @@ func (s *eventStream) Next(ctx context.Context) (service.Event, error) {
 			continue
 		}
 	}
+}
+
+func (s *eventStream) blockerGeneration(transportGeneration uint64) (string, error) {
+	s.blockerOnce.Do(func() {
+		s.blockerID, s.blockerErr = mektup.NewUUIDv7Checked()
+	})
+	if s.blockerErr != nil {
+		return "", fmt.Errorf("runtime: allocate blocker observer identity: %w", s.blockerErr)
+	}
+	return s.blockerID + "/" + strconv.FormatUint(transportGeneration, 10), nil
+}
+
+func serverRequestMetadata(method string, params json.RawMessage) (threadID, turnID, itemID string) {
+	var object map[string]json.RawMessage
+	switch method {
+	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval",
+		"item/tool/requestUserInput", "item/permissions/requestApproval":
+		if json.Unmarshal(params, &object) != nil {
+			return "", "", ""
+		}
+		threadID = stringField(object, "threadId")
+		turnID = stringField(object, "turnId")
+		itemID = stringField(object, "itemId")
+	case "item/tool/call":
+		if json.Unmarshal(params, &object) != nil {
+			return "", "", ""
+		}
+		threadID = stringField(object, "threadId")
+		turnID = stringField(object, "turnId")
+		itemID = stringField(object, "callId")
+	case "mcpServer/elicitation/request":
+		if json.Unmarshal(params, &object) != nil {
+			return "", "", ""
+		}
+		threadID = stringField(object, "threadId")
+		turnID = stringField(object, "turnId")
+	case "currentTime/read":
+		if json.Unmarshal(params, &object) != nil {
+			return "", "", ""
+		}
+		threadID = stringField(object, "threadId")
+	}
+	return threadID, turnID, itemID
 }
 
 func serverRequestCorrelationID(id appserver.RequestID) (string, error) {
