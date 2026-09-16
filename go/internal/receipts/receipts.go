@@ -51,6 +51,7 @@ type Journal interface {
 	RecordManualResolution(context.Context, string, journal.ManualResolution) error
 	Reply(context.Context, string) (journal.ReplyClaim, error)
 	RepliesFor(context.Context, string) ([]journal.ReplyClaim, error)
+	OriginalStatus(context.Context, string) (journal.OriginalStatusResult, error)
 	RecordAccepted(context.Context, string, string) error
 	ReconcileReplyObservation(context.Context, string, string, string) error
 	UpsertBlocker(context.Context, journal.BlockerObservation) error

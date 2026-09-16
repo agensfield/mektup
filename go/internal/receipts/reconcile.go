@@ -22,11 +22,18 @@ func (s Store) Reconcile(ctx context.Context, reference string, history HistoryP
 	if err != nil {
 		return mektup.Receipt{}, err
 	}
+	if receipt.ContentRef == nil && isReplyWaitReceipt(receipt.State) {
+		return s.reconcileDurableReply(ctx, receipt, history)
+	}
 	previous := receipt
 	previous.Evidence = append([]mektup.EvidenceRecord(nil), receipt.Evidence...)
-	// Native history is always read from the pinned delivery target. Source is
-	// the sender/custody identity and must not retarget a reply reconciliation.
+	// Reply content locators carry their own pinned native destination. For a
+	// wait receipt without ContentRef, the durable operation's reply route is
+	// resolved by reconcileDurableReply above; ordinary receipts use Target.
 	endpointID, threadID := receipt.Target.EndpointID, receipt.Target.ThreadID
+	if receipt.ContentRef != nil {
+		endpointID, threadID = receipt.ContentRef.EndpointID, receipt.ContentRef.ThreadID
+	}
 	if endpointID == "" || threadID == "" {
 		return mektup.Receipt{}, ErrRouteUnavailable
 	}
@@ -145,6 +152,97 @@ func (s Store) Reconcile(ctx context.Context, reference string, history HistoryP
 		}
 	}
 	return receipt, nil
+}
+
+func isReplyWaitReceipt(state mektup.EvidenceState) bool {
+	return state == mektup.StateReplyAccepted || state == mektup.StateReplyOutcomeUnknown || state == mektup.StateReplyObserved
+}
+
+// reconcileDurableReply resolves the selected reply from the authoritative
+// custody journal, then reads the pinned reply destination. Receipt evidence
+// fields are presentation only and never select a claim or digest.
+func (s Store) reconcileDurableReply(ctx context.Context, receipt mektup.Receipt, history HistoryPort) (mektup.Receipt, error) {
+	op, err := s.Journal.Operation(ctx, receipt.OperationID)
+	if err != nil {
+		return mektup.Receipt{}, err
+	}
+	status, err := s.Journal.OriginalStatus(ctx, op.MessageID)
+	if err != nil {
+		return mektup.Receipt{}, err
+	}
+	if status.Selection != journal.OriginalStatusWinner && status.Selection != journal.OriginalStatusTerminalUnknown {
+		return mektup.Receipt{}, ErrReconcileIncomplete
+	}
+	claim := status.Claim
+	endpointID := op.ReplyEndpointID
+	if endpointID == "" {
+		endpointID = receipt.Source.EndpointID
+	}
+	threadID := op.ReplyThreadID
+	if threadID == "" {
+		if parsed, parseErr := mektup.ParseThreadURI(op.ReplyRoute); parseErr == nil {
+			threadID = parsed.ThreadID
+		}
+	}
+	if threadID == "" {
+		threadID = receipt.Source.ThreadID
+	}
+	if endpointID == "" || threadID == "" {
+		return mektup.Receipt{}, ErrRouteUnavailable
+	}
+	items, err := history.FullHistory(ctx, endpointID, threadID)
+	if err != nil {
+		return mektup.Receipt{}, fmt.Errorf("%w: %v", ErrReconcileIncomplete, err)
+	}
+	var match *HistoryItem
+	for i := range items {
+		item := &items[i]
+		if !replyHistoryMatch(*item, endpointID, threadID, claim) {
+			continue
+		}
+		if match != nil {
+			return mektup.Receipt{}, fmt.Errorf("%w: multiple exact reply items", ErrIdentityMismatch)
+		}
+		match = item
+	}
+	if match == nil {
+		return mektup.Receipt{}, ErrReconcileIncomplete
+	}
+	now := s.now().Format(time.RFC3339Nano)
+	updated := receipt
+	updated.State = mektup.StateReplyObserved
+	updated.UpdatedAt = now
+	updated.ContentRef = &mektup.ContentRef{EndpointID: endpointID, ThreadID: threadID, TurnID: match.TurnID, ItemID: match.ItemID, ClientMessageID: claim.ReplyID, PayloadBytes: uint64(claim.BodySize), PayloadSHA256: claim.Digest}
+	updated.Evidence = append(updated.Evidence, mektup.EvidenceRecord{State: mektup.StateReplyObserved, At: now, Reference: claim.ReplyID, Details: map[string]any{"replyStatus": claim.Status, "replyDigest": claim.Digest, "replyBodyBytes": claim.BodySize, "commitSeq": claim.CommitSeq}})
+	if concrete, ok := s.Journal.(*journal.Journal); ok {
+		if err := concrete.ReconcileReplyObservationWithReceipt(ctx, claim.ReplyID, match.ItemID, claim.Digest, updated); err != nil {
+			return mektup.Receipt{}, err
+		}
+		return updated, nil
+	}
+	if err := s.Journal.ReconcileReplyObservation(ctx, claim.ReplyID, match.ItemID, claim.Digest); err != nil {
+		return mektup.Receipt{}, err
+	}
+	if err := s.Journal.PutReceipt(ctx, updated); err != nil {
+		return mektup.Receipt{}, err
+	}
+	return updated, nil
+}
+
+func replyHistoryMatch(item HistoryItem, endpointID, threadID string, claim journal.ReplyClaim) bool {
+	if item.EndpointID != endpointID || item.ThreadID != threadID || item.MessageID != claim.ReplyID || item.ClientMessageID != claim.ReplyID || item.InReplyTo != claim.OriginalID || item.Body == nil {
+		return false
+	}
+	if bodyDigest(item.Body) != claim.Digest || uint64(len(item.Body)) != uint64(claim.BodySize) {
+		return false
+	}
+	if item.PayloadSHA256 != "" && item.PayloadSHA256 != claim.Digest {
+		return false
+	}
+	if item.ReplyStatus != "" && item.ReplyStatus != claim.Status {
+		return false
+	}
+	return item.ReplyErrorCode == "" || item.ReplyErrorCode == claim.ReplyErrorCode
 }
 
 func historyEvidenceReference(item HistoryItem) string {

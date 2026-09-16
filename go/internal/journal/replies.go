@@ -1028,37 +1028,60 @@ func (j *Journal) ReconcileReplyObservation(ctx context.Context, replyID, native
 		return fmt.Errorf("journal: invalid reconciliation")
 	}
 	return j.withTx(ctx, func(tx *sql.Tx) error {
+		return reconcileReplyObservationTx(tx, replyID, nativeItemID, digest, j.nowUnix())
+	})
+}
+
+func reconcileReplyObservationTx(tx *sql.Tx, replyID, nativeItemID, digest string, now int64) error {
+	var expected, originalID string
+	var state EvidenceState
+	if err := tx.QueryRow("SELECT digest,original_id,state FROM reply_claims WHERE reply_id=?", replyID).Scan(&expected, &originalID, &state); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return err
+	}
+	if expected != digest {
+		return ErrIdentityConflict
+	}
+	if state != StateReplyOutcomeUnknown && state != StateReplyAccepted && state != StateReplyObserved {
+		return ErrInvalidTransition
+	}
+	if err := validateObservationIdentityTx(tx, replyID, nativeItemID, digest, "", ""); err != nil {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest) VALUES(?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET observed_at=excluded.observed_at", replyID, nativeItemID, now, digest); err != nil {
+		return err
+	}
+	if state == StateReplyObserved {
+		return nil
+	}
+	if _, err := tx.Exec("UPDATE reply_claims SET state=?,updated_at=? WHERE reply_id=? AND state=?", string(StateReplyObserved), now, replyID, string(state)); err != nil {
+		return err
+	}
+	if _, _, err := assignReplyCommitTx(tx, originalID, replyID, now); err != nil {
+		return err
+	}
+	return emit(tx, "reply.reconciled", "", replyID, StateReplyObserved, now)
+}
+
+// ReconcileReplyObservationWithReceipt atomically strengthens the authoritative
+// reply claim and publishes the metadata-only receipt projection. It is the
+// durable boundary used by successor wait/reconcile paths: either both the
+// custody evidence and ContentRef commit, or neither does.
+func (j *Journal) ReconcileReplyObservationWithReceipt(ctx context.Context, replyID, nativeItemID, digest string, receipt mektup.Receipt) error {
+	if nativeItemID == "" || digest == "" {
+		return fmt.Errorf("journal: invalid reconciliation")
+	}
+	if receipt.State != mektup.StateReplyObserved || receipt.ContentRef == nil {
+		return fmt.Errorf("journal: observed receipt projection is incomplete")
+	}
+	return j.withTx(ctx, func(tx *sql.Tx) error {
 		now := j.nowUnix()
-		var expected, originalID string
-		var state EvidenceState
-		if err := tx.QueryRow("SELECT digest,original_id,state FROM reply_claims WHERE reply_id=?", replyID).Scan(&expected, &originalID, &state); err != nil {
-			if err == sql.ErrNoRows {
-				return ErrNotFound
-			}
+		if err := reconcileReplyObservationTx(tx, replyID, nativeItemID, digest, now); err != nil {
 			return err
 		}
-		if expected != digest {
-			return ErrIdentityConflict
-		}
-		if state != StateReplyOutcomeUnknown && state != StateReplyAccepted && state != StateReplyObserved {
-			return ErrInvalidTransition
-		}
-		if err := validateObservationIdentityTx(tx, replyID, nativeItemID, digest, "", ""); err != nil {
-			return err
-		}
-		if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest) VALUES(?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET observed_at=excluded.observed_at", replyID, nativeItemID, now, digest); err != nil {
-			return err
-		}
-		if state == StateReplyObserved {
-			return nil
-		}
-		if _, err := tx.Exec("UPDATE reply_claims SET state=?,updated_at=? WHERE reply_id=? AND state=?", string(StateReplyObserved), now, replyID, string(state)); err != nil {
-			return err
-		}
-		if _, _, err := assignReplyCommitTx(tx, originalID, replyID, now); err != nil {
-			return err
-		}
-		return emit(tx, "reply.reconciled", "", replyID, StateReplyObserved, now)
+		return j.putReceiptTx(ctx, tx, receipt)
 	})
 }
 

@@ -651,7 +651,7 @@ func (h runtimeHistory) FullHistory(ctx context.Context, endpointID, threadID st
 		if parseErr != nil {
 			continue
 		}
-		history = append(history, receipts.HistoryItem{EndpointID: endpointID, ThreadID: threadID, TurnID: item.TurnID, ItemID: item.NativeItemID, MessageID: envelope.MessageID, ClientMessageID: item.ClientMessageID, InReplyTo: envelope.InReplyTo, Body: []byte(envelope.Body), PayloadSHA256: envelope.PayloadSHA256})
+		history = append(history, receipts.HistoryItem{EndpointID: endpointID, ThreadID: threadID, TurnID: item.TurnID, ItemID: item.NativeItemID, MessageID: envelope.MessageID, ClientMessageID: item.ClientMessageID, InReplyTo: envelope.InReplyTo, ReplyStatus: string(envelope.ReplyStatus), ReplyErrorCode: envelope.ReplyErrorCode, Body: []byte(envelope.Body), PayloadSHA256: envelope.PayloadSHA256})
 	}
 	return history, nil
 }

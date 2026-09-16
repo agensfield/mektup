@@ -18,6 +18,8 @@ type HistoryItem struct {
 	MessageID       string
 	ClientMessageID string
 	InReplyTo       string
+	ReplyStatus     string
+	ReplyErrorCode  string
 	Body            []byte
 	PayloadSHA256   string
 }
