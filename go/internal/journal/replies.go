@@ -56,6 +56,11 @@ type OriginalStatusImport struct {
 	CommitSeq    int64
 	EventSeq     int64
 	NativeItemID string
+	// NativeEndpointID and NativeControlRoute are optional provenance for
+	// journal-native observation imports. The control wire does not carry
+	// these fields, so portable originalStatus imports leave them empty.
+	NativeEndpointID   string
+	NativeControlRoute string
 }
 
 const (
@@ -742,7 +747,7 @@ func (j *Journal) RecordObservedWinner(ctx context.Context, originalID, replyID,
 	}
 	return j.withTx(ctx, func(tx *sql.Tx) error {
 		now := j.nowUnix()
-		return importObservedWinnerTx(tx, OriginalStatusImport{Operation: Operation{MessageID: originalID, ReplyRoute: replyRoute, CustodyRoute: custodyRoute, CustodyStoreID: storeID}, ReplyID: replyID, Digest: digest, BodySize: bodySize, Status: status, ErrorCode: errorCode, CommitSeq: commitSeq, NativeItemID: nativeID}, now)
+		return importObservedWinnerTx(tx, OriginalStatusImport{Operation: Operation{MessageID: originalID, ReplyRoute: replyRoute, CustodyRoute: custodyRoute, CustodyStoreID: storeID}, ReplyID: replyID, Digest: digest, BodySize: bodySize, Status: status, ErrorCode: errorCode, CommitSeq: commitSeq, NativeItemID: nativeID, NativeEndpointID: endpointID, NativeControlRoute: controlRoute}, now)
 	})
 }
 
@@ -791,12 +796,22 @@ func importObservedWinnerTx(tx *sql.Tx, in OriginalStatusImport, now int64) erro
 		if existing.State != StateReplyOutcomeUnknown && existing.State != StateReplyAccepted && existing.State != StateReplyObserved {
 			return ErrIdentityConflict
 		}
+		priorState := existing.State
 		state := existing.State
 		if winnerState == StateReplyObserved || state == StateReplyOutcomeUnknown {
 			state = winnerState
 		}
 		if _, err := tx.Exec("UPDATE reply_claims SET state=?,token='',lease_until=0,accepted_at=COALESCE(accepted_at,?),commit_seq=?,updated_at=? WHERE reply_id=?", string(state), now, in.CommitSeq, now, in.ReplyID); err != nil {
 			return err
+		}
+		if state != priorState {
+			eventKind := "reply.accepted"
+			if state == StateReplyObserved {
+				eventKind = "reply.observed"
+			}
+			if err := emit(tx, eventKind, "", in.ReplyID, state, now); err != nil {
+				return err
+			}
 		}
 	}
 	if errWinner == sql.ErrNoRows {
@@ -813,10 +828,10 @@ func importObservedWinnerTx(tx *sql.Tx, in OriginalStatusImport, now int64) erro
 		}
 	}
 	if in.NativeItemID != "" {
-		if err := validateObservationIdentityTx(tx, in.ReplyID, in.NativeItemID, in.Digest, "", ""); err != nil {
+		if err := validateObservationIdentityTx(tx, in.ReplyID, in.NativeItemID, in.Digest, in.NativeEndpointID, in.NativeControlRoute); err != nil {
 			return err
 		}
-		if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest) VALUES(?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET observed_at=excluded.observed_at", in.ReplyID, in.NativeItemID, now, in.Digest); err != nil {
+		if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest,endpoint_id,control_route) VALUES(?,?,?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET observed_at=excluded.observed_at,endpoint_id=CASE WHEN excluded.endpoint_id='' THEN observations.endpoint_id ELSE excluded.endpoint_id END,control_route=CASE WHEN excluded.control_route='' THEN observations.control_route ELSE excluded.control_route END", in.ReplyID, in.NativeItemID, now, in.Digest, in.NativeEndpointID, in.NativeControlRoute); err != nil {
 			return err
 		}
 	}

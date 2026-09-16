@@ -185,6 +185,62 @@ func TestImportOriginalStatusUnknownMapsRemoteEventToFreshLocalSequence(t *testi
 	}
 }
 
+func TestImportOriginalStatusStrengtheningEmitsExactlyOnce(t *testing.T) {
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, t.TempDir(), &now)
+	op := portableImportOperation("018")
+	in := portableImportInput(op, OriginalStatusTerminalUnknown, portableImportReply("018"))
+	if err := j.ImportOriginalStatus(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	in.Selection = OriginalStatusWinner
+	in.EventSeq = 0
+	in.CommitSeq = 4
+	if err := j.ImportOriginalStatus(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.ImportOriginalStatus(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := j.db.QueryRow("SELECT COUNT(*) FROM events WHERE reply_id=? AND kind='reply.accepted' AND state=?", in.ReplyID, string(StateReplyAccepted)).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("strengthening accepted events=%d want1", count)
+	}
+}
+
+func TestRecordObservedWinnerPersistsAndFencesProvenance(t *testing.T) {
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, t.TempDir(), &now)
+	op := portableImportOperation("019")
+	if err := j.ImportOperation(context.Background(), op, StateAccepted, ""); err != nil {
+		t.Fatal(err)
+	}
+	in := portableImportInput(op, OriginalStatusWinner, portableImportReply("019"))
+	endpoint := op.ReplyEndpointID
+	route := op.CustodyRoute
+	if err := j.RecordObservedWinner(context.Background(), op.MessageID, in.ReplyID, in.Digest, in.Status, "", op.ReplyRoute, op.CustodyRoute, op.CustodyStoreID, "native", endpoint, route, in.CommitSeq, in.BodySize); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordObservedWinner(context.Background(), op.MessageID, in.ReplyID, in.Digest, in.Status, "", op.ReplyRoute, op.CustodyRoute, op.CustodyStoreID, "native", endpoint, route, in.CommitSeq, in.BodySize); err != nil {
+		t.Fatal(err)
+	}
+	var gotEndpoint, gotRoute string
+	if err := j.db.QueryRow("SELECT endpoint_id,control_route FROM observations WHERE reply_id=?", in.ReplyID).Scan(&gotEndpoint, &gotRoute); err != nil {
+		t.Fatal(err)
+	}
+	if gotEndpoint != endpoint || gotRoute != route {
+		t.Fatalf("provenance endpoint=%q route=%q", gotEndpoint, gotRoute)
+	}
+	if err := j.RecordObservedWinner(context.Background(), op.MessageID, in.ReplyID, in.Digest, in.Status, "", op.ReplyRoute, op.CustodyRoute, op.CustodyStoreID, "native", "ep_0198f0e0-0000-7000-8000-000000000099", route, in.CommitSeq, in.BodySize); !errors.Is(err, ErrIdentityConflict) {
+		t.Fatalf("provenance conflict=%v", err)
+	}
+}
+
 func TestImportOriginalStatusRollsBackOnSQLFailure(t *testing.T) {
 	var now atomic.Int64
 	now.Store(time.Now().UnixNano())
