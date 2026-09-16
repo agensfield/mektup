@@ -186,11 +186,18 @@ func humanStorage(subcommand string, data any) string {
 func humanCollection(kind string, data any, cursor string) string {
 	items := slice(data)
 	if len(items) == 0 {
-		return emptyCollection(kind)
+		return withCursor(emptyCollection(kind), cursor)
 	}
 	var headers []string
 	rows := make([][]string, 0, len(items))
 	for _, raw := range items {
+		if kind == "thread.list" {
+			if id, ok := raw.(string); ok {
+				headers = []string{"THREAD", "STATUS", "MODEL", "NAME", "UPDATED"}
+				rows = append(rows, []string{id, "", "", "", ""})
+				continue
+			}
+		}
 		item := object(raw)
 		switch kind {
 		case "thread.list":
@@ -218,11 +225,14 @@ func humanCollection(kind string, data any, cursor string) string {
 			}
 		}
 	}
-	output := table(headers, rows)
-	if cursor != "" {
-		output += "\nnext cursor: " + cursor
+	return withCursor(table(headers, rows), cursor)
+}
+
+func withCursor(output, cursor string) string {
+	if cursor == "" {
+		return output
 	}
-	return output
+	return output + "\nnext cursor: " + cursor
 }
 
 func humanThreadRead(thread map[string]any) string {

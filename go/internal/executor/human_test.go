@@ -79,6 +79,16 @@ func TestHumanResultHasUsefulEmptyStatesAndDeterministicFallback(t *testing.T) {
 			t.Fatalf("%s output=%q want=%q", kind, got, want)
 		}
 	}
+	for _, kind := range []string{"thread.list", "thread.turns", "thread.items", "search"} {
+		got := humanResult(kind, []any{}, "next-page", "")
+		if !strings.Contains(got, "next cursor: next-page") {
+			t.Fatalf("%s empty page lost cursor: %q", kind, got)
+		}
+	}
+	loaded := humanResult("thread.list", []any{"01999999-9999-7999-8999-999999999999"}, "", "")
+	if !strings.Contains(loaded, "01999999-9999-7999-8999-999999999999") {
+		t.Fatalf("ID-only loaded thread disappeared: %q", loaded)
+	}
 	fallback := humanResult("future.command", map[string]any{"z": 1, "a": "value"}, "next", "")
 	if !strings.Contains(fallback, "future.command:") || !strings.Contains(fallback, `"a": "value"`) || !strings.Contains(fallback, "next cursor: next") {
 		t.Fatalf("fallback output=%q", fallback)

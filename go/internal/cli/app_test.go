@@ -323,6 +323,19 @@ func TestDocsCommandsJSONIsOneMachineLine(t *testing.T) {
 	}
 }
 
+func TestHumanCommandDocsAndInspectHelpAreNavigable(t *testing.T) {
+	code, stdout, stderr := runTest(t, "--human", "docs", "commands")
+	if code != int(ExitSuccess) || stderr != "" || !strings.Contains(stdout, "Mektup commands (contract "+ContractVersion+")") || !strings.Contains(stdout, "usage: mektup inspect <target>") || strings.Contains(stdout, `"commands"`) {
+		t.Fatalf("human command docs code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	code, stdout, stderr = runTest(t, "help", "inspect")
+	for _, want := range []string{"codex://local/thread/<thread-uuid>", "--receipts 0", "live Herdr agent name"} {
+		if code != int(ExitSuccess) || stderr != "" || !strings.Contains(stdout, want) {
+			t.Fatalf("inspect help missing %q: code=%d stdout=%q stderr=%q", want, code, stdout, stderr)
+		}
+	}
+}
+
 func TestExecutorResultStreamsProvidedOutputAndReceipt(t *testing.T) {
 	var out, errOut bytes.Buffer
 	var got Invocation

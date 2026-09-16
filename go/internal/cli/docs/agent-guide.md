@@ -19,6 +19,23 @@ or `--file <path>`. `--raw` is unwrapped one-way delivery and cannot be used
 with `--wait` or `--request-reply`. Mektup never silently queues or retries an
 outcome whose effect is unknown. Search is discovery, not delivery evidence.
 
+Targets may be a unique live Herdr agent name, an explicit Herdr URI, or a
+direct Codex thread URI. A bare UUID is not a messaging target. To preflight a
+named live agent without returning receipt history, use:
+
+```text
+mektup inspect <agent-name> --receipts 0
+```
+
+To address a known local thread UUID directly, use the complete form:
+
+```text
+codex://local/thread/<thread-uuid>
+```
+
+Zero or multiple live Herdr-name matches fail closed. Resolution success proves
+the target identity was found; it is not message delivery evidence.
+
 Reply custody claim results are an authority union: `claimed` includes the
 current fencing token and lease for the one caller allowed to submit the body;
 `existing` is tokenless and may include status or winner metadata only. An

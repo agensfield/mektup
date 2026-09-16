@@ -135,6 +135,21 @@ func TestInspectFiltersBeforeLimit(t *testing.T) {
 	}
 }
 
+func TestInspectZeroReceiptLimitIsIdentityOnly(t *testing.T) {
+	store, _ := openStore(t)
+	receipt := testReceipt(t, mektup.StateAccepted)
+	if err := store.Save(context.Background(), receipt); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Inspect(context.Background(), "target", reviewInspector{identity: TargetIdentity{EndpointID: receipt.Target.EndpointID, ThreadID: receipt.Target.ThreadID}}, InspectOptions{ReceiptLimit: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Receipts) != 0 || got.Target.EndpointID != receipt.Target.EndpointID {
+		t.Fatalf("identity-only inspect = %+v", got)
+	}
+}
+
 func TestReceiptRetentionPreservesUnansweredFamily(t *testing.T) {
 	store, j := openStore(t)
 	receipt := testReceipt(t, mektup.StateAccepted)

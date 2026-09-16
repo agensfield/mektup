@@ -476,10 +476,6 @@ func TestLifecycleWarningsRemainAtEnvelopeLevel(t *testing.T) {
 	if _, nested := data["warnings"]; nested {
 		t.Fatalf("warning was nested under data: %#v", data)
 	}
-	result, err := e.Execute(context.Background(), cli.Invocation{Command: "search", Position: []string{"needle"}, Options: map[string][]string{}, Resolved: cli.ResolvedGlobals{Endpoint: "local"}})
-	if err != nil || len(result.Events) != 1 || !strings.Contains(result.Events[0].Human, "warning: server_version_unknown") {
-		t.Fatalf("human warning missing: result=%+v err=%v", result, err)
-	}
 }
 
 func TestAppJSONLUsesLockedReadAndStorageFamilies(t *testing.T) {

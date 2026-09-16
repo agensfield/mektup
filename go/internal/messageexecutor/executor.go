@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"text/tabwriter"
 	"time"
 	"unicode/utf8"
 
 	mektup "github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/internal/cli"
+	"github.com/agensfield/mektup/go/internal/endpoint"
 	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/receipts"
 	"github.com/agensfield/mektup/go/internal/service"
@@ -471,7 +473,11 @@ func (e *Executor) inspect(ctx context.Context, inv cli.Invocation) (cli.Executi
 	if err != nil {
 		return cli.ExecutionResult{}, mapError(err)
 	}
-	result, err := e.ports.Receipts.Inspect(ctx, inv.Position[0], inspector, receipts.InspectOptions{ReceiptLimit: optionInt(inv, "receipts"), Blockers: has(inv, "blockers")})
+	receiptLimit := 10
+	if has(inv, "receipts") {
+		receiptLimit = optionInt(inv, "receipts")
+	}
+	result, err := e.ports.Receipts.Inspect(ctx, inv.Position[0], inspector, receipts.InspectOptions{ReceiptLimit: receiptLimit, Blockers: has(inv, "blockers")})
 	if err != nil {
 		return cli.ExecutionResult{}, mapError(err)
 	}
@@ -737,17 +743,56 @@ func humanReceipt(receipt mektup.Receipt) string {
 	return fmt.Sprintf("receipt %s state=%s operation=%s", receipt.ReceiptID, receipt.State, receipt.OperationID)
 }
 func humanReceiptList(items []mektup.Receipt) string {
-	lines := make([]string, 0, len(items))
+	rows := make([][]string, 0, len(items))
 	for _, item := range items {
-		lines = append(lines, humanReceipt(item))
+		rows = append(rows, []string{item.ReceiptID, item.Operation, string(item.State), item.Message.MessageID, firstNonempty(item.Target.Alias, item.Target.EndpointID), item.UpdatedAt})
 	}
-	if len(lines) == 0 {
+	if len(rows) == 0 {
 		return "no receipts"
 	}
-	return strings.Join(lines, "\n")
+	return humanTable([]string{"RECEIPT", "OPERATION", "STATE", "MESSAGE", "TARGET", "UPDATED"}, rows)
 }
 func humanInspect(result receipts.InspectResult) string {
-	return fmt.Sprintf("target %s thread=%s endpoint=%s receipts=%d blockers=%d", result.Target.Requested, result.Target.ThreadID, result.Target.EndpointID, len(result.Receipts), len(result.Blockers))
+	lines := []string{"target " + firstNonempty(result.Target.Requested, result.Target.Resolved)}
+	lines = append(lines, "  thread: "+result.Target.ThreadID)
+	endpointText := firstNonempty(result.Target.EndpointAlias, result.Target.EndpointID)
+	if result.Target.EndpointAlias != "" && result.Target.EndpointID != "" {
+		endpointText += " (" + result.Target.EndpointID + ")"
+	}
+	if result.Target.Transport != "" {
+		endpointText += " via " + result.Target.Transport
+	}
+	lines = append(lines, "  endpoint: "+endpointText)
+	if result.Target.ServerVersion != "" || result.Target.Compatibility != "" {
+		lines = append(lines, fmt.Sprintf("  server: %s compatibility=%s", firstNonempty(result.Target.ServerVersion, "unknown"), firstNonempty(result.Target.Compatibility, "unknown")))
+	}
+	lines = append(lines, fmt.Sprintf("  runtime: loaded=%t status=%s", result.Target.Loaded, firstNonempty(result.Target.Status, "unknown")))
+	if result.Target.ActiveTurnID != "" {
+		lines[len(lines)-1] += " active-turn=" + result.Target.ActiveTurnID
+	}
+	if result.Target.Resolved != "" {
+		lines = append(lines, "  resolved: "+result.Target.Resolved)
+	}
+	if len(result.Target.HerdrEvidence) != 0 {
+		lines = append(lines, fmt.Sprintf("  herdr: name=%v pane=%v status=%v", result.Target.HerdrEvidence["name"], result.Target.HerdrEvidence["paneId"], result.Target.HerdrEvidence["status"]))
+	}
+	lines = append(lines, fmt.Sprintf("receipts: %d", len(result.Receipts)))
+	if len(result.Receipts) != 0 {
+		lines = append(lines, humanReceiptList(result.Receipts))
+	}
+	lines = append(lines, fmt.Sprintf("blockers: %d", len(result.Blockers)))
+	if len(result.Blockers) != 0 {
+		rows := make([][]string, 0, len(result.Blockers))
+		for _, blocker := range result.Blockers {
+			state := "pending"
+			if blocker.ResolvedAt != nil {
+				state = "resolved"
+			}
+			rows = append(rows, []string{state, blocker.Method, blocker.CorrelationID, blocker.TurnID, blocker.LastSeen.UTC().Format(time.RFC3339)})
+		}
+		lines = append(lines, humanTable([]string{"STATE", "METHOD", "CORRELATION", "TURN", "LAST SEEN"}, rows))
+	}
+	return strings.Join(lines, "\n")
 }
 func humanContent(content receipts.ContentResult) string {
 	if content.Spill != nil {
@@ -757,6 +802,26 @@ func humanContent(content receipts.ContentResult) string {
 		return fmt.Sprintf("content bytes=%d digest=%s", content.Bytes, content.Digest)
 	}
 	return string(content.Body)
+}
+
+func humanTable(headers []string, rows [][]string) string {
+	var output strings.Builder
+	writer := tabwriter.NewWriter(&output, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(writer, strings.Join(headers, "\t"))
+	for _, row := range rows {
+		_, _ = fmt.Fprintln(writer, strings.Join(row, "\t"))
+	}
+	_ = writer.Flush()
+	return strings.TrimRight(output.String(), "\n")
+}
+
+func firstNonempty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 func waitExit(wait *service.WaitResult, err error) cli.ExitCode {
 	if wait.State == mektup.StateReplyOutcomeUnknown {
@@ -815,6 +880,24 @@ func mapError(err error) error {
 	}
 	if errors.Is(err, receipts.ErrNotFound) || errors.Is(err, journal.ErrNotFound) {
 		return cliErr("message_not_found", "receipt was not found", "rejected", cli.ExitRejected)
+	}
+	if errors.Is(err, endpoint.ErrInvalidTarget) {
+		return cliErr("invalid_target", err.Error()+"; use codex://<endpoint>/thread/<uuid> for a direct thread", "not_sent", cli.ExitUsage)
+	}
+	if errors.Is(err, endpoint.ErrResolverNotFound) {
+		return cliErr("endpoint_unavailable", err.Error()+"; bare targets are live Herdr names, use codex://<endpoint>/thread/<uuid> for a direct thread", "not_sent", cli.ExitRejected)
+	}
+	if errors.Is(err, endpoint.ErrEndpointRequired) || errors.Is(err, endpoint.ErrEndpointNotFound) || errors.Is(err, endpoint.ErrEndpointMismatch) {
+		return cliErr("endpoint_unavailable", err.Error(), "not_sent", cli.ExitRejected)
+	}
+	if errors.Is(err, endpoint.ErrResolverUnavailable) {
+		return cliErr("resolver_unavailable", err.Error(), "not_sent", cli.ExitRejected)
+	}
+	if errors.Is(err, endpoint.ErrResolverAmbiguous) {
+		return cliErr("target_ambiguous", err.Error(), "not_sent", cli.ExitRejected)
+	}
+	if errors.Is(err, endpoint.ErrResolverStale) {
+		return cliErr("route_unavailable", err.Error(), "not_sent", cli.ExitRejected)
 	}
 	if errors.Is(err, receipts.ErrAmbiguous) || errors.Is(err, journal.ErrReceiptConflict) {
 		return cliErr("target_ambiguous", "receipt reference is ambiguous", "rejected", cli.ExitRejected)

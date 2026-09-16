@@ -237,6 +237,7 @@ type ResolvedGlobals struct {
 	CurrentThreadID string
 	AgentMode       bool
 	Color           bool
+	ErrorColor      bool
 }
 
 // PathSource records which input won path precedence. It is intentionally
@@ -296,7 +297,7 @@ func resolvePresentation(explicitJSON, explicitHuman bool, env map[string]string
 	return DetectPresentation(false, false, env)
 }
 
-func resolveGlobals(inv Invocation, env map[string]string, terminal bool) (Invocation, *Error) {
+func resolveGlobals(inv Invocation, env map[string]string, outputTerminal, errorTerminal bool) (Invocation, *Error) {
 	config, state := defaultStatePaths(env)
 	configSource, stateSource := PathDefault, PathDefault
 	endpoint := "local"
@@ -326,11 +327,15 @@ func resolveGlobals(inv Invocation, env map[string]string, terminal bool) (Invoc
 	if err != nil {
 		return inv, normalizeError(err)
 	}
-	color, colorErr := resolveColor(inv.Global.Color, env, output, terminal)
+	color, colorErr := resolveColor(inv.Global.Color, env, output, outputTerminal)
 	if colorErr != nil {
 		return inv, colorErr
 	}
-	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, EndpointSource: endpointSource, Config: config, StateDir: state, ConfigSource: configSource, StateSource: stateSource, CodexHome: strings.TrimSpace(env["CODEX_HOME"]), CurrentThreadID: strings.TrimSpace(env["CODEX_THREAD_ID"]), AgentMode: env["MEKTUP_AGENT"] == "1", Color: color}
+	errorColor, colorErr := resolveColor(inv.Global.Color, env, output, errorTerminal)
+	if colorErr != nil {
+		return inv, colorErr
+	}
+	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, EndpointSource: endpointSource, Config: config, StateDir: state, ConfigSource: configSource, StateSource: stateSource, CodexHome: strings.TrimSpace(env["CODEX_HOME"]), CurrentThreadID: strings.TrimSpace(env["CODEX_THREAD_ID"]), AgentMode: env["MEKTUP_AGENT"] == "1", Color: color, ErrorColor: errorColor}
 	return inv, nil
 }
 
@@ -449,7 +454,7 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 			return a.finish(presentation, parsed, presentationErr)
 		}
 	}
-	resolved, resolveErr := resolveGlobals(parsed, env, writerIsTerminal(a.Out))
+	resolved, resolveErr := resolveGlobals(parsed, env, writerIsTerminal(a.Out), writerIsTerminal(a.Err))
 	if resolveErr != nil {
 		return a.finish(presentation, parsed, resolveErr)
 	}
@@ -459,7 +464,7 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 		if parsed.Command != "--skill" || len(parsed.Position) != 0 || !onlyOptions(parsed, "skill", "json", "human", "color") {
 			return a.finish(presentation, parsed, usageError("use mektup --skill without operational arguments"))
 		}
-		return a.writeGuide()
+		return a.writeGuide(parsed.Resolved.Color)
 	}
 	if parsed.Global.Help || parsed.Command == "" || parsed.Command == "help" {
 		if parsed.Command == "help" && len(parsed.Position) > 1 {
@@ -534,7 +539,7 @@ func (a *App) help(p Presentation, position []string, color bool) int {
 		if detail, ok := helpTopics[position[0]]; ok {
 			text = detail
 		} else {
-			return a.finish(p, Invocation{Command: "help", Resolved: ResolvedGlobals{Color: color}}, usageError("unknown help topic: "+position[0]))
+			return a.finish(p, Invocation{Command: "help", Resolved: ResolvedGlobals{Color: color, ErrorColor: color}}, usageError("unknown help topic: "+position[0]))
 		}
 	}
 	if p == PresentationJSON {
@@ -573,40 +578,34 @@ func (a *App) docs(p Presentation, inv Invocation) int {
 	}
 	switch inv.Position[0] {
 	case "agents":
-		return a.writeGuide()
+		return a.writeGuide(inv.Resolved.Color)
 	case "commands":
-		var data []byte
-		var err error
 		if inv.Global.JSON {
-			data, err = json.Marshal(commandContract())
-		} else {
-			data, err = json.MarshalIndent(commandContract(), "", "  ")
-		}
-		if err != nil {
-			return a.finish(p, inv, &Error{Code: "internal_error", Message: err.Error(), Exit: ExitInternal})
-		}
-		if inv.Global.JSON {
+			data, err := json.Marshal(commandContract())
+			if err != nil {
+				return a.finish(p, inv, &Error{Code: "internal_error", Message: err.Error(), Exit: ExitInternal})
+			}
 			_, _ = a.Out.Write(append(data, '\n'))
 			return int(ExitSuccess)
 		}
-		_, _ = a.Out.Write(append(data, '\n'))
+		_, _ = io.WriteString(a.Out, ensureFinalNewline(StyleHuman(commandContractHuman(commandContract()), inv.Resolved.Color)))
 		return int(ExitSuccess)
 	case "envelopes":
-		return a.writeAsset(envelopeDocs)
+		return a.writeAsset(envelopeDocs, inv.Resolved.Color)
 	case "receipts":
-		return a.writeAsset(receiptDocs)
+		return a.writeAsset(receiptDocs, inv.Resolved.Color)
 	default:
 		return a.finish(p, inv, usageError("unknown docs topic: "+inv.Position[0]))
 	}
 }
 
-func (a *App) writeGuide() int {
-	_, _ = io.WriteString(a.Out, ensureFinalNewline(agentGuide))
+func (a *App) writeGuide(color bool) int {
+	_, _ = io.WriteString(a.Out, ensureFinalNewline(StyleHuman(agentGuide, color)))
 	return int(ExitSuccess)
 }
 
-func (a *App) writeAsset(asset string) int {
-	_, _ = io.WriteString(a.Out, ensureFinalNewline(asset))
+func (a *App) writeAsset(asset string, color bool) int {
+	_, _ = io.WriteString(a.Out, ensureFinalNewline(StyleHuman(asset, color)))
 	return int(ExitSuccess)
 }
 
@@ -619,7 +618,7 @@ func (a *App) finish(p Presentation, inv Invocation, err error) int {
 		return a.writeEvent(inv, e)
 	}
 	if e.Message != "" {
-		_, _ = fmt.Fprintln(a.Err, StyleHuman("mektup: "+e.Message, inv.Resolved.Color))
+		_, _ = fmt.Fprintln(a.Err, StyleHuman("mektup: "+e.Message, inv.Resolved.ErrorColor))
 	}
 	return int(e.Exit)
 }
@@ -668,6 +667,12 @@ func (a *App) writeExecutionResultState(p Presentation, inv Invocation, result E
 			if _, err := io.WriteString(a.Out, ensureFinalNewline(StyleHuman(event.Human, inv.Resolved.Color))); err != nil {
 				return int(ExitInternal)
 			}
+		}
+	}
+	for _, warning := range humanWarnings(result) {
+		hasOutput = true
+		if _, err := io.WriteString(a.Out, ensureFinalNewline(StyleHuman("warning: "+warning, inv.Resolved.Color))); err != nil {
+			return int(ExitInternal)
 		}
 	}
 	if result.Receipt != nil {
@@ -846,7 +851,7 @@ func (a *App) writeStreamingFailure(p Presentation, inv Invocation, state *strea
 	if p != PresentationJSON {
 		e := normalizeError(err)
 		if e.Message != "" {
-			_, _ = fmt.Fprintln(a.Err, StyleHuman("mektup: "+e.Message, inv.Resolved.Color))
+			_, _ = fmt.Fprintln(a.Err, StyleHuman("mektup: "+e.Message, inv.Resolved.ErrorColor))
 		}
 		return int(e.Exit)
 	}
@@ -921,9 +926,6 @@ func receiptHuman(receipt any) string {
 	}
 	if id, ok := object["receiptId"].(string); ok && id != "" {
 		parts = append(parts, "receipt="+id)
-	}
-	if warnings, ok := object["warnings"].([]any); ok && len(warnings) != 0 {
-		parts = append(parts, fmt.Sprintf("warnings=%d", len(warnings)))
 	}
 	return strings.Join(parts, " ")
 }

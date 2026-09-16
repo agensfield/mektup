@@ -22,6 +22,21 @@ func TestStyleHumanIsOptInAndReadable(t *testing.T) {
 	}
 }
 
+func TestStyleHumanEscapesUntrustedTerminalControlsBeforeDecoration(t *testing.T) {
+	input := "safe\x1b]52;c;c2VjcmV0\x07\x1b[2J\u202eevil"
+	for _, enabled := range []bool{false, true} {
+		got := StyleHuman(input, enabled)
+		if strings.Contains(got, "\x1b]") || strings.Contains(got, "\x1b[2J") || strings.ContainsRune(got, '\x07') || strings.ContainsRune(got, '\u202e') {
+			t.Fatalf("enabled=%t emitted terminal control: %q", enabled, got)
+		}
+		for _, visible := range []string{`\x1b`, `\x07`, `\u202e`} {
+			if !strings.Contains(got, visible) {
+				t.Fatalf("enabled=%t missing visible escape %q: %q", enabled, visible, got)
+			}
+		}
+	}
+}
+
 func TestColorResolutionHonorsPresentationTTYAndOverrides(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -48,6 +63,22 @@ func TestColorResolutionHonorsPresentationTTYAndOverrides(t *testing.T) {
 				t.Fatalf("got=%t err=%v want=%t wantErr=%t", got, err, test.want, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestResolvedColorTracksStdoutAndStderrSeparately(t *testing.T) {
+	inv := Invocation{Global: Globals{Human: true}, Options: map[string][]string{"human": {"true"}}}
+	resolved, err := resolveGlobals(inv, map[string]string{}, true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resolved.Resolved.Color || resolved.Resolved.ErrorColor {
+		t.Fatalf("auto colors = stdout:%t stderr:%t", resolved.Resolved.Color, resolved.Resolved.ErrorColor)
+	}
+	inv.Global.Color = "always"
+	resolved, err = resolveGlobals(inv, map[string]string{}, false, false)
+	if err != nil || !resolved.Resolved.Color || !resolved.Resolved.ErrorColor {
+		t.Fatalf("forced colors = stdout:%t stderr:%t err=%v", resolved.Resolved.Color, resolved.Resolved.ErrorColor, err)
 	}
 }
 
@@ -107,6 +138,22 @@ func TestReceiptHumanCarriesOutcomeAndRoutingIdentity(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("receipt output missing %q: %q", want, got)
 		}
+	}
+}
+
+func TestHumanWarningsIncludeLateLifecycleAndReceiptEvidenceOnce(t *testing.T) {
+	result := ExecutionResult{
+		Events: []OutputEvent{{Human: "no threads", Machine: map[string]any{"warnings": []any{
+			map[string]any{"code": "cleanup_incomplete", "message": "connection cleanup failed"},
+		}}}},
+		Receipt: map[string]any{"warnings": []any{
+			map[string]any{"code": "cleanup_incomplete", "message": "connection cleanup failed"},
+			map[string]any{"code": "untested_server_version", "message": "server 9 is untested"},
+		}},
+	}
+	warnings := humanWarnings(result)
+	if len(warnings) != 2 || !strings.Contains(strings.Join(warnings, "\n"), "cleanup") || !strings.Contains(strings.Join(warnings, "\n"), "untested") {
+		t.Fatalf("warnings=%q", warnings)
 	}
 }
 

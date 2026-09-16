@@ -33,6 +33,12 @@ Messaging:
   wait <receipt-or-message-id> [--timeout <duration>]
   inspect <target> [--receipts <limit>] [--blockers]
 
+Targets:
+  <unique-live-herdr-name>
+  codex://<endpoint-alias-or-id>/thread/<thread-uuid>
+  herdr://<endpoint-alias-or-id>/agent/<percent-encoded-name>
+  herdr://<endpoint-alias-or-id>/pane/<workspace:pane>
+
 Thread/read:
   thread list|read|turns|items|start|resume|fork
   search <query> [--thread <target>]
@@ -69,12 +75,26 @@ error; --error-code requires --status error.
 
 Wait never sends or edits a message. Plain/raw sends fail reply_not_requested.
 `,
+	"inspect": `Usage: mektup inspect <target> [--receipts <limit>] [--blockers]
+
+Inspect resolves a target without sending a message. A bare target is a unique
+live Herdr agent name. Address a known Codex thread directly as:
+
+  codex://local/thread/<thread-uuid>
+
+The default includes up to 10 related receipts. Use --receipts 0 for an
+identity-only existence check, or --blockers to include callback blockers.
+`,
 	"docs": `Usage: mektup docs agents|commands [--json]|envelopes|receipts
 
 Documentation is embedded and works without endpoint or journal state.
 `,
-	"search":     "Usage: mektup search <query> [--thread <target>] [--archived] [--source <kind>]...\n",
-	"thread":     "Usage: mektup thread list|read|turns|items|start|resume|fork [options]\n",
+	"search": "Usage: mektup search <query> [--thread <target>] [--archived] [--source <kind>]...\n",
+	"thread": `Usage: mektup thread list|read|turns|items|start|resume|fork [options]
+
+Read and lifecycle commands accept a configured target URI. A known local
+thread UUID can be addressed as codex://local/thread/<thread-uuid>.
+`,
 	"receipt":    "Usage: mektup receipt list|show|reconcile|resolve [options]\n",
 	"endpoint":   "Usage: mektup endpoint list|show|add|remove|check [options]\n",
 	"storage":    "Usage: mektup storage status|check|maintain|vacuum [options]\n",
