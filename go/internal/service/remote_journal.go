@@ -463,17 +463,33 @@ func (r *RemoteJournal) PersistOriginalStatus(ctx context.Context, op Operation,
 	if r == nil || r.Local == nil || r.Local.Inner == nil {
 		return ErrRemoteCustodyUnavailable
 	}
-	if result.Selection == "pending" {
-		return nil
-	}
-	in := journal.ClaimInput{ReplyID: result.ReplyID, OriginalID: op.MessageID, Digest: result.Digest, BodySize: result.BodySize, Status: result.Status, ErrorCode: result.ErrorCode, ReplyRoute: op.ReplyRoute, CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID}
-	if result.Selection == "winner" {
-		return r.Local.Inner.RecordObservedWinner(ctx, op.MessageID, result.ReplyID, result.Digest, result.Status, result.ErrorCode, op.ReplyRoute, op.CustodyRoute, op.CustodyStoreID, result.NativeItemID, op.ReplyEndpointID, op.CustodyRoute, result.CommitSeq, result.BodySize)
-	}
-	if result.Selection == "terminal_unknown" {
-		return r.Local.Inner.ImportTerminalUnknown(ctx, in)
-	}
-	return sshproxy.ErrControlValidation
+	return r.Local.Inner.ImportOriginalStatus(ctx, journal.OriginalStatusImport{
+		Operation: journal.Operation{
+			OperationID:      op.OperationID,
+			MessageID:        op.MessageID,
+			SourceRoute:      op.SourceRoute,
+			TargetRoute:      op.TargetRoute,
+			Semantics:        op.Semantics,
+			SourceEndpointID: op.SourceEndpointID,
+			TargetEndpointID: op.TargetEndpointID,
+			ReplyRoute:       op.ReplyRoute,
+			ReplyEndpointID:  op.ReplyEndpointID,
+			ReplyThreadID:    threadID(op.ReplyRoute),
+			CustodyRoute:     op.CustodyRoute,
+			CustodyStoreID:   op.CustodyStoreID,
+			Digest:           op.Digest,
+			BodySize:         op.BodySize,
+		},
+		Selection:    result.Selection,
+		ReplyID:      result.ReplyID,
+		Digest:       result.Digest,
+		BodySize:     result.BodySize,
+		Status:       result.Status,
+		ErrorCode:    result.ErrorCode,
+		CommitSeq:    result.CommitSeq,
+		EventSeq:     result.EventSeq,
+		NativeItemID: result.NativeItemID,
+	})
 }
 
 func (r *RemoteJournal) persistRemoteStatus(ctx context.Context, op Operation, status OperationStatus) error {

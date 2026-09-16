@@ -41,6 +41,97 @@ type OriginalStatusResult struct {
 	TerminalEventSeq int64
 }
 
+// OriginalStatusImport is the metadata-only, tokenless projection of a
+// remote originalStatus response. Operation is persisted before the selected
+// reply evidence in the same SQLite transaction. Bodies are intentionally not
+// represented here.
+type OriginalStatusImport struct {
+	Operation    Operation
+	Selection    string
+	ReplyID      string
+	Digest       string
+	BodySize     int64
+	Status       string
+	ErrorCode    string
+	CommitSeq    int64
+	EventSeq     int64
+	NativeItemID string
+}
+
+const (
+	OriginalStatusPending         = "pending"
+	OriginalStatusWinner          = "winner"
+	OriginalStatusTerminalUnknown = "terminal_unknown"
+)
+
+// ImportOriginalStatus atomically imports a portable originalStatus result.
+// It never creates an attempts row and therefore cannot grant local dispatch
+// authority. The transaction is also the identity fence: any conflict in the
+// operation, selected reply, winner, native evidence, or remote ordering
+// rolls back the operation and every projection made by this call.
+func (j *Journal) ImportOriginalStatus(ctx context.Context, in OriginalStatusImport) error {
+	if err := validateOriginalStatusImport(in); err != nil {
+		return err
+	}
+	return j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
+		if err := importOperationTxAt(tx, in.Operation, StatePrepared, "portable_import", now, false); err != nil {
+			return err
+		}
+		switch in.Selection {
+		case OriginalStatusPending:
+			return nil
+		case OriginalStatusWinner:
+			return importObservedWinnerTx(tx, in, now)
+		case OriginalStatusTerminalUnknown:
+			return importTerminalUnknownTx(tx, in, now)
+		default:
+			return fmt.Errorf("journal: invalid original status selection")
+		}
+	})
+}
+
+// ImportPortableOriginalStatus is an explicit alias for callers describing
+// the source as a portable receipt rather than an originalStatus response.
+func (j *Journal) ImportPortableOriginalStatus(ctx context.Context, in OriginalStatusImport) error {
+	return j.ImportOriginalStatus(ctx, in)
+}
+
+func validateOriginalStatusImport(in OriginalStatusImport) error {
+	if in.Selection != OriginalStatusPending && in.Selection != OriginalStatusWinner && in.Selection != OriginalStatusTerminalUnknown {
+		return fmt.Errorf("journal: invalid original status selection")
+	}
+	if in.Operation.OperationID == "" || in.Operation.MessageID == "" || in.Operation.SourceRoute == "" || in.Operation.TargetRoute == "" || in.Operation.Digest == "" || in.Operation.BodySize < 0 {
+		return fmt.Errorf("journal: invalid imported operation metadata")
+	}
+	if (in.Operation.ReplyRoute == "") != (in.Operation.CustodyRoute == "") || (in.Operation.ReplyRoute != "" && in.Operation.CustodyStoreID == "") {
+		return fmt.Errorf("journal: incomplete imported reply custody relationship")
+	}
+	if in.Selection == OriginalStatusPending {
+		if in.ReplyID != "" || in.Digest != "" || in.BodySize != 0 || in.Status != "" || in.ErrorCode != "" || in.CommitSeq != 0 || in.EventSeq != 0 || in.NativeItemID != "" {
+			return fmt.Errorf("journal: pending original status contains reply evidence")
+		}
+		return nil
+	}
+	if in.ReplyID == "" || mektup.ValidateID(in.ReplyID, mektup.MessageIDPrefix) != nil || in.Digest == "" || in.BodySize < 0 || (in.Status != "success" && in.Status != "error") || (in.Status == "success" && in.ErrorCode != "") {
+		return fmt.Errorf("journal: invalid imported reply metadata")
+	}
+	if !validDigest(in.Digest) {
+		return fmt.Errorf("journal: invalid imported reply digest")
+	}
+	if (in.Selection == OriginalStatusWinner && in.CommitSeq < 1) || (in.Selection == OriginalStatusTerminalUnknown && in.EventSeq < 1) {
+		return fmt.Errorf("journal: invalid imported reply ordering")
+	}
+	if in.Selection == OriginalStatusWinner {
+		if in.EventSeq != 0 {
+			return fmt.Errorf("journal: winner contains terminal event ordering")
+		}
+	} else if in.NativeItemID != "" || in.CommitSeq != 0 {
+		return fmt.Errorf("journal: terminal unknown contains positive evidence")
+	}
+	return nil
+}
+
 // OriginalStatus expires every due claim for one original and selects the
 // authoritative winner, earliest terminal unknown, or pending from one
 // linearized custody transaction. It never creates or renews authority.
@@ -149,34 +240,37 @@ func (j *Journal) ImportTerminalUnknown(ctx context.Context, in ClaimInput) erro
 	if in.ReplyID == "" || in.OriginalID == "" || in.Digest == "" || in.BodySize < 0 || (in.Status != "success" && in.Status != "error") || in.ReplyRoute == "" || in.CustodyRoute == "" || in.CustodyStoreID == "" {
 		return fmt.Errorf("journal: invalid imported terminal unknown")
 	}
-	now := j.nowUnix()
 	return j.withTx(ctx, func(tx *sql.Tx) error {
-		var route, custody, storeID string
-		if err := tx.QueryRow("SELECT reply_route,custody_route,custody_store_id FROM operations WHERE message_id=?", in.OriginalID).Scan(&route, &custody, &storeID); err != nil {
-			if err == sql.ErrNoRows {
-				return ErrNotFound
-			}
-			return err
+		return importTerminalUnknownTx(tx, OriginalStatusImport{Operation: Operation{MessageID: in.OriginalID, ReplyRoute: in.ReplyRoute, CustodyRoute: in.CustodyRoute, CustodyStoreID: in.CustodyStoreID}, ReplyID: in.ReplyID, Digest: in.Digest, BodySize: in.BodySize, Status: in.Status, ErrorCode: in.ErrorCode, EventSeq: 0}, j.nowUnix())
+	})
+}
+
+func importTerminalUnknownTx(tx *sql.Tx, in OriginalStatusImport, now int64) error {
+	var route, custody, storeID string
+	if err := tx.QueryRow("SELECT reply_route,custody_route,custody_store_id FROM operations WHERE message_id=?", in.Operation.MessageID).Scan(&route, &custody, &storeID); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
 		}
-		if route != in.ReplyRoute || custody != in.CustodyRoute || storeID != in.CustodyStoreID {
+		return err
+	}
+	if route != in.Operation.ReplyRoute || custody != in.Operation.CustodyRoute || storeID != in.Operation.CustodyStoreID {
+		return ErrIdentityConflict
+	}
+	var existing ReplyClaim
+	err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_error_code,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", in.ReplyID), &existing)
+	if err == nil {
+		if existing.OriginalID != in.Operation.MessageID || existing.Digest != in.Digest || existing.BodySize != in.BodySize || existing.Status != in.Status || existing.ReplyErrorCode != in.ErrorCode || existing.ReplyRoute != in.Operation.ReplyRoute || existing.CustodyRoute != in.Operation.CustodyRoute || existing.CustodyStoreID != in.Operation.CustodyStoreID || existing.State != StateReplyOutcomeUnknown {
 			return ErrIdentityConflict
 		}
-		var existing ReplyClaim
-		err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_error_code,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", in.ReplyID), &existing)
-		if err == nil {
-			if existing.OriginalID != in.OriginalID || existing.Digest != in.Digest || existing.BodySize != in.BodySize || existing.Status != in.Status || existing.ReplyErrorCode != in.ErrorCode || existing.ReplyRoute != in.ReplyRoute || existing.CustodyRoute != in.CustodyRoute || existing.CustodyStoreID != in.CustodyStoreID || existing.State != StateReplyOutcomeUnknown {
-				return ErrIdentityConflict
-			}
-			return nil
-		}
-		if err != sql.ErrNoRows {
-			return err
-		}
-		if _, err := tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", in.ReplyID, in.OriginalID, in.Digest, in.BodySize, in.Status, in.ReplyRoute, in.CustodyRoute, in.CustodyStoreID, "", "", int64(0), string(StateReplyOutcomeUnknown), now, now, in.ErrorCode); err != nil {
-			return err
-		}
-		return emit(tx, "reply.abandoned", "", in.ReplyID, StateReplyOutcomeUnknown, now)
-	})
+		return ensureImportedEventTx(tx, existing.ReplyID, StateReplyOutcomeUnknown, in.EventSeq, now)
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	if _, err := tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", in.ReplyID, in.Operation.MessageID, in.Digest, in.BodySize, in.Status, in.Operation.ReplyRoute, in.Operation.CustodyRoute, in.Operation.CustodyStoreID, "", "", int64(0), string(StateReplyOutcomeUnknown), now, now, in.ErrorCode); err != nil {
+		return err
+	}
+	return ensureImportedEventTx(tx, in.ReplyID, StateReplyOutcomeUnknown, in.EventSeq, now)
 }
 
 func validateOriginalSelectedClaim(claim ReplyClaim, seq int64, native string, winner bool) error {
@@ -646,86 +740,122 @@ func (j *Journal) RecordObservedWinner(ctx context.Context, originalID, replyID,
 	if originalID == "" || replyID == "" || digest == "" || bodySize < 0 || (status != "success" && status != "error") || replyRoute == "" || custodyRoute == "" || storeID == "" || commitSeq < 1 {
 		return fmt.Errorf("journal: invalid observed winner projection")
 	}
-	now := j.nowUnix()
+	return j.withTx(ctx, func(tx *sql.Tx) error {
+		now := j.nowUnix()
+		return importObservedWinnerTx(tx, OriginalStatusImport{Operation: Operation{MessageID: originalID, ReplyRoute: replyRoute, CustodyRoute: custodyRoute, CustodyStoreID: storeID}, ReplyID: replyID, Digest: digest, BodySize: bodySize, Status: status, ErrorCode: errorCode, CommitSeq: commitSeq, NativeItemID: nativeID}, now)
+	})
+}
+
+func importObservedWinnerTx(tx *sql.Tx, in OriginalStatusImport, now int64) error {
+	var route, custody, storeID string
+	if err := tx.QueryRow("SELECT reply_route,custody_route,custody_store_id FROM operations WHERE message_id=?", in.Operation.MessageID).Scan(&route, &custody, &storeID); err != nil {
+		if err == sql.ErrNoRows {
+			return ErrNotFound
+		}
+		return err
+	}
+	if route != in.Operation.ReplyRoute || custody != in.Operation.CustodyRoute || storeID != in.Operation.CustodyStoreID {
+		return ErrIdentityConflict
+	}
+	var currentWinner string
+	errWinner := tx.QueryRow("SELECT reply_id FROM reply_winners WHERE original_id=?", in.Operation.MessageID).Scan(&currentWinner)
+	if errWinner != nil && errWinner != sql.ErrNoRows {
+		return errWinner
+	}
+	if errWinner == nil && currentWinner != in.ReplyID {
+		return ErrIdentityConflict
+	}
 	winnerState := StateReplyAccepted
-	if nativeID != "" {
+	if in.NativeItemID != "" {
 		winnerState = StateReplyObserved
 	}
-	return j.withTx(ctx, func(tx *sql.Tx) error {
-		var route, custody, existingStore string
-		if err := tx.QueryRow("SELECT reply_route,custody_route,custody_store_id FROM operations WHERE message_id=?", originalID).Scan(&route, &custody, &existingStore); err != nil {
-			if err == sql.ErrNoRows {
-				return ErrNotFound
-			}
+	var existing ReplyClaim
+	err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_error_code,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", in.ReplyID), &existing)
+	if err == sql.ErrNoRows {
+		if _, err := tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,accepted_at,commit_seq,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", in.ReplyID, in.Operation.MessageID, in.Digest, in.BodySize, in.Status, in.Operation.ReplyRoute, in.Operation.CustodyRoute, in.Operation.CustodyStoreID, "", "", int64(0), string(winnerState), now, now, now, in.CommitSeq, in.ErrorCode); err != nil {
 			return err
 		}
-		if route != replyRoute || custody != custodyRoute || existingStore != storeID {
-			return ErrIdentityConflict
+		eventKind := "reply.accepted"
+		if winnerState == StateReplyObserved {
+			eventKind = "reply.observed"
 		}
-		var existing ReplyClaim
-		err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_error_code,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", replyID), &existing)
-		var currentWinner string
-		errWinner := tx.QueryRow("SELECT reply_id FROM reply_winners WHERE original_id=?", originalID).Scan(&currentWinner)
-		if errWinner != nil && errWinner != sql.ErrNoRows {
-			return errWinner
-		}
-		if errWinner == nil && currentWinner != replyID {
-			return ErrIdentityConflict
-		}
-		if err == sql.ErrNoRows {
-			if _, err := tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,accepted_at,commit_seq,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", replyID, originalID, digest, bodySize, status, replyRoute, custodyRoute, storeID, "", "", int64(0), string(winnerState), now, now, now, commitSeq, errorCode); err != nil {
-				return err
-			}
-			eventKind := "reply.accepted"
-			if winnerState == StateReplyObserved {
-				eventKind = "reply.observed"
-			}
-			if err := emit(tx, eventKind, "", replyID, winnerState, now); err != nil {
-				return err
-			}
-		} else if err != nil {
-			return err
-		} else if existing.OriginalID != originalID || existing.Digest != digest || existing.BodySize != bodySize || existing.Status != status || existing.ReplyErrorCode != errorCode || existing.ReplyRoute != replyRoute || existing.CustodyRoute != custodyRoute || existing.CustodyStoreID != storeID {
-			return ErrIdentityConflict
-		} else {
-			priorState := existing.State
-			state := existing.State
-			if nativeID != "" {
-				state = StateReplyObserved
-			} else if state != StateReplyObserved {
-				state = StateReplyAccepted
-			}
-			if _, err := tx.Exec("UPDATE reply_claims SET state=?,token='',lease_until=0,accepted_at=?,commit_seq=?,updated_at=? WHERE reply_id=?", string(state), now, commitSeq, now, replyID); err != nil {
-				return err
-			}
-			if state != priorState {
-				eventKind := "reply.accepted"
-				if state == StateReplyObserved {
-					eventKind = "reply.observed"
-				}
-				if err := emit(tx, eventKind, "", replyID, state, now); err != nil {
-					return err
-				}
-			}
-		}
-		if errWinner == sql.ErrNoRows {
-			if _, err := tx.Exec("INSERT INTO reply_winners(original_id,reply_id,committed_at,commit_seq) VALUES(?,?,?,?)", originalID, replyID, now, commitSeq); err != nil {
-				return err
-			}
-		} else {
-			if _, err := tx.Exec("UPDATE reply_winners SET committed_at=?,commit_seq=? WHERE original_id=? AND reply_id=?", now, commitSeq, originalID, replyID); err != nil {
-				return err
-			}
-		}
-		if nativeID != "" {
-			if err := validateObservationIdentityTx(tx, replyID, nativeID, digest, endpointID, controlRoute); err != nil {
-				return err
-			}
-			_, err = tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest,endpoint_id,control_route) VALUES(?,?,?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET observed_at=excluded.observed_at", replyID, nativeID, now, digest, endpointID, controlRoute)
+		if err := emit(tx, eventKind, "", in.ReplyID, winnerState, now); err != nil {
 			return err
 		}
+	} else if err != nil {
+		return err
+	} else {
+		if existing.OriginalID != in.Operation.MessageID || existing.Digest != in.Digest || existing.BodySize != in.BodySize || existing.Status != in.Status || existing.ReplyErrorCode != in.ErrorCode || existing.ReplyRoute != in.Operation.ReplyRoute || existing.CustodyRoute != in.Operation.CustodyRoute || existing.CustodyStoreID != in.Operation.CustodyStoreID || (existing.CommitSeq != 0 && existing.CommitSeq != in.CommitSeq) {
+			return ErrIdentityConflict
+		}
+		if existing.State != StateReplyOutcomeUnknown && existing.State != StateReplyAccepted && existing.State != StateReplyObserved {
+			return ErrIdentityConflict
+		}
+		state := existing.State
+		if winnerState == StateReplyObserved || state == StateReplyOutcomeUnknown {
+			state = winnerState
+		}
+		if _, err := tx.Exec("UPDATE reply_claims SET state=?,token='',lease_until=0,accepted_at=COALESCE(accepted_at,?),commit_seq=?,updated_at=? WHERE reply_id=?", string(state), now, in.CommitSeq, now, in.ReplyID); err != nil {
+			return err
+		}
+	}
+	if errWinner == sql.ErrNoRows {
+		if _, err := tx.Exec("INSERT INTO reply_winners(original_id,reply_id,committed_at,commit_seq) VALUES(?,?,?,?)", in.Operation.MessageID, in.ReplyID, now, in.CommitSeq); err != nil {
+			return err
+		}
+	} else {
+		var seq int64
+		if err := tx.QueryRow("SELECT commit_seq FROM reply_winners WHERE original_id=? AND reply_id=?", in.Operation.MessageID, in.ReplyID).Scan(&seq); err != nil {
+			return err
+		}
+		if seq != in.CommitSeq {
+			return ErrIdentityConflict
+		}
+	}
+	if in.NativeItemID != "" {
+		if err := validateObservationIdentityTx(tx, in.ReplyID, in.NativeItemID, in.Digest, "", ""); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("INSERT INTO observations(reply_id,native_item_id,observed_at,digest) VALUES(?,?,?,?) ON CONFLICT(reply_id) DO UPDATE SET observed_at=excluded.observed_at", in.ReplyID, in.NativeItemID, now, in.Digest); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureImportedEventTx(tx *sql.Tx, replyID string, state EvidenceState, remoteSeq int64, now int64) error {
+	if remoteSeq > 0 {
+		var replySeq int64
+		err := tx.QueryRow("SELECT seq FROM events WHERE reply_id=? AND kind='reply.abandoned' AND state=? ORDER BY seq LIMIT 1", replyID, string(state)).Scan(&replySeq)
+		if err == nil && replySeq != remoteSeq {
+			return ErrIdentityConflict
+		}
+		if err != nil && err != sql.ErrNoRows {
+			return err
+		}
+		var kind, existingReply string
+		var existingState EvidenceState
+		err = tx.QueryRow("SELECT kind,COALESCE(reply_id,''),state FROM events WHERE seq=?", remoteSeq).Scan(&kind, &existingReply, &existingState)
+		if err == nil {
+			if existingReply != replyID || kind != "reply.abandoned" || existingState != state {
+				return ErrIdentityConflict
+			}
+			return nil
+		}
+		if err != sql.ErrNoRows {
+			return err
+		}
+		_, err = tx.Exec("INSERT INTO events(seq,kind,operation_id,reply_id,state,at) VALUES(?,?,?,?,?,?)", remoteSeq, "reply.abandoned", "", replyID, string(state), now)
+		return err
+	}
+	var count int
+	if err := tx.QueryRow("SELECT COUNT(1) FROM events WHERE reply_id=? AND kind='reply.abandoned' AND state=?", replyID, string(state)).Scan(&count); err != nil {
+		return err
+	}
+	if count != 0 {
 		return nil
-	})
+	}
+	return emit(tx, "reply.abandoned", "", replyID, state, now)
 }
 
 // RecordObservedReplyAndWinner applies an authoritative winner projection and

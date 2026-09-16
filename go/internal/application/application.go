@@ -755,13 +755,6 @@ func (r applicationImportResolver) ResolveWaitReference(ctx context.Context, _ c
 	if hasClaim && !portableClaimMatchesStatus(claim, status) && status.Selection != "pending" {
 		return "", &cli.Error{Code: "message_identity_conflict", Message: "portable reply evidence conflicts with authoritative original status", Effect: "rejected", Exit: cli.ExitRejected}
 	}
-	projectionState := mektup.StateAccepted
-	if status.Selection == "pending" {
-		projectionState = mektup.StatePrepared
-	}
-	if err := r.ensurePortableOperation(ctx, op, projectionState); err != nil {
-		return "", err
-	}
 	if err := r.remote.PersistOriginalStatus(ctx, op, status); err != nil {
 		return "", portableControlError(err)
 	}
@@ -829,40 +822,6 @@ func (r applicationImportResolver) verifyIdentityRoute(identity mektup.ReceiptId
 
 func portableOperation(receipt mektup.Receipt, routes portableRoutes) service.Operation {
 	return service.Operation{OperationID: receipt.OperationID, MessageID: receipt.Message.MessageID, SourceRoute: receipt.Source.Resolved, TargetRoute: receipt.Target.Resolved, Semantics: receipt.Operation, ReplyRoute: receipt.Source.Resolved, ReplyEndpointID: receipt.Source.EndpointID, CustodyRoute: routes.custody.ID, CustodyStoreID: routes.custodyStore, Digest: receipt.Message.PayloadSHA256, BodySize: int64(receipt.Message.PayloadBytes), ReplyRequested: receipt.Message.ReplyRequested, SourceEndpointID: receipt.Source.EndpointID, TargetEndpointID: receipt.Target.EndpointID}
-}
-
-func (r applicationImportResolver) ensurePortableOperation(ctx context.Context, op service.Operation, state mektup.EvidenceState) error {
-	if existing, err := r.journal.Operation(ctx, op.OperationID); err == nil {
-		if !samePortableOperation(existing, op) {
-			return &cli.Error{Code: "message_identity_conflict", Message: "portable operation conflicts with local authority", Effect: "rejected", Exit: cli.ExitRejected}
-		}
-		return nil
-	} else if !errors.Is(err, journal.ErrNotFound) {
-		return portableRouteError(err)
-	}
-	if existing, err := r.journal.OperationByMessage(ctx, op.MessageID); err == nil {
-		if !samePortableOperation(existing, op) {
-			return &cli.Error{Code: "message_identity_conflict", Message: "portable message conflicts with local authority", Effect: "rejected", Exit: cli.ExitRejected}
-		}
-		return nil
-	} else if !errors.Is(err, journal.ErrNotFound) {
-		return portableRouteError(err)
-	}
-	if state == mektup.StateReplyAccepted || state == mektup.StateReplyObserved || state == mektup.StateReplyOutcomeUnknown {
-		state = mektup.StateAccepted
-	}
-	err := r.journal.ImportOperation(ctx, journal.Operation{OperationID: op.OperationID, MessageID: op.MessageID, SourceRoute: op.SourceRoute, TargetRoute: op.TargetRoute, Semantics: op.Semantics, SourceEndpointID: op.SourceEndpointID, TargetEndpointID: op.TargetEndpointID, ReplyRoute: op.ReplyRoute, ReplyEndpointID: op.ReplyEndpointID, ReplyThreadID: threadIDFromURI(op.ReplyRoute), CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID, Digest: op.Digest, BodySize: op.BodySize}, journal.EvidenceState(state), "portable_import")
-	if errors.Is(err, journal.ErrIdentityConflict) {
-		return &cli.Error{Code: "message_identity_conflict", Message: "portable operation conflicts with local authority", Effect: "rejected", Exit: cli.ExitRejected}
-	}
-	if err != nil {
-		return portableRouteError(err)
-	}
-	return nil
-}
-
-func samePortableOperation(existing journal.OperationRecord, op service.Operation) bool {
-	return existing.OperationID == op.OperationID && existing.MessageID == op.MessageID && existing.SourceRoute == op.SourceRoute && existing.TargetRoute == op.TargetRoute && existing.Semantics == op.Semantics && existing.SourceEndpointID == op.SourceEndpointID && existing.TargetEndpointID == op.TargetEndpointID && existing.ReplyRoute == op.ReplyRoute && existing.ReplyEndpointID == op.ReplyEndpointID && existing.ReplyThreadID == threadIDFromURI(op.ReplyRoute) && existing.CustodyRoute == op.CustodyRoute && existing.CustodyStoreID == op.CustodyStoreID && existing.Digest == op.Digest && existing.BodySize == op.BodySize
 }
 
 func portableReplyClaim(receipt mektup.Receipt, op service.Operation) (service.ReplyClaimInput, bool, error) {

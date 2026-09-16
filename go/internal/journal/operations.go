@@ -76,31 +76,48 @@ func (j *Journal) ImportOperation(ctx context.Context, op Operation, state Evide
 	if (op.ReplyRoute == "") != (op.CustodyRoute == "") || (op.ReplyRoute != "" && op.CustodyStoreID == "") {
 		return fmt.Errorf("journal: incomplete imported reply custody relationship")
 	}
-	now := j.nowUnix()
 	return j.withTx(ctx, func(tx *sql.Tx) error {
-		var existing OperationRecord
-		err := scanOperation(tx.QueryRow(operationSelect+"o.operation_id=?", op.OperationID), &existing)
-		if err == nil {
-			if existing.OperationID != op.OperationID || existing.MessageID != op.MessageID || existing.SourceRoute != op.SourceRoute || existing.TargetRoute != op.TargetRoute || existing.Semantics != op.Semantics || existing.SourceEndpointID != op.SourceEndpointID || existing.TargetEndpointID != op.TargetEndpointID || existing.ReplyRoute != op.ReplyRoute || existing.ReplyEndpointID != op.ReplyEndpointID || existing.ReplyThreadID != op.ReplyThreadID || existing.CustodyRoute != op.CustodyRoute || existing.CustodyStoreID != op.CustodyStoreID || existing.Digest != op.Digest || existing.BodySize != op.BodySize {
-				return ErrIdentityConflict
-			}
-			return nil
-		}
-		if err != sql.ErrNoRows {
-			return err
-		}
-		var byMessage OperationRecord
-		if err := scanOperation(tx.QueryRow(operationSelect+"o.message_id=?", op.MessageID), &byMessage); err == nil {
-			return ErrIdentityConflict
-		} else if err != sql.ErrNoRows {
-			return err
-		}
-		_, err = tx.Exec("INSERT INTO operations(operation_id,message_id,source_route,target_route,semantics,source_endpoint_id,target_endpoint_id,reply_route,reply_endpoint_id,reply_thread_id,custody_route,custody_store_id,digest,body_size,state,created_at,updated_at,terminal_at,error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", op.OperationID, op.MessageID, op.SourceRoute, op.TargetRoute, op.Semantics, op.SourceEndpointID, op.TargetEndpointID, op.ReplyRoute, op.ReplyEndpointID, op.ReplyThreadID, op.CustodyRoute, op.CustodyStoreID, op.Digest, op.BodySize, string(state), now, now, now, errorCode)
-		if err != nil {
-			return err
-		}
-		return emit(tx, "operation.imported", op.OperationID, "", state, now)
+		return importOperationTx(tx, op, state, errorCode, j.nowUnix())
 	})
+}
+
+func importOperationTx(tx *sql.Tx, op Operation, state EvidenceState, errorCode string, now int64) error {
+	return importOperationTxAt(tx, op, state, errorCode, now, true)
+}
+
+func importOperationTxAt(tx *sql.Tx, op Operation, state EvidenceState, errorCode string, now int64, emitEvent bool) error {
+	var existing OperationRecord
+	err := scanOperation(tx.QueryRow(operationSelect+"o.operation_id=?", op.OperationID), &existing)
+	if err == nil {
+		if existing.OperationID != op.OperationID || existing.MessageID != op.MessageID || existing.SourceRoute != op.SourceRoute || existing.TargetRoute != op.TargetRoute || existing.Semantics != op.Semantics || existing.SourceEndpointID != op.SourceEndpointID || existing.TargetEndpointID != op.TargetEndpointID || existing.ReplyRoute != op.ReplyRoute || existing.ReplyEndpointID != op.ReplyEndpointID || existing.ReplyThreadID != op.ReplyThreadID || existing.CustodyRoute != op.CustodyRoute || existing.CustodyStoreID != op.CustodyStoreID || existing.Digest != op.Digest || existing.BodySize != op.BodySize {
+			return ErrIdentityConflict
+		}
+		var attempts int
+		if err := tx.QueryRow("SELECT COUNT(1) FROM attempts WHERE operation_id=?", op.OperationID).Scan(&attempts); err != nil {
+			return err
+		}
+		if attempts != 0 {
+			return ErrIdentityConflict
+		}
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+	var byMessage OperationRecord
+	if err := scanOperation(tx.QueryRow(operationSelect+"o.message_id=?", op.MessageID), &byMessage); err == nil {
+		return ErrIdentityConflict
+	} else if err != sql.ErrNoRows {
+		return err
+	}
+	_, err = tx.Exec("INSERT INTO operations(operation_id,message_id,source_route,target_route,semantics,source_endpoint_id,target_endpoint_id,reply_route,reply_endpoint_id,reply_thread_id,custody_route,custody_store_id,digest,body_size,state,created_at,updated_at,terminal_at,error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", op.OperationID, op.MessageID, op.SourceRoute, op.TargetRoute, op.Semantics, op.SourceEndpointID, op.TargetEndpointID, op.ReplyRoute, op.ReplyEndpointID, op.ReplyThreadID, op.CustodyRoute, op.CustodyStoreID, op.Digest, op.BodySize, string(state), now, now, now, errorCode)
+	if err != nil {
+		return err
+	}
+	if emitEvent {
+		return emit(tx, "operation.imported", op.OperationID, "", state, now)
+	}
+	return nil
 }
 
 const operationSelect = "SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.source_endpoint_id,o.target_endpoint_id,o.reply_route,o.reply_endpoint_id,o.reply_thread_id,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE "
