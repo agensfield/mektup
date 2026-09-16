@@ -83,7 +83,7 @@
     {
       "if": { "required": ["from-herdr-name"] },
       "then": {
-        "properties": { "from-herdr": { "type": "string" } }
+        "properties": { "from-herdr": { "type": "string", "minLength": 1 } }
       }
     },
     {

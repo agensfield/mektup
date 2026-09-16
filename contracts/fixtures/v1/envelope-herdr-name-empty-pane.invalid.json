@@ -1,0 +1,23 @@
+{
+  "schema": "Mektup/1",
+  "message-id": "msg_0198f0e0-0000-7000-8000-000000000003",
+  "kind": "message",
+  "from-endpoint-id": "ep_0198f0e0-0000-7000-8000-000000000001",
+  "from": "codex://local/thread/thread-local-001",
+  "from-kind": "agent",
+  "from-herdr": "",
+  "from-herdr-name": "mektup-lead",
+  "to-endpoint-id": "ep_0198f0e0-0000-7000-8000-000000000002",
+  "to": "codex://devbox/thread/thread-recipient-001",
+  "requested-target": "buildoor",
+  "in-reply-to": null,
+  "reply-requested": false,
+  "reply-endpoint-id": null,
+  "reply-to": null,
+  "reply-custody-endpoint-id": null,
+  "reply-custody-store-id": null,
+  "sent-at": "2026-09-15T03:00:00.000000Z",
+  "payload-bytes": 18,
+  "payload-sha256": "sha256:b165810e4e7bf583d7a6582c9f93a2964ab0bd1fd86690a2e013e8555d4faa28",
+  "provenance": "observed"
+}
