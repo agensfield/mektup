@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -149,108 +148,51 @@ func (r *RemoteJournal) Lookup(ctx context.Context, ref string) (OperationStatus
 	if err != nil {
 		return OperationStatus{}, err
 	}
-	if status.ReplyID != "" && status.ReplyCommitSeq > 0 && (status.State == mektup.StateReplyAccepted || status.State == mektup.StateReplyObserved) {
+	if status.Operation.ReplyRoute == "" || status.Operation.CustodyRoute == "" {
 		return status, nil
 	}
-	claims := r.claimsForOriginal(status.MessageID)
-	var terminal []OperationStatus
-	for _, claim := range claims {
-		_, remote, routeErr := r.route(claim.input.CustodyRoute)
-		if routeErr != nil {
-			return OperationStatus{}, routeErr
-		}
-		if !remote {
-			continue
-		}
-		remoteStatus, statusErr := r.status(ctx, claim, false)
-		if statusErr != nil {
-			return OperationStatus{}, statusErr
-		}
-		if remoteStatus.State == mektup.StateReplyAccepted || remoteStatus.State == mektup.StateReplyObserved || remoteStatus.State == mektup.StateReplyOutcomeUnknown {
-			terminal = append(terminal, remoteStatus)
-		}
+	_, remote, routeErr := r.route(status.Operation.CustodyRoute)
+	if routeErr != nil {
+		return OperationStatus{}, routeErr
 	}
-	// A cacheless/restarted portable wait has no in-memory claim to drive the
-	// ordinary status path.  The original-scoped control operation is the
-	// durable authority in that case.  It is metadata-only and can never create
-	// a dispatch attempt.
-	needsOriginalStatus := len(terminal) == 0
-	for _, candidate := range terminal {
-		if candidate.State == mektup.StateReplyOutcomeUnknown && candidate.ReplyCommitSeq == 0 {
-			needsOriginalStatus = true
-			break
-		}
+	if !remote {
+		return status, nil
 	}
-	if needsOriginalStatus && status.Operation.ReplyRoute != "" && status.Operation.CustodyRoute != "" {
-		_, remote, routeErr := r.route(status.Operation.CustodyRoute)
-		if routeErr != nil {
-			return OperationStatus{}, routeErr
-		}
-		if remote {
-			original, statusErr := r.OriginalStatus(ctx, status.Operation)
-			if statusErr != nil {
-				return OperationStatus{}, statusErr
-			}
-			if original.Selection != "pending" {
-				if statusErr := r.PersistOriginalStatus(ctx, status.Operation, original); statusErr != nil {
-					return OperationStatus{}, statusErr
-				}
-				status.State = original.State
-				status.ReplyID = original.ReplyID
-				status.ReplyStatus = original.Status
-				status.ReplyErrorCode = original.ErrorCode
-				status.ReplyDigest = original.Digest
-				status.ReplyBodySize = original.BodySize
-				status.ReplyCommitSeq = original.CommitSeq
-				status.ReplyNativeID = original.NativeItemID
-				terminal = nil
-			} else if len(terminal) > 0 {
-				return OperationStatus{}, journal.ErrIdentityConflict
-			}
-		}
+	// Remote per-reply status is useful for owner heartbeat and mutation
+	// bookkeeping, but it is never a winner selector. The custody owner
+	// resolves the original relationship atomically, including when this
+	// process has a cached claim for a later reply.
+	original, statusErr := r.OriginalStatus(ctx, status.Operation)
+	if statusErr != nil {
+		return OperationStatus{}, statusErr
 	}
-	if len(terminal) > 0 {
-		sort.SliceStable(terminal, func(i, j int) bool {
-			leftSeq, rightSeq := terminal[i].ReplyCommitSeq, terminal[j].ReplyCommitSeq
-			if leftSeq == 0 {
-				return false
-			}
-			if rightSeq == 0 {
-				return true
-			}
-			if leftSeq != rightSeq {
-				return leftSeq < rightSeq
-			}
-			return terminal[i].ReplyID < terminal[j].ReplyID
-		})
-		winner := terminal[0]
-		if winner.ReplyCommitSeq > 0 {
-			for _, candidate := range terminal[1:] {
-				if candidate.ReplyCommitSeq == winner.ReplyCommitSeq && candidate.ReplyID != winner.ReplyID {
-					return OperationStatus{}, journal.ErrIdentityConflict
-				}
-			}
+	if original.Selection == "pending" {
+		base, baseErr := r.Local.Inner.Operation(ctx, status.Operation.OperationID)
+		if baseErr != nil {
+			return OperationStatus{}, baseErr
 		}
-		status.State, status.ReplyID, status.ReplyStatus, status.ReplyErrorCode = winner.State, winner.ReplyID, winner.ReplyStatus, winner.ReplyErrorCode
-		status.ReplyDigest, status.ReplyBodySize, status.ReplyCommitSeq, status.ReplyNativeID = winner.ReplyDigest, winner.ReplyBodySize, winner.ReplyCommitSeq, winner.ReplyNativeID
-		if err := r.persistRemoteStatus(ctx, status.Operation, winner); err != nil {
-			return OperationStatus{}, err
-		}
+		status.State = mektup.EvidenceState(base.State)
+		status.ReplyID = ""
+		status.ReplyStatus = ""
+		status.ReplyErrorCode = ""
+		status.ReplyDigest = ""
+		status.ReplyBodySize = 0
+		status.ReplyCommitSeq = 0
+		status.ReplyNativeID = ""
+		return status, nil
 	}
+	if statusErr := r.PersistOriginalStatus(ctx, status.Operation, original); statusErr != nil {
+		return OperationStatus{}, statusErr
+	}
+	status.State = original.State
+	status.ReplyID = original.ReplyID
+	status.ReplyStatus = original.Status
+	status.ReplyErrorCode = original.ErrorCode
+	status.ReplyDigest = original.Digest
+	status.ReplyBodySize = original.BodySize
+	status.ReplyCommitSeq = original.CommitSeq
+	status.ReplyNativeID = original.NativeItemID
 	return status, nil
-}
-
-func (r *RemoteJournal) claimsForOriginal(originalID string) []remoteClaim {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	claims := make([]remoteClaim, 0)
-	for _, claim := range r.claims {
-		if claim.input.OriginalID == originalID {
-			claims = append(claims, claim)
-		}
-	}
-	sort.SliceStable(claims, func(i, j int) bool { return claims[i].input.ReplyID < claims[j].input.ReplyID })
-	return claims
 }
 
 func (r *RemoteJournal) ClaimReply(ctx context.Context, input ReplyClaimInput) (ReplyClaim, error) {
@@ -490,17 +432,6 @@ func (r *RemoteJournal) PersistOriginalStatus(ctx context.Context, op Operation,
 		EventSeq:     result.EventSeq,
 		NativeItemID: result.NativeItemID,
 	})
-}
-
-func (r *RemoteJournal) persistRemoteStatus(ctx context.Context, op Operation, status OperationStatus) error {
-	if status.State != mektup.StateReplyAccepted && status.State != mektup.StateReplyObserved && status.State != mektup.StateReplyOutcomeUnknown {
-		return nil
-	}
-	in := journal.ClaimInput{ReplyID: status.ReplyID, OriginalID: op.MessageID, Digest: status.ReplyDigest, BodySize: status.ReplyBodySize, Status: status.ReplyStatus, ErrorCode: status.ReplyErrorCode, ReplyRoute: op.ReplyRoute, CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID}
-	if status.State == mektup.StateReplyOutcomeUnknown {
-		return r.Local.Inner.ImportTerminalUnknown(ctx, in)
-	}
-	return r.Local.Inner.RecordObservedWinner(ctx, op.MessageID, status.ReplyID, status.ReplyDigest, status.ReplyStatus, status.ReplyErrorCode, op.ReplyRoute, op.CustodyRoute, op.CustodyStoreID, status.ReplyNativeID, op.ReplyEndpointID, op.CustodyRoute, status.ReplyCommitSeq, status.ReplyBodySize)
 }
 
 func (r *RemoteJournal) OriginalStatus(ctx context.Context, op Operation) (OriginalStatusResult, error) {

@@ -210,7 +210,9 @@ func TestRemoteJournalOriginalStatusUsesCanonicalReceiverSelections(t *testing.T
 			if err := json.Unmarshal(data, &document); err != nil {
 				return nil, err
 			}
-			delete(document, "replyMessageId")
+			if request.Operation == "originalStatus" {
+				delete(document, "replyMessageId")
+			}
 			data, err = json.Marshal(document)
 			if err != nil {
 				return nil, err
@@ -265,7 +267,9 @@ func TestRemoteJournalOriginalStatusUsesCanonicalReceiverSelections(t *testing.T
 		if err := json.Unmarshal(data, &document); err != nil {
 			return nil, err
 		}
-		delete(document, "replyMessageId")
+		if request.Operation == "originalStatus" {
+			delete(document, "replyMessageId")
+		}
 		data, err = json.Marshal(document)
 		if err != nil {
 			return nil, err
@@ -303,6 +307,35 @@ func TestRemoteJournalOriginalStatusUsesCanonicalReceiverSelections(t *testing.T
 	result, err = router.OriginalStatus(context.Background(), unknown)
 	if err != nil || result.Selection != "terminal_unknown" || result.ReplyID != unknownClaim.ReplyID || result.EventSeq < 1 || result.ErrorCode != "E_REMOTE" {
 		t.Fatalf("unknown result=%+v err=%v", result, err)
+	}
+	later := newOperation("op_0198f0e0-0000-7000-8000-000000000101", "msg_0198f0e0-0000-7000-8000-000000000102")
+	importOriginal(later)
+	if err := client.ImportOperation(context.Background(), journal.Operation{OperationID: later.OperationID, MessageID: later.MessageID, SourceRoute: later.SourceRoute, TargetRoute: later.TargetRoute, Semantics: later.Semantics, SourceEndpointID: later.SourceEndpointID, TargetEndpointID: later.TargetEndpointID, ReplyRoute: later.ReplyRoute, ReplyEndpointID: later.ReplyEndpointID, ReplyThreadID: "source", CustodyRoute: later.CustodyRoute, CustodyStoreID: later.CustodyStoreID, Digest: later.Digest, BodySize: later.BodySize}, journal.StatePrepared, "portable_import"); err != nil {
+		t.Fatal(err)
+	}
+	firstReply := "msg_0198f0e0-0000-7000-8000-000000000103"
+	firstClaim, err := server.ClaimReply(context.Background(), journal.ClaimInput{ReplyID: firstReply, OriginalID: later.MessageID, Digest: later.Digest, BodySize: later.BodySize, Status: "success", ReplyRoute: later.ReplyRoute, CustodyRoute: later.CustodyRoute, CustodyStoreID: later.CustodyStoreID, Owner: "owner-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.CommitReply(context.Background(), firstClaim.ReplyID, firstClaim.Owner, firstClaim.Token); err != nil {
+		t.Fatal(err)
+	}
+	secondReply := "msg_0198f0e0-0000-7000-8000-000000000104"
+	secondClaim, err := server.ClaimReply(context.Background(), journal.ClaimInput{ReplyID: secondReply, OriginalID: later.MessageID, Digest: later.Digest, BodySize: later.BodySize, Status: "success", ReplyRoute: later.ReplyRoute, CustodyRoute: later.CustodyRoute, CustodyStoreID: later.CustodyStoreID, Owner: "owner-b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.CommitReply(context.Background(), secondClaim.ReplyID, secondClaim.Owner, secondClaim.Token); err != nil {
+		t.Fatal(err)
+	}
+	joined, err := restarted.ClaimReply(context.Background(), ReplyClaimInput{ReplyID: secondReply, OriginalID: later.MessageID, Digest: later.Digest, BodySize: later.BodySize, Status: "success", ReplyRoute: later.ReplyRoute, CustodyRoute: later.CustodyRoute, CustodyStoreID: later.CustodyStoreID, Owner: "joiner"})
+	if err != nil || !joined.Joined {
+		t.Fatalf("ordinary later reply join failed: claim=%+v err=%v", joined, err)
+	}
+	status, err := restarted.Lookup(context.Background(), later.OperationID)
+	if err != nil || status.ReplyID != firstReply || status.ReplyCommitSeq <= 0 {
+		t.Fatalf("lookup selected cached later reply: status=%+v err=%v", status, err)
 	}
 }
 
