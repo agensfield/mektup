@@ -130,6 +130,25 @@ func TestAuditCaptureFinalizesExactFramedTrafficAndOverlimitIsAbsent(t *testing.
 	}
 }
 
+func TestMessagingAuditReceiptProgressionStrengthensAtTerminal(t *testing.T) {
+	logger, err := logging.New(logging.DefaultConfig(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &auditCapture{logger: logger, invocation: "audit-stream", max: logging.DefaultAuditMaxBytes}
+	_ = capture.Observe(appserver.FrameOutbound, appserver.Frame{Type: appserver.FrameText, Payload: []byte(`{"id":"accept"}`)})
+	accepted := enrichAuditReceipt(mektup.Receipt{State: mektup.StateAccepted}, capture, false)
+	if len(accepted.Evidence) != 1 || accepted.Evidence[0].Details["complete"] != false {
+		t.Fatalf("acceptance audit marker = %+v", accepted.Evidence)
+	}
+	_ = capture.Observe(appserver.FrameInbound, appserver.Frame{Type: appserver.FrameText, Payload: []byte(`{"id":"terminal"}`)})
+	terminal := enrichAuditReceipt(accepted, capture, true)
+	last := terminal.Evidence[len(terminal.Evidence)-1].Details
+	if last["complete"] != true || last["path"] == "" || last["sha256"] == "" {
+		t.Fatalf("terminal audit marker = %+v", last)
+	}
+}
+
 func (f *fakeTransport) Read(ctx context.Context) (appserver.Frame, error) {
 	select {
 	case frame := <-f.reads:

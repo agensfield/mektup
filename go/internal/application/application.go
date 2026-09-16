@@ -786,8 +786,14 @@ func enrichAuditReceipt(receipt mektup.Receipt, audit *auditCapture, finalize bo
 	if marker == nil {
 		return receipt
 	}
-	for _, warning := range receipt.Warnings {
-		if warning.Code == mektup.WarningAuditLoggingEnabled {
+	for i := range receipt.Warnings {
+		if receipt.Warnings[i].Code == mektup.WarningAuditLoggingEnabled {
+			receipt.Warnings[i].Details = map[string]any{"audit": marker}
+			for j := range receipt.Evidence {
+				if receipt.Evidence[j].Kind == "audit" {
+					receipt.Evidence[j].Details = marker
+				}
+			}
 			return receipt
 		}
 	}
