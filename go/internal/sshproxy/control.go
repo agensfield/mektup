@@ -23,7 +23,7 @@ type ControlRequest struct {
 	Operation         string          `json:"operation"`
 	OperationID       string          `json:"operationId"`
 	ReceiptID         string          `json:"receiptId,omitempty"`
-	ReplyMessageID    string          `json:"replyMessageId"`
+	ReplyMessageID    string          `json:"replyMessageId,omitempty"`
 	OriginalMessageID string          `json:"originalMessageId"`
 	Custody           CustodyRef      `json:"custody"`
 	ReplyDestination  DestinationRef  `json:"replyDestination"`

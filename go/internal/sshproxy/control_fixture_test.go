@@ -60,6 +60,25 @@ func TestControlV1Fixtures(t *testing.T) {
 }
 
 func TestOriginalStatusResultUnion(t *testing.T) {
+	typedRequest := validControlRequest()
+	typedRequest.Operation = "originalStatus"
+	typedRequest.ReplyMessageID = ""
+	typedRequest.BodyBytes = nil
+	typedRequest.BodySHA256 = ""
+	typedRequest.ReplyStatus = ""
+	typedRequest.AttemptOwner = ""
+	typedRequest.RequestedLease = nil
+	typedWire, err := json.Marshal(typedRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(typedWire, []byte(`"replyMessageId"`)) {
+		t.Fatalf("originalStatus typed request emitted forbidden replyMessageId: %s", typedWire)
+	}
+	if _, err := ValidateControlRequest(typedWire); err != nil {
+		t.Fatalf("typed originalStatus request rejected: %v", err)
+	}
+
 	base, err := json.Marshal(validControlRequest())
 	if err != nil {
 		t.Fatal(err)
