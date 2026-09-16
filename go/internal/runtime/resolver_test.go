@@ -54,19 +54,18 @@ func TestResolverPinnedUsesRuntimeStateProbe(t *testing.T) {
 	}
 }
 
-func TestResolverPinnedAcceptsForeignAliasAndCanonicalizesWireURI(t *testing.T) {
+func TestResolverPinnedRejectsUnmappedOrContradictorySelectors(t *testing.T) {
 	store := endpoint.NewStore(filepath.Join(t.TempDir(), "endpoints.json"), t.TempDir())
 	ep := endpoint.Endpoint{ID: testTargetEndpoint, Alias: "receiver-local", Route: endpoint.Route{Kind: endpoint.RouteUnix, UnixSocket: "/tmp/target.sock"}, Herdr: endpoint.HerdrDisabled}
 	if err := store.Add(ep); err != nil {
 		t.Fatal(err)
 	}
-	got, err := (ResolverAdapter{Store: store}).ResolvePinned(context.Background(), ep.ID, "codex://sender-local/thread/thread-1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := "codex://" + ep.ID + "/thread/thread-1"
-	if got.EndpointID != ep.ID || got.ThreadID != "thread-1" || got.URI != want {
-		t.Fatalf("pinned foreign alias = %#v, want canonical URI %q", got, want)
+	for _, host := range []string{"sender-local", "ep_0198f0e0-0000-7000-8000-000000000099"} {
+		calls := 0
+		resolver := ResolverAdapter{Store: store, StateProbe: func(context.Context, string, string) (bool, bool, error) { calls++; return true, true, nil }}
+		if _, err := resolver.ResolvePinned(context.Background(), ep.ID, "codex://"+host+"/thread/thread-1"); err == nil || calls != 0 {
+			t.Fatalf("selector %q accepted/reached probe: err=%v calls=%d", host, err, calls)
+		}
 	}
 }
 

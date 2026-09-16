@@ -159,7 +159,7 @@ func (s *Service) reply(ctx context.Context, resolver OriginalResolver, req Repl
 	} else if err := mektup.ValidateID(opID, mektup.OperationIDPrefix); err != nil {
 		return ReplyResult{}, semantic(mektup.ErrInvalidArguments, "reply operation identity is invalid", nil, err)
 	}
-	op := Operation{OperationID: opID, MessageID: replyID, InReplyTo: original.Envelope.MessageID, SourceRoute: wireSourceURI, TargetRoute: wireTargetURI, Semantics: "reply", AttemptOwner: "reply-" + replyID, ReplyRoute: e.ReplyTo, ReplyEndpointID: e.ReplyEndpointID, CustodyRoute: e.ReplyCustodyEndpointID, CustodyStoreID: e.ReplyCustodyStoreID,
+	op := Operation{OperationID: opID, MessageID: replyID, InReplyTo: original.Envelope.MessageID, SourceRoute: wireSourceURI, TargetRoute: target.URI, Semantics: "reply", AttemptOwner: "reply-" + replyID, ReplyRoute: e.ReplyTo, ReplyEndpointID: e.ReplyEndpointID, CustodyRoute: e.ReplyCustodyEndpointID, CustodyStoreID: e.ReplyCustodyStoreID,
 		Digest: digest(req.Body), BodySize: int64(len([]byte(req.Body))), ReplyRequested: req.Wait, SourceEndpointID: source.EndpointID, TargetEndpointID: target.EndpointID}
 	prepared, err := s.Journal.Prepare(ctx, op)
 	if err != nil {
@@ -169,7 +169,7 @@ func (s *Service) reply(ctx context.Context, resolver OriginalResolver, req Repl
 	if owner == "" {
 		owner = "reply-" + replyID
 	}
-	claim, err := s.Journal.ClaimReply(ctx, ReplyClaimInput{ReplyID: replyID, OriginalID: original.Envelope.MessageID, Digest: digest(req.Body), BodySize: int64(len([]byte(req.Body))), Status: string(req.Status), ErrorCode: req.ErrorCode, ReplyRoute: wireTargetURI, CustodyRoute: original.Envelope.ReplyCustodyEndpointID, CustodyStoreID: original.Envelope.ReplyCustodyStoreID, Owner: owner})
+	claim, err := s.Journal.ClaimReply(ctx, ReplyClaimInput{ReplyID: replyID, OriginalID: original.Envelope.MessageID, Digest: digest(req.Body), BodySize: int64(len([]byte(req.Body))), Status: string(req.Status), ErrorCode: req.ErrorCode, ReplyRoute: original.Envelope.ReplyTo, CustodyRoute: original.Envelope.ReplyCustodyEndpointID, CustodyStoreID: original.Envelope.ReplyCustodyStoreID, Owner: owner})
 	if err != nil {
 		if errors.Is(err, ErrClaimExpired) {
 			return ReplyResult{}, semantic(mektup.ErrReplyOutcomeUnknown, "reply claim expired and will not be replayed", nil, err)
