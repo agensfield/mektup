@@ -34,6 +34,10 @@
     "from": { "type": ["string", "null"] },
     "from-kind": { "enum": ["agent", "human"] },
     "from-herdr": { "type": ["string", "null"] },
+    "from-herdr-name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]{0,31}$"
+    },
     "to-endpoint-id": { "$ref": "common-v1.schema.json#/$defs/endpointId" },
     "to": { "$ref": "common-v1.schema.json#/$defs/uri" },
     "requested-target": { "type": "string", "minLength": 1 },
@@ -76,6 +80,12 @@
     "reply-error-code": { "type": "string", "minLength": 1 }
   },
   "allOf": [
+    {
+      "if": { "required": ["from-herdr-name"] },
+      "then": {
+        "properties": { "from-herdr": { "type": "string", "minLength": 1 } }
+      }
+    },
     {
       "if": {
         "required": ["reply-requested"],

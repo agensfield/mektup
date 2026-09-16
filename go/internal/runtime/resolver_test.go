@@ -120,7 +120,7 @@ func TestResolverSourceAddsVerifiedHerdrPaneProvenance(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := "herdr://" + local.ID + "/pane/w3:p29"
-	if got.EndpointID != local.ID || got.URI != "codex://"+local.ID+"/thread/thread-source" || got.Herdr != want {
+	if got.EndpointID != local.ID || got.URI != "codex://"+local.ID+"/thread/thread-source" || got.Herdr != want || got.HerdrName != "mektup-lead" {
 		t.Fatalf("source identity = %#v, want Herdr %q", got, want)
 	}
 
@@ -128,5 +128,30 @@ func TestResolverSourceAddsVerifiedHerdrPaneProvenance(t *testing.T) {
 	got, err = (ResolverAdapter{Store: store, CodexHome: home, CurrentThreadID: "thread-source", Herdr: empty}).ResolveSource(context.Background(), "")
 	if err != nil || got.Herdr != "" {
 		t.Fatalf("optional missing provenance = %#v, %v", got, err)
+	}
+}
+
+func TestResolverSourceOmitsUnsafeHerdrNameWithoutLosingPane(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "codex")
+	store := endpoint.NewStore(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"))
+	store.IdentityHome = filepath.Join(root, "identity")
+	local, err := store.EnsureBuiltinLocal(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	item := `{"agent":"codex","name":"Bad Name\\u001b]52;c;evil","pane_id":"w3:p29","workspace_id":"w3","tab_id":"w3:t17","agent_status":"working","agent_session":{"agent":"codex","kind":"id","source":"herdr:codex","value":"thread-source"}}`
+	responses := [][]byte{[]byte(`{"agents":[` + item + `]}`), []byte(`{"agent":` + item + `}`), []byte(`{"agents":[` + item + `]}`)}
+	herdr := endpoint.NewHerdrResolver(resolverRunner(func(context.Context, []string) ([]byte, error) {
+		out := responses[0]
+		responses = responses[1:]
+		return out, nil
+	}))
+	got, err := (ResolverAdapter{Store: store, CodexHome: home, CurrentThreadID: "thread-source", Herdr: herdr}).ResolveSource(context.Background(), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Herdr != "herdr://"+local.ID+"/pane/w3:p29" || got.HerdrName != "" {
+		t.Fatalf("unsafe optional name changed stable pane provenance: %#v", got)
 	}
 }

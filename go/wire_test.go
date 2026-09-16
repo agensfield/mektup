@@ -13,7 +13,7 @@ import (
 func fixtureEnvelope() Envelope {
 	return Envelope{
 		MessageID: NewMessageID(), Kind: KindMessage, FromEndpointID: NewEndpointID(),
-		From: "codex://local/thread/source", FromKind: "agent", FromHerdr: "herdr://local/agent/a",
+		From: "codex://local/thread/source", FromKind: "agent", FromHerdr: "herdr://local/agent/a", FromHerdrName: "mektup-lead",
 		ToEndpointID: NewEndpointID(), To: "codex://local/thread/destination", RequestedTarget: "agent\nforged: true",
 		ReplyRequested: true, ReplyEndpointID: NewEndpointID(), ReplyTo: "codex://local/thread/source",
 		ReplyCustodyEndpointID: NewEndpointID(), ReplyCustodyStoreID: NewStoreID(),
@@ -41,8 +41,66 @@ func TestEnvelopeRoundTripPreservesUTF8BytesAndDelimiter(t *testing.T) {
 	if got.RequestedTarget != e.RequestedTarget {
 		t.Fatalf("escaped header changed: %q", got.RequestedTarget)
 	}
+	if got.FromHerdrName != "mektup-lead" || !bytes.Contains(want, []byte("from-herdr-name: \"mektup-lead\"\n")) {
+		t.Fatalf("Herdr presentation name changed or missing: %#v", got)
+	}
 	if !bytes.HasSuffix(want, []byte(e.Body)) {
 		t.Fatal("render added bytes after body")
+	}
+}
+
+func TestEnvelopeHerdrNameIsStrictOnEmissionAndTolerantOnRead(t *testing.T) {
+	e := fixtureEnvelope()
+	valid, err := RenderEnvelope(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, raw := range map[string]string{
+		"null":    "null",
+		"number":  "42",
+		"object":  `{"forged":true}`,
+		"control": `"bad\\u001bname"`,
+		"bidi":    `"bad\\u202ename"`,
+		"grammar": `"Mektup Lead"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			mutated := bytes.Replace(valid, []byte(`"mektup-lead"`), []byte(raw), 1)
+			got, parseErr := ParseEnvelope(mutated)
+			if parseErr != nil {
+				t.Fatalf("optional malformed presentation metadata rejected message: %v", parseErr)
+			}
+			if got.FromHerdrName != "" {
+				t.Fatalf("unsafe presentation metadata retained: %q", got.FromHerdrName)
+			}
+		})
+	}
+
+	e.FromHerdrName = "Bad Name"
+	rendered, err := RenderEnvelope(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(rendered, []byte("from-herdr-name:")) {
+		t.Fatalf("invalid registered name emitted: %s", rendered)
+	}
+
+	e = fixtureEnvelope()
+	e.FromHerdr = ""
+	rendered, err = RenderEnvelope(e)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(rendered, []byte("from-herdr-name:")) {
+		t.Fatal("Herdr name emitted without stable Herdr pane URI")
+	}
+
+	duplicate := bytes.Replace(valid, []byte("from-herdr-name: \"mektup-lead\"\n"), []byte("from-herdr-name: null\nfrom-herdr-name: \"mektup-lead\"\n"), 1)
+	if _, err := ParseEnvelope(duplicate); err == nil {
+		t.Fatal("duplicate optional Herdr name accepted")
+	}
+	malformed := bytes.Replace(valid, []byte(`"mektup-lead"`), []byte(`{`), 1)
+	if _, err := ParseEnvelope(malformed); err == nil {
+		t.Fatal("physically malformed optional header accepted")
 	}
 }
 
