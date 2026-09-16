@@ -121,7 +121,18 @@ func (e *Environment) Execute(ctx context.Context, inv cli.Invocation) (result c
 		}
 	}()
 	if resources.messaging != nil {
-		return resources.messaging.Execute(ctx, inv)
+		result, execErr = resources.messaging.Execute(ctx, inv)
+		if resources.audit != nil && !hasOption(inv, "wait") {
+			var auditErr error
+			result, auditErr = resources.decorateAudit(ctx, result)
+			if execErr == nil && auditErr != nil {
+				return result, auditErr
+			}
+			if execErr != nil && auditErr != nil {
+				execErr = errors.Join(execErr, auditErr)
+			}
+		}
+		return result, execErr
 	}
 	result, execErr = executor.New(resources.Ports()).Execute(ctx, inv)
 	if resources.audit != nil {
@@ -384,6 +395,24 @@ func (a *auditCapture) Finalize(ctx context.Context) (logging.AuditReceipt, erro
 	return receipt, nil
 }
 
+func (a *auditCapture) Marker(ctx context.Context, finalize bool) map[string]any {
+	if a == nil {
+		return nil
+	}
+	if finalize {
+		if receipt, err := a.Finalize(ctx); err == nil {
+			return auditMarker(receipt)
+		}
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	marker := map[string]any{"path": "", "bytes": a.buf.Len(), "complete": false, "mode": "audit", "sensitive": true, "networkTelemetry": false}
+	if a.err != nil {
+		marker["error"] = a.err.Error()
+	}
+	return marker
+}
+
 func auditMarker(receipt logging.AuditReceipt) map[string]any {
 	return map[string]any{"path": receipt.Path, "bytes": receipt.Bytes, "sha256": receipt.SHA256, "complete": receipt.Complete, "mode": receipt.Mode.Mode, "sensitive": receipt.Mode.Sensitive, "networkTelemetry": receipt.Mode.NetworkTelemetry}
 }
@@ -419,6 +448,11 @@ func (r *resources) CloseWithResult(ctx context.Context, result cli.ExecutionRes
 		}
 	}
 	if r.journal != nil && result.Receipt != nil {
+		if r.audit != nil && r.messaging != nil {
+			if receipt, ok := result.Receipt.(mektup.Receipt); ok {
+				result.Receipt = enrichAuditReceipt(receipt, r.audit, true)
+			}
+		}
 		if persistErr := persistReceiptWarning(ctx, r.journal, result.Receipt); persistErr != nil {
 			joined = errors.Join(joined, persistErr)
 		}
@@ -558,7 +592,7 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 		if j == nil {
 			return nil, errors.New("messaging requires a writable local journal")
 		}
-		pool, messaging, err = e.composeMessaging(ctx, inv, j, store, artifacts, input, facts)
+		pool, messaging, err = e.composeMessaging(ctx, inv, j, store, artifacts, input, facts, audit)
 		if err != nil {
 			if artifacts != nil {
 				_ = artifacts.Close()
@@ -571,7 +605,7 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 }
 
 func needsLogging(inv cli.Invocation) bool {
-	if isMessaging(inv) || (inv.Command == "doctor" && !hasOption(inv, "fix")) || (inv.Command == "storage" && len(inv.Position) > 0 && inv.Position[0] == "check") {
+	if (inv.Command == "doctor" && !hasOption(inv, "fix")) || (inv.Command == "storage" && len(inv.Position) > 0 && inv.Position[0] == "check") {
 		return inv.Global.Audit
 	}
 	return true
@@ -592,13 +626,17 @@ func (e *Environment) debug(inv cli.Invocation, event string, fields map[string]
 	_, _ = fmt.Fprintln(e.options.DebugWriter, "mektup debug:", strings.Join(clean, " "))
 }
 
-func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, j *journal.Journal, store endpoint.EndpointStore, artifacts *artifact.Store, input executor.ReaderInput, facts *connectionFacts) (*runtime.ConnectionPool, *messageexecutor.Executor, error) {
+func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, j *journal.Journal, store endpoint.EndpointStore, artifacts *artifact.Store, input executor.ReaderInput, facts *connectionFacts, audit *auditCapture) (*runtime.ConnectionPool, *messageexecutor.Executor, error) {
 	codexHome := firstNonEmpty(inv.Resolved.CodexHome, e.options.CodexHome)
 	stateProbe := e.options.ThreadStateProbe
 	herdr := e.herdrResolver()
 	sessionFactory := e.options.SessionFactory
 	if sessionFactory == nil {
-		sessionFactory = applicationSessionFactory{options: e.options.Connection, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute, facts: facts}
+		connectionOptions := e.options.Connection
+		if audit != nil {
+			connectionOptions.FrameObserver = audit.Observe
+		}
+		sessionFactory = applicationSessionFactory{options: connectionOptions, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute, facts: facts}
 	}
 	pool := runtime.NewConnectionPool(sessionFactory, func(id string) (endpoint.Endpoint, error) { return store.ResolveEndpointID(id, codexHome) })
 	if stateProbe == nil {
@@ -695,7 +733,12 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 	}
 	importResolver := applicationImportResolver{observe: observe, store: store, codexHome: codexHome, resolverFor: resolverFor, journal: j, remote: remoteJournal}
 	return pool, messageexecutor.New(messageexecutor.Ports{Service: serviceFactory, Original: originalFactory, Receipts: &storeReceipts, Input: input, PersistReceipt: storeReceipts.Save, EnrichReceipt: func(receipt mektup.Receipt) mektup.Receipt {
-		return enrichMessagingReceipt(receipt, store, codexHome, facts)
+		receipt = enrichMessagingReceipt(receipt, store, codexHome, facts)
+		if audit != nil {
+			finalize := !hasOption(inv, "wait") || inv.Command == "wait" || inv.Command == "receipt"
+			receipt = enrichAuditReceipt(receipt, audit, finalize)
+		}
+		return receipt
 	}, Artifacts: func(context.Context, cli.Invocation) (receipts.SpillWriter, error) {
 		if artifacts == nil {
 			return nil, nil
@@ -735,6 +778,21 @@ func enrichMessagingReceipt(receipt mektup.Receipt, store endpoint.EndpointStore
 			}
 		}
 	}
+	return receipt
+}
+
+func enrichAuditReceipt(receipt mektup.Receipt, audit *auditCapture, finalize bool) mektup.Receipt {
+	marker := audit.Marker(context.Background(), finalize)
+	if marker == nil {
+		return receipt
+	}
+	for _, warning := range receipt.Warnings {
+		if warning.Code == mektup.WarningAuditLoggingEnabled {
+			return receipt
+		}
+	}
+	receipt.Warnings = append(receipt.Warnings, mektup.Warning{Code: mektup.WarningAuditLoggingEnabled, Message: "sensitive audit capture enabled", Details: map[string]any{"audit": marker}})
+	receipt.Evidence = append(receipt.Evidence, mektup.EvidenceRecord{State: receipt.State, At: time.Now().UTC().Format(time.RFC3339Nano), Kind: "audit", Details: marker})
 	return receipt
 }
 
