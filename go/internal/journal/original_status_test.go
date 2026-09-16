@@ -207,4 +207,10 @@ func TestOriginalStatusFailsClosedOnCorruptWinnerMetadata(t *testing.T) {
 	if _, err := j.OriginalStatus(context.Background(), "msg-1"); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("observed winner without native evidence accepted: %v", err)
 	}
+	if _, err := j.db.Exec("UPDATE reply_claims SET state=?,digest=? WHERE reply_id=?", string(StateReplyAccepted), "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", c.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.OriginalStatus(context.Background(), "msg-1"); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("uppercase winner digest accepted: %v", err)
+	}
 }

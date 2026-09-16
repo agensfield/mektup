@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -160,6 +161,9 @@ func validateOriginalSelectedClaim(claim ReplyClaim, seq int64, native string, w
 
 func validDigest(value string) bool {
 	if len(value) != len("sha256:")+64 || value[:len("sha256:")] != "sha256:" {
+		return false
+	}
+	if strings.ToLower(value) != value {
 		return false
 	}
 	_, err := hex.DecodeString(value[len("sha256:"):])

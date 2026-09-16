@@ -286,7 +286,7 @@ func TestOriginalStatusResultRejectsAuthorityAndBodyKeysIncludingNull(t *testing
 func TestReceiverOriginalStatusFailsBeforeEmittingCorruptWinner(t *testing.T) {
 	j, _ := openReceiverJournal(t, time.Minute)
 	prepareOriginal(t, j)
-	c, err := j.ClaimReply(context.Background(), journal.ClaimInput{ReplyID: replyID, OriginalID: originalID, Digest: "invalid", BodySize: 7, Status: "success", ReplyRoute: "codex://local/thread/source", CustodyRoute: receiverEndpoint, CustodyStoreID: j.StoreID(), Owner: "owner"})
+	c, err := j.ClaimReply(context.Background(), journal.ClaimInput{ReplyID: replyID, OriginalID: originalID, Digest: "sha256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", BodySize: 7, Status: "success", ReplyRoute: "codex://local/thread/source", CustodyRoute: receiverEndpoint, CustodyStoreID: j.StoreID(), Owner: "owner"})
 	if err != nil {
 		t.Fatal(err)
 	}
