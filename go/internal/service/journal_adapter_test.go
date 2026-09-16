@@ -62,22 +62,65 @@ func TestOperationByMessageRedactsAttemptToken(t *testing.T) {
 }
 
 func TestSQLiteJournalRestartLookupUsesDurableIdentityWithoutRegistry(t *testing.T) {
-	ctx := context.Background(); dir := t.TempDir(); inner, err := journal.Open(ctx, journal.Options{StateDir: dir}); if err != nil { t.Fatal(err) }
+	ctx := context.Background()
+	dir := t.TempDir()
+	inner, err := journal.Open(ctx, journal.Options{StateDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
 	a := SQLiteJournal{Inner: inner}
 	op := Operation{OperationID: "restart-op", MessageID: "restart-msg", SourceRoute: "src", TargetRoute: "dst", Semantics: "message", Digest: digest("restart"), BodySize: 7, SourceEndpointID: epSource, TargetEndpointID: epTarget}
-	if _, err := a.Prepare(ctx, op); err != nil { t.Fatal(err) }; if err := inner.Close(); err != nil { t.Fatal(err) }
-	reopened, err := journal.Open(ctx, journal.Options{StateDir: dir}); if err != nil { t.Fatal(err) }; defer reopened.Close(); status, err := (SQLiteJournal{Inner: reopened}).Lookup(ctx, op.MessageID); if err != nil { t.Fatal(err) }; if status.SourceEndpointID != epSource || status.TargetEndpointID != epTarget { t.Fatalf("restart identity: %+v", status) }
+	if _, err := a.Prepare(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	if err := inner.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := journal.Open(ctx, journal.Options{StateDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	status, err := (SQLiteJournal{Inner: reopened}).Lookup(ctx, op.MessageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.SourceEndpointID != epSource || status.TargetEndpointID != epTarget {
+		t.Fatalf("restart identity: %+v", status)
+	}
 }
 
 func TestSQLiteJournalConflictingOptionalRegistryFailsClosed(t *testing.T) {
-	ctx := context.Background(); inner, err := journal.Open(ctx, journal.Options{StateDir: t.TempDir()}); if err != nil { t.Fatal(err) }; defer inner.Close()
-	a := SQLiteJournal{Inner: inner}; op := Operation{OperationID: "conflict-op", MessageID: "conflict-msg", SourceRoute: "src", TargetRoute: "dst", Semantics: "message", Digest: digest("conflict"), BodySize: 8, SourceEndpointID: epSource, TargetEndpointID: epTarget}; if _, err := a.Prepare(ctx, op); err != nil { t.Fatal(err) }
-	registry := NewMemoryIdentityRegistry(); if err := registry.Bind(ctx, op.OperationID, op.MessageID, IdentityBinding{SourceEndpointID: epTarget, TargetEndpointID: epSource}); err != nil { t.Fatal(err) }; if _, err := (SQLiteJournal{Inner: inner, Registry: registry}).Lookup(ctx, op.MessageID); err == nil { t.Fatal("conflicting optional registry identity was accepted") }
+	ctx := context.Background()
+	inner, err := journal.Open(ctx, journal.Options{StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	a := SQLiteJournal{Inner: inner}
+	op := Operation{OperationID: "conflict-op", MessageID: "conflict-msg", SourceRoute: "src", TargetRoute: "dst", Semantics: "message", Digest: digest("conflict"), BodySize: 8, SourceEndpointID: epSource, TargetEndpointID: epTarget}
+	if _, err := a.Prepare(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewMemoryIdentityRegistry()
+	if err := registry.Bind(ctx, op.OperationID, op.MessageID, IdentityBinding{SourceEndpointID: epTarget, TargetEndpointID: epSource}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := (SQLiteJournal{Inner: inner, Registry: registry}).Lookup(ctx, op.MessageID); err == nil {
+		t.Fatal("conflicting optional registry identity was accepted")
+	}
 }
 
 func TestSQLiteJournalLegacyEmptyAuthorityFailsClosed(t *testing.T) {
-	ctx := context.Background(); inner, err := journal.Open(ctx, journal.Options{StateDir: t.TempDir()}); if err != nil { t.Fatal(err) }; defer inner.Close()
-	if _, err := (SQLiteJournal{Inner: inner}).Prepare(ctx, Operation{OperationID: "legacy-op", MessageID: "legacy-msg", SourceRoute: "src", TargetRoute: "dst", Semantics: "message", Digest: digest("legacy"), BodySize: 6}); err == nil { t.Fatal("empty endpoint authority was accepted") }
+	ctx := context.Background()
+	inner, err := journal.Open(ctx, journal.Options{StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	if _, err := (SQLiteJournal{Inner: inner}).Prepare(ctx, Operation{OperationID: "legacy-op", MessageID: "legacy-msg", SourceRoute: "src", TargetRoute: "dst", Semantics: "message", Digest: digest("legacy"), BodySize: 6}); err == nil {
+		t.Fatal("empty endpoint authority was accepted")
+	}
 }
 
 func TestSQLiteJournalAdapterReplyAcceptanceProjectsClaimMetadata(t *testing.T) {

@@ -41,6 +41,12 @@ func TestJournalAdapterUsesPerOperationIdentityRegistry(t *testing.T) {
 }
 
 func TestJournalAdapterDoesNotRequireMemoryRegistry(t *testing.T) {
-	inner, err := journal.Open(context.Background(), journal.Options{StateDir: t.TempDir()}); if err != nil { t.Fatal(err) }; defer inner.Close()
-	if _, err := NewJournalAdapter(inner, nil); err != nil { t.Fatal(err) }
+	inner, err := journal.Open(context.Background(), journal.Options{StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	if _, err := NewJournalAdapter(inner, nil); err != nil {
+		t.Fatal(err)
+	}
 }
