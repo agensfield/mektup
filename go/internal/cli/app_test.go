@@ -336,6 +336,31 @@ func TestHumanCommandDocsAndInspectHelpAreNavigable(t *testing.T) {
 	}
 }
 
+func TestImplicitAgentPresentationsKeepCommandDocsMachineJSON(t *testing.T) {
+	for _, environment := range [][]string{{"MEKTUP_AGENT=1"}, {"CODEX_THREAD_ID=thread-1"}, {"MEKTUP_OUTPUT=json"}} {
+		var out, errOut bytes.Buffer
+		app := &App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: environment}
+		if code := app.Run([]string{"docs", "commands"}); code != int(ExitSuccess) || errOut.Len() != 0 {
+			t.Fatalf("env=%v exit=%d stderr=%q", environment, code, errOut.String())
+		}
+		var document map[string]any
+		if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &document); err != nil || document["schema"] != CommandSchema {
+			t.Fatalf("env=%v output=%q err=%v", environment, out.String(), err)
+		}
+	}
+}
+
+func TestUnknownHelpUsesStderrColorDecision(t *testing.T) {
+	var out, errOut bytes.Buffer
+	app := &App{Out: &out, Err: &errOut}
+	if code := app.help(PresentationHuman, []string{"unknown"}, true, false); code != int(ExitUsage) {
+		t.Fatalf("exit=%d", code)
+	}
+	if strings.Contains(errOut.String(), "\x1b[") || !strings.Contains(errOut.String(), "unknown help topic") {
+		t.Fatalf("stderr=%q", errOut.String())
+	}
+}
+
 func TestExecutorResultStreamsProvidedOutputAndReceipt(t *testing.T) {
 	var out, errOut bytes.Buffer
 	var got Invocation

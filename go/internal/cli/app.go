@@ -474,7 +474,7 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 		if parsed.Global.Help && parsed.Command != "" && parsed.Command != "help" {
 			topic = []string{parsed.Command}
 		}
-		return a.help(presentation, topic, parsed.Resolved.Color)
+		return a.help(presentation, topic, parsed.Resolved.Color, parsed.Resolved.ErrorColor)
 	}
 	switch parsed.Command {
 	case "version":
@@ -533,13 +533,13 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 	return a.finish(presentation, parsed, normalizeError(err))
 }
 
-func (a *App) help(p Presentation, position []string, color bool) int {
+func (a *App) help(p Presentation, position []string, color, errorColor bool) int {
 	text := usageText
 	if len(position) == 1 {
 		if detail, ok := helpTopics[position[0]]; ok {
 			text = detail
 		} else {
-			return a.finish(p, Invocation{Command: "help", Resolved: ResolvedGlobals{Color: color, ErrorColor: color}}, usageError("unknown help topic: "+position[0]))
+			return a.finish(p, Invocation{Command: "help", Resolved: ResolvedGlobals{Color: color, ErrorColor: errorColor}}, usageError("unknown help topic: "+position[0]))
 		}
 	}
 	if p == PresentationJSON {
@@ -580,7 +580,7 @@ func (a *App) docs(p Presentation, inv Invocation) int {
 	case "agents":
 		return a.writeGuide(inv.Resolved.Color)
 	case "commands":
-		if inv.Global.JSON {
+		if p == PresentationJSON {
 			data, err := json.Marshal(commandContract())
 			if err != nil {
 				return a.finish(p, inv, &Error{Code: "internal_error", Message: err.Error(), Exit: ExitInternal})
