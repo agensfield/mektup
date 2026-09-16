@@ -216,7 +216,17 @@ func statePath(requested string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return requested, nil
+	// SQLite WAL coordination requires every process to name the database
+	// through the same canonical ancestor path. macOS exposes /tmp as a
+	// symlink to /private/tmp; opening one journal through both spellings can
+	// otherwise give long-lived connections stale writer state. Preserve the
+	// final component verbatim so acquireStateDirectory still rejects an
+	// explicitly supplied state-directory symlink.
+	parent, err := filepath.EvalSymlinks(filepath.Dir(requested))
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(parent, filepath.Base(requested)), nil
 }
 
 func (j *Journal) init(ctx context.Context) error {

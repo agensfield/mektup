@@ -31,6 +31,35 @@ func TestSafeOpenRejectsStateDirectorySymlink(t *testing.T) {
 	}
 }
 
+func TestStatePathCanonicalizesSymlinkedAncestor(t *testing.T) {
+	root := t.TempDir()
+	realParent := filepath.Join(root, "real")
+	if err := os.Mkdir(realParent, 0700); err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(root, "alias")
+	if err := os.Symlink(realParent, aliasParent); err != nil {
+		t.Fatal(err)
+	}
+	requested := filepath.Join(aliasParent, "state")
+	j, err := Open(context.Background(), Options{StateDir: requested})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	canonicalParent, err := filepath.EvalSymlinks(realParent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(canonicalParent, "state")
+	if j.StateDir() != want {
+		t.Fatalf("state dir = %q, want canonical ancestor %q", j.StateDir(), want)
+	}
+	if _, err := os.Stat(filepath.Join(want, "journal.sqlite3")); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSafeOpenRejectsDatabaseSymlink(t *testing.T) {
 	root := t.TempDir()
 	targetDir := filepath.Join(root, "target")
