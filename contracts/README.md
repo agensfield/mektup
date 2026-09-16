@@ -1,6 +1,6 @@
-# Mektup v1 language-neutral contracts (spec revision 1.0.5)
+# Mektup v1 language-neutral contracts (spec revision 1.0.6)
 
-The locked product specification revision is 1.0.5. The wire schema identifiers
+The locked product specification revision is 1.0.6. The wire schema identifiers
 remain versioned as `.../v1`; the revision is contract metadata, not a new wire
 schema family.
 

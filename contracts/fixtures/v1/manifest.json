@@ -1,6 +1,6 @@
 {
   "schema": "mektup/contracts/v1/manifest",
-  "contractVersion": "1.0.5",
+  "contractVersion": "1.0.6",
   "fixtures": [
     { "kind": "envelope-metadata", "schema": "Mektup/1", "path": "envelope-agent-request.json" },
     { "kind": "envelope-rendered", "schema": "Mektup/1", "path": "envelope-agent-request.txt" },

@@ -1,4 +1,4 @@
-# Mektup agent guide (contract 1.0.5)
+# Mektup agent guide (contract 1.0.6)
 
 Mektup delivers messages to Codex threads and preserves evidence. Use ordinary
 `mektup send <target> <message>` for one-way delivery. Use

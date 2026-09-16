@@ -1,7 +1,7 @@
 {
   "schema": "mektup/conformance/v1/scenarios",
   "version": "1.0.0",
-  "specVersion": "1.0.5",
+  "specVersion": "1.0.6",
   "source": "acceptance-v1.md",
   "profiles": {
     "plain_accept": {
