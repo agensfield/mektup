@@ -247,20 +247,40 @@ func (a SQLiteJournal) ObserveReply(ctx context.Context, id, native, digest stri
 	if err := a.valid(); err != nil {
 		return err
 	}
-	return a.Inner.ObserveReply(ctx, id, native, digest)
+	return a.observeTransition(ctx, id, func() error { return a.Inner.ObserveReply(ctx, id, native, digest) })
 }
 
 func (a SQLiteJournal) RecordObservedReply(ctx context.Context, in ReplyClaimInput, native, endpointID, controlRoute string) error {
 	if err := a.valid(); err != nil {
 		return err
 	}
-	return a.Inner.RecordObservedReply(ctx, journal.ClaimInput{ReplyID: in.ReplyID, OriginalID: in.OriginalID, Digest: in.Digest, BodySize: in.BodySize, Status: in.Status, ErrorCode: in.ErrorCode, ReplyRoute: in.ReplyRoute, CustodyRoute: in.CustodyRoute, CustodyStoreID: in.CustodyStoreID}, native, endpointID, controlRoute)
+	return a.observeTransition(ctx, in.ReplyID, func() error {
+		return a.Inner.RecordObservedReply(ctx, journal.ClaimInput{ReplyID: in.ReplyID, OriginalID: in.OriginalID, Digest: in.Digest, BodySize: in.BodySize, Status: in.Status, ErrorCode: in.ErrorCode, ReplyRoute: in.ReplyRoute, CustodyRoute: in.CustodyRoute, CustodyStoreID: in.CustodyStoreID}, native, endpointID, controlRoute)
+	})
 }
 func (a SQLiteJournal) ReconcileReplyObservation(ctx context.Context, id, native, digest string) error {
 	if err := a.valid(); err != nil {
 		return err
 	}
-	return a.Inner.ReconcileReplyObservation(ctx, id, native, digest)
+	return a.observeTransition(ctx, id, func() error { return a.Inner.ReconcileReplyObservation(ctx, id, native, digest) })
+}
+
+func (a SQLiteJournal) observeTransition(ctx context.Context, replyID string, transition func() error) error {
+	err := transition()
+	if !errors.Is(err, journal.ErrInvalidTransition) {
+		return err
+	}
+	claim, lookupErr := a.Inner.Reply(ctx, replyID)
+	if lookupErr != nil {
+		return err
+	}
+	if claim.State == journal.StateReplyClaimed {
+		return ErrObservationPending
+	}
+	if claim.State == journal.StateReplyAccepted || claim.State == journal.StateReplyOutcomeUnknown || claim.State == journal.StateReplyObserved {
+		return transition()
+	}
+	return err
 }
 
 func (a SQLiteJournal) WaitReply(ctx context.Context, replyID string, timeout time.Duration) (OperationStatus, error) {

@@ -143,6 +143,9 @@ func (s *Service) Wait(ctx context.Context, req WaitRequest) (WaitResult, error)
 			}
 			for _, item := range result.items {
 				if observeErr := s.observeCandidate(ctx, pinnedStatus, item, seen, true); observeErr != nil {
+					if errors.Is(observeErr, ErrObservationPending) {
+						continue
+					}
 					return s.incompleteAfterGap(req.Reference, status, "observation: "+observeErr.Error(), stopWorkers)
 				}
 			}
@@ -155,6 +158,9 @@ func (s *Service) Wait(ctx context.Context, req WaitRequest) (WaitResult, error)
 			}
 			if event.Item != nil {
 				if observeErr := s.observeCandidate(ctx, pinnedStatus, *event.Item, seen, false); observeErr != nil {
+					if errors.Is(observeErr, ErrObservationPending) {
+						continue
+					}
 					return s.incompleteAfterGap(req.Reference, status, "observation: "+observeErr.Error(), stopWorkers)
 				}
 			}

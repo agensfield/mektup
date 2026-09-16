@@ -76,13 +76,16 @@ func (d *fakeDelivery) Detach(context.Context, ResolvedTarget) error { d.detach+
 func (d *fakeDelivery) count() int                                   { d.mu.Lock(); defer d.mu.Unlock(); return len(d.calls) }
 
 type fakeJournal struct {
-	mu        sync.Mutex
-	prepared  map[string]Prepared
-	ops       map[string]OperationStatus
-	claims    map[string]ReplyClaim
-	marked    []string
-	results   []mektup.EvidenceState
-	commitErr error
+	mu          sync.Mutex
+	prepared    map[string]Prepared
+	ops         map[string]OperationStatus
+	claims      map[string]ReplyClaim
+	marked      []string
+	results     []mektup.EvidenceState
+	commitErr   error
+	observeErr  error
+	observeDone chan struct{}
+	observeOnce sync.Once
 }
 
 func newFakeJournal() *fakeJournal {
@@ -181,7 +184,12 @@ func (j *fakeJournal) AbandonReply(_ context.Context, id, _, _ string) error {
 	}
 	return nil
 }
-func (j *fakeJournal) ObserveReply(context.Context, string, string, string) error { return nil }
+func (j *fakeJournal) ObserveReply(context.Context, string, string, string) error {
+	if j.observeDone != nil {
+		j.observeOnce.Do(func() { close(j.observeDone) })
+	}
+	return j.observeErr
+}
 func (j *fakeJournal) ReconcileReplyObservation(context.Context, string, string, string) error {
 	return nil
 }
@@ -652,6 +660,38 @@ func TestWaitGapReturnsIncompleteWithoutInventingReply(t *testing.T) {
 	}
 }
 
+func TestWaitDefersNativeObservationUntilCustodyCommit(t *testing.T) {
+	r := baseResolver()
+	d := &fakeDelivery{}
+	j := newFakeJournal()
+	j.observeErr = ErrObservationPending
+	j.observeDone = make(chan struct{})
+	op := Operation{OperationID: "op_18999999-9999-7999-8999-999999999999", MessageID: "msg_18999999-9999-7999-8999-999999999998", SourceRoute: r.source.URI, TargetRoute: r.target.URI, ReplyRoute: r.source.URI, ReplyEndpointID: epSource, CustodyRoute: epSource, CustodyStoreID: storeID, Semantics: "message", Digest: digest("question"), BodySize: 8, ReplyRequested: true, SourceEndpointID: epSource, TargetEndpointID: epTarget}
+	j.ops[op.MessageID] = OperationStatus{Operation: op, State: mektup.StateAccepted}
+	reply := mektup.Envelope{MessageID: "msg_18999999-9999-7999-8999-999999999997", Kind: mektup.KindReply, FromEndpointID: epTarget, From: r.target.URI, FromKind: "agent", ToEndpointID: epSource, To: r.source.URI, RequestedTarget: r.source.URI, InReplyTo: op.MessageID, ReplyStatus: mektup.ReplySuccess, Body: "answer", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	reply.PayloadBytes = uint64(len(reply.Body))
+	reply.PayloadSHA256 = digest(reply.Body)
+	s := validService(&r, d, j)
+	s.Observe = singleItemObservation{item: ObservedItem{ThreadID: "source", TurnID: "turn", NativeItemID: "native", NativeType: "userMessage", ClientMessageID: reply.MessageID, Text: string(mektup.MustRenderEnvelope(reply))}}
+	go func() {
+		<-j.observeDone
+		j.mu.Lock()
+		status := j.ops[op.MessageID]
+		status.State = mektup.StateReplyAccepted
+		status.ReplyID = reply.MessageID
+		status.ReplyStatus = string(reply.ReplyStatus)
+		status.ReplyDigest = reply.PayloadSHA256
+		status.ReplyBodySize = int64(reply.PayloadBytes)
+		status.ReplyCommitSeq = 1
+		j.ops[op.MessageID] = status
+		j.mu.Unlock()
+	}()
+	wait, err := s.Wait(context.Background(), WaitRequest{Reference: op.MessageID, Timeout: time.Second})
+	if err != nil || wait.Incomplete || wait.State != mektup.StateReplyAccepted || wait.ReplyID != reply.MessageID {
+		t.Fatalf("body-before-commit wait = %#v err=%v", wait, err)
+	}
+}
+
 func TestWaitTerminalErrorReplyIsRejectedAndReceiptIsValid(t *testing.T) {
 	r := baseResolver()
 	d := &fakeDelivery{}
@@ -683,3 +723,32 @@ func (gapStream) Next(context.Context) (Event, error) {
 	return Event{Gap: true, Reason: "overflow"}, nil
 }
 func (gapStream) Close() error { return nil }
+
+type singleItemObservation struct{ item ObservedItem }
+
+func (o singleItemObservation) Subscribe(context.Context, ResolvedTarget) (EventStream, error) {
+	return &singleItemStream{item: o.item}, nil
+}
+func (singleItemObservation) FullHistory(context.Context, ResolvedTarget) ([]ObservedItem, error) {
+	return nil, nil
+}
+
+type singleItemStream struct {
+	item ObservedItem
+	once sync.Once
+}
+
+func (s *singleItemStream) Next(ctx context.Context) (Event, error) {
+	var event Event
+	delivered := false
+	s.once.Do(func() {
+		event = Event{Item: &s.item}
+		delivered = true
+	})
+	if delivered {
+		return event, nil
+	}
+	<-ctx.Done()
+	return Event{}, ctx.Err()
+}
+func (*singleItemStream) Close() error { return nil }

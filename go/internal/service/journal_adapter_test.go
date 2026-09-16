@@ -156,6 +156,38 @@ func TestSQLiteJournalAdapterReplyAcceptanceProjectsClaimMetadata(t *testing.T) 
 	}
 }
 
+func TestSQLiteJournalDefersObservationWhileClaimIsFenced(t *testing.T) {
+	ctx := context.Background()
+	inner, err := journal.Open(ctx, journal.Options{StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer inner.Close()
+	a := SQLiteJournal{Inner: inner, SourceEndpointID: epSource, TargetEndpointID: epTarget}
+	op := Operation{OperationID: "op_14999999-9999-7999-8999-999999999998", MessageID: "msg_14999999-9999-7999-8999-999999999998", SourceRoute: "codex://local/thread/source", TargetRoute: "codex://local/thread/target", Semantics: "message", Digest: digest("question"), BodySize: 8, ReplyRequested: true, ReplyRoute: "codex://local/thread/source", CustodyRoute: epSource, CustodyStoreID: storeID, SourceEndpointID: epSource, TargetEndpointID: epTarget}
+	if _, err := a.Prepare(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	input := ReplyClaimInput{ReplyID: "msg_14999999-9999-7999-8999-999999999997", OriginalID: op.MessageID, Digest: digest("answer"), BodySize: 6, Status: "success", ReplyRoute: op.ReplyRoute, CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID, Owner: "receiver"}
+	claim, err := a.ClaimReply(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RecordObservedReply(ctx, input, "native", epSource, epSource); !errors.Is(err, ErrObservationPending) {
+		t.Fatalf("body-before-commit observation = %v, want pending", err)
+	}
+	if _, err := a.CommitReply(ctx, claim.ReplyID, claim.Owner, claim.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RecordObservedReply(ctx, input, "native", epSource, epSource); err != nil {
+		t.Fatalf("post-commit observation: %v", err)
+	}
+	status, err := a.Lookup(ctx, op.MessageID)
+	if err != nil || status.State != mektup.StateReplyObserved || status.ReplyNativeID != "native" {
+		t.Fatalf("observed projection = %#v err=%v", status, err)
+	}
+}
+
 type adapterFailingDelivery struct{ messageID string }
 
 func (d *adapterFailingDelivery) Send(_ context.Context, _ ResolvedTarget, _ string, id string) (DeliveryResult, error) {

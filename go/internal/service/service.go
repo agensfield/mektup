@@ -29,9 +29,10 @@ const (
 )
 
 var (
-	ErrNoResolver = errors.New("mektup service: resolver port is required")
-	ErrNoDelivery = errors.New("mektup service: delivery port is required")
-	ErrNoJournal  = errors.New("mektup service: journal port is required")
+	ErrNoResolver         = errors.New("mektup service: resolver port is required")
+	ErrNoDelivery         = errors.New("mektup service: delivery port is required")
+	ErrNoJournal          = errors.New("mektup service: journal port is required")
+	ErrObservationPending = errors.New("mektup service: native observation arrived before custody became terminal")
 )
 
 // Error is the semantic error returned by the service.  Transport and server
