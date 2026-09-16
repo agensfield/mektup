@@ -245,13 +245,19 @@ func runHerdrProcess(parent context.Context, process sshproxy.Process, stdin io.
 		select {
 		case out = <-stdoutCh:
 			gotOut = true
-			if out.too && terminal == nil {
+			if terminal == nil && out.err != nil {
+				terminal = &HerdrRunnerFailure{Kind: HerdrRunnerCommandFailure, Err: out.err}
+				cleanupDone = beginHerdrCleanup(process, stdout, stderr, cfg.CleanupTimeout, &cleanupTimer)
+			} else if out.too && terminal == nil {
 				terminal = &HerdrRunnerFailure{Kind: HerdrRunnerOutputFailure, Err: ErrHerdrRunnerOutputTooLarge, OutputTruncated: true}
 				cleanupDone = beginHerdrCleanup(process, stdout, stderr, cfg.CleanupTimeout, &cleanupTimer)
 			}
 		case errout = <-stderrCh:
 			gotErrout = true
-			if errout.too && terminal == nil {
+			if terminal == nil && errout.err != nil {
+				terminal = &HerdrRunnerFailure{Kind: HerdrRunnerCommandFailure, Err: errout.err}
+				cleanupDone = beginHerdrCleanup(process, stdout, stderr, cfg.CleanupTimeout, &cleanupTimer)
+			} else if errout.too && terminal == nil {
 				terminal = &HerdrRunnerFailure{Kind: HerdrRunnerOutputFailure, Err: ErrHerdrRunnerOutputTooLarge, StderrTruncated: true}
 				cleanupDone = beginHerdrCleanup(process, stdout, stderr, cfg.CleanupTimeout, &cleanupTimer)
 			}

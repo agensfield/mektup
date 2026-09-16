@@ -34,10 +34,15 @@ type testWriteCloser struct{ io.Writer }
 
 func (testWriteCloser) Close() error { return nil }
 
-type failingReadCloser struct{}
+type failingReadCloser struct{ err error }
 
-func (failingReadCloser) Read([]byte) (int, error) { return 0, errors.New("synthetic read failure") }
-func (failingReadCloser) Close() error             { return nil }
+func (f failingReadCloser) Read([]byte) (int, error) {
+	if f.err != nil {
+		return 0, f.err
+	}
+	return 0, errors.New("synthetic read failure")
+}
+func (failingReadCloser) Close() error { return nil }
 
 func (p *herdrTestProcess) StdinPipe() (io.WriteCloser, error) { return p.stdin, nil }
 func (p *herdrTestProcess) StdoutPipe() (io.ReadCloser, error) { return p.stdout, nil }
@@ -235,6 +240,42 @@ func TestRemoteHerdrRunnerReadFailureCannotBecomeSuccess(t *testing.T) {
 	var failure *HerdrRunnerFailure
 	if !errors.Is(err, ErrResolverUnavailable) || !errors.As(err, &failure) || failure.Kind != HerdrRunnerCommandFailure || !strings.Contains(failure.Error(), "synthetic read failure") {
 		t.Fatalf("read failure = %#v", err)
+	}
+}
+
+func TestRemoteHerdrRunnerReadErrorStartsCleanupImmediately(t *testing.T) {
+	cause := errors.New("causal read fault")
+	stderrR, stderrW := io.Pipe()
+	killed := make(chan struct{})
+	p := &herdrTestProcess{
+		stdin:  testWriteCloser{Writer: io.Discard},
+		stdout: failingReadCloser{err: cause},
+		stderr: stderrR,
+		kill: func() error {
+			select {
+			case <-killed:
+			default:
+				close(killed)
+			}
+			return stderrW.Close()
+		},
+		wait: func() error {
+			<-killed
+			return nil
+		},
+	}
+	runner := RemoteHerdrRunner{
+		Config:  HerdrRunnerConfig{SSH: sshproxy.Config{Host: "route.example"}, CommandTimeout: 30 * time.Millisecond, CleanupTimeout: time.Second},
+		Factory: sshproxy.ProcessFactoryFunc(func([]string) (sshproxy.Process, error) { return p, nil }),
+	}
+	started := time.Now()
+	_, err := runner.RunEndpoint(context.Background(), testEndpoint(t, "route.example"), []string{"herdr", "agent", "list"})
+	if time.Since(started) > 500*time.Millisecond {
+		t.Fatalf("read-error cleanup waited for command timeout: %v", time.Since(started))
+	}
+	var failure *HerdrRunnerFailure
+	if !errors.Is(err, cause) || !errors.Is(err, ErrResolverUnavailable) || !errors.As(err, &failure) || failure.Kind != HerdrRunnerCommandFailure {
+		t.Fatalf("read failure evidence = %#v", err)
 	}
 }
 
