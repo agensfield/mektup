@@ -104,13 +104,13 @@ func (r *HerdrResolver) ResolveEndpoint(ctx context.Context, endpoint Endpoint, 
 	if r == nil {
 		return HerdrResolution{}, ErrResolverUnavailable
 	}
-	if r.EndpointRunner != nil {
+	if endpoint.Route.Kind == RouteSSH {
+		if r.EndpointRunner == nil {
+			return HerdrResolution{}, fmt.Errorf("%w: SSH endpoint needs an endpoint-specific Herdr runner", ErrResolverUnavailable)
+		}
 		return r.resolve(ctx, target, func(runCtx context.Context, argv []string) ([]byte, error) {
 			return r.EndpointRunner.RunEndpoint(runCtx, endpoint, argv)
 		})
-	}
-	if endpoint.Route.Kind == RouteSSH {
-		return HerdrResolution{}, fmt.Errorf("%w: SSH endpoint needs an endpoint-specific Herdr runner", ErrResolverUnavailable)
 	}
 	return r.Resolve(ctx, target)
 }

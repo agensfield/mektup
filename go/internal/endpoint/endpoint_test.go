@@ -348,6 +348,30 @@ func TestSSHHerdrUsesEndpointSpecificRunnerAndContext(t *testing.T) {
 	}
 }
 
+func TestLocalHerdrIgnoresSSHEndpointRunner(t *testing.T) {
+	list := []byte(`{"agents":[{"agent":"codex","name":"local-agent","pane_id":"w3:p1","workspace_id":"w3","tab_id":"w3:t1","agent_status":"idle","agent_session":{"kind":"id","source":"herdr:codex","value":"thread-local"}}]}`)
+	get := herdrJSON("local-agent", "w3:p1", "w3", "w3:t1", "thread-local", "idle")
+	local := &fakeRunner{responses: [][]byte{list, get}}
+	resolver := NewHerdrResolver(local)
+	endpointRunnerCalls := 0
+	resolver.EndpointRunner = EndpointCommandRunnerFunc(func(context.Context, Endpoint, []string) ([]byte, error) {
+		endpointRunnerCalls++
+		return nil, errors.New("SSH runner must not receive a local endpoint")
+	})
+	route, err := UnixRoute("/tmp/codex.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep := Endpoint{ID: testEndpointID, Alias: "local-test", Route: route, Herdr: HerdrAuto}
+	resolved, err := resolver.ResolveEndpoint(context.Background(), ep, Target{Kind: TargetAgent, Name: "local-agent"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ThreadID != "thread-local" || endpointRunnerCalls != 0 {
+		t.Fatalf("resolution=%+v endpointRunnerCalls=%d", resolved, endpointRunnerCalls)
+	}
+}
+
 func TestSSHArgvCannotCarryShellOrBody(t *testing.T) {
 	route, err := SSHRoute("host; touch /tmp/pwned")
 	if err == nil {
