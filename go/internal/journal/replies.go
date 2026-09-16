@@ -4,6 +4,7 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"time"
 )
@@ -141,7 +142,7 @@ func (j *Journal) OriginalStatus(ctx context.Context, originalID string) (Origin
 }
 
 func validateOriginalSelectedClaim(claim ReplyClaim, seq int64, native string, winner bool) error {
-	if claim.ReplyID == "" || claim.OriginalID == "" || claim.Digest == "" || claim.BodySize < 0 || (claim.Status != "success" && claim.Status != "error") || (claim.Status == "success" && claim.ReplyErrorCode != "") || seq <= 0 {
+	if claim.ReplyID == "" || claim.OriginalID == "" || !validDigest(claim.Digest) || claim.BodySize < 0 || (claim.Status != "success" && claim.Status != "error") || (claim.Status == "success" && claim.ReplyErrorCode != "") || seq <= 0 {
 		return fmt.Errorf("%w: corrupt selected reply metadata", ErrCorrupt)
 	}
 	if winner {
@@ -155,6 +156,14 @@ func validateOriginalSelectedClaim(claim ReplyClaim, seq int64, native string, w
 		return fmt.Errorf("%w: corrupt terminal unknown state", ErrCorrupt)
 	}
 	return nil
+}
+
+func validDigest(value string) bool {
+	if len(value) != len("sha256:")+64 || value[:len("sha256:")] != "sha256:" {
+		return false
+	}
+	_, err := hex.DecodeString(value[len("sha256:"):])
+	return err == nil
 }
 
 // ClaimInput is the complete identity fence. Every field is compared for a

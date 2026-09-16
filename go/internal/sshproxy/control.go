@@ -97,6 +97,11 @@ func ValidateControlRequest(data []byte) (ControlRequest, error) {
 	if err := json.Unmarshal(data, &req); err != nil {
 		return ControlRequest{}, fmt.Errorf("%w: %v", ErrControlValidation, err)
 	}
+	if req.Kind == "result" && req.Operation == "originalStatus" {
+		if _, present := raw["replyMessageId"]; present {
+			return ControlRequest{}, fmt.Errorf("%w: originalStatus result forbids top-level replyMessageId", ErrControlValidation)
+		}
+	}
 	if err := req.Validate(); err != nil {
 		return ControlRequest{}, err
 	}
@@ -625,6 +630,11 @@ func (r ControlRequest) Validate() error {
 }
 
 func validateOriginalStatusResult(result map[string]json.RawMessage) error {
+	for _, field := range []string{"body", "bodyText", "bodyContent"} {
+		if _, ok := result[field]; ok {
+			return fmt.Errorf("%w: originalStatus result forbids %s", ErrControlValidation, field)
+		}
+	}
 	for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner"} {
 		if _, ok := result[field]; ok {
 			return fmt.Errorf("%w: originalStatus result forbids %s", ErrControlValidation, field)

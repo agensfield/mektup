@@ -9,6 +9,12 @@ import (
 	"time"
 )
 
+func originalStatusClaimInput() ClaimInput {
+	in := claimInput()
+	in.Digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	return in
+}
+
 func TestOriginalStatusPendingAndUnknownOrder(t *testing.T) {
 	dir := t.TempDir()
 	var now atomic.Int64
@@ -22,7 +28,7 @@ func TestOriginalStatusPendingAndUnknownOrder(t *testing.T) {
 	if pending.Selection != "pending" {
 		t.Fatalf("pending selection %q", pending.Selection)
 	}
-	a := claimInput()
+	a := originalStatusClaimInput()
 	a.ReplyID = "unknown-a"
 	ca, err := j.ClaimReply(context.Background(), a)
 	if err != nil {
@@ -31,7 +37,7 @@ func TestOriginalStatusPendingAndUnknownOrder(t *testing.T) {
 	if err := j.AbandonReply(context.Background(), ca.ReplyID, ca.Owner, ca.Token); err != nil {
 		t.Fatal(err)
 	}
-	b := claimInput()
+	b := originalStatusClaimInput()
 	b.ReplyID = "unknown-b"
 	cb, err := j.ClaimReply(context.Background(), b)
 	if err != nil {
@@ -55,7 +61,7 @@ func TestOriginalStatusWinnerPrecedesUnknown(t *testing.T) {
 	now.Store(time.Now().UnixNano())
 	j := testJournal(t, dir, &now)
 	prepared(t, j)
-	a := claimInput()
+	a := originalStatusClaimInput()
 	a.ReplyID = "winner"
 	ca, err := j.ClaimReply(context.Background(), a)
 	if err != nil {
@@ -64,7 +70,7 @@ func TestOriginalStatusWinnerPrecedesUnknown(t *testing.T) {
 	if _, err := j.CommitReply(context.Background(), ca.ReplyID, ca.Owner, ca.Token); err != nil {
 		t.Fatal(err)
 	}
-	b := claimInput()
+	b := originalStatusClaimInput()
 	b.ReplyID = "unknown"
 	cb, err := j.ClaimReply(context.Background(), b)
 	if err != nil {
@@ -88,7 +94,7 @@ func TestOriginalStatusExpiresDueClaimsAndWakesUnknown(t *testing.T) {
 	now.Store(time.Now().UnixNano())
 	j := testJournal(t, dir, &now)
 	prepared(t, j)
-	c, err := j.ClaimReply(context.Background(), claimInput())
+	c, err := j.ClaimReply(context.Background(), originalStatusClaimInput())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,7 +121,7 @@ func TestOriginalStatusRollbackAndConcurrentLinearization(t *testing.T) {
 	now.Store(time.Now().UnixNano())
 	j := testJournal(t, dir, &now)
 	prepared(t, j)
-	c, err := j.ClaimReply(context.Background(), claimInput())
+	c, err := j.ClaimReply(context.Background(), originalStatusClaimInput())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +185,7 @@ func TestOriginalStatusFailsClosedOnCorruptWinnerMetadata(t *testing.T) {
 	now.Store(time.Now().UnixNano())
 	j := testJournal(t, dir, &now)
 	prepared(t, j)
-	c, err := j.ClaimReply(context.Background(), claimInput())
+	c, err := j.ClaimReply(context.Background(), originalStatusClaimInput())
 	if err != nil {
 		t.Fatal(err)
 	}

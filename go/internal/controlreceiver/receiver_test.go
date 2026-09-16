@@ -255,6 +255,12 @@ func TestReceiverOriginalStatusRejectsReplyIDPresenceAndOperationMismatch(t *tes
 	if _, err := receiver.Receive(context.Background(), raw); !errors.Is(err, ErrRelationshipMismatch) {
 		t.Fatalf("operation mismatch error: %v", err)
 	}
+	independent := request(j)
+	independent.OperationID = "op_0198f0e0-0000-7000-8000-000000000099"
+	independent.ReplyMessageID = "msg_0198f0e0-0000-7000-8000-000000000099"
+	if _, err := receiver.Receive(context.Background(), mustMarshal(t, independent)); err != nil {
+		t.Fatalf("independent reply operation rejected: %v", err)
+	}
 }
 
 func TestOriginalStatusResultRejectsAuthorityAndBodyKeysIncludingNull(t *testing.T) {
@@ -274,6 +280,40 @@ func TestOriginalStatusResultRejectsAuthorityAndBodyKeysIncludingNull(t *testing
 		if _, err := sshproxy.ValidateControlRequest(data); !errors.Is(err, sshproxy.ErrControlValidation) {
 			t.Fatalf("authority/body field %s accepted: %v", field, err)
 		}
+	}
+}
+
+func TestReceiverOriginalStatusFailsBeforeEmittingCorruptWinner(t *testing.T) {
+	j, _ := openReceiverJournal(t, time.Minute)
+	prepareOriginal(t, j)
+	c, err := j.ClaimReply(context.Background(), journal.ClaimInput{ReplyID: replyID, OriginalID: originalID, Digest: "invalid", BodySize: 7, Status: "success", ReplyRoute: "codex://local/thread/source", CustodyRoute: receiverEndpoint, CustodyStoreID: j.StoreID(), Owner: "owner"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.CommitReply(context.Background(), c.ReplyID, c.Owner, c.Token); err != nil {
+		t.Fatal(err)
+	}
+	receiver := Receiver{Registry: staticResolver{store: Store{Journal: j, StoreID: j.StoreID(), EndpointID: receiverEndpoint, CloseFunc: func() error { return nil }}}, LocalEndpointID: receiverEndpoint, Destination: localDestination()}
+	q := request(j)
+	q.Operation = "originalStatus"
+	q.ReplyMessageID = ""
+	q.BodyBytes = nil
+	q.BodySHA256 = ""
+	q.ReplyStatus = ""
+	q.AttemptOwner = ""
+	q.ReplyErrorCode = ""
+	raw := mustMarshal(t, q)
+	var document map[string]any
+	if err := json.Unmarshal(raw, &document); err != nil {
+		t.Fatal(err)
+	}
+	delete(document, "replyMessageId")
+	raw, err = json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := receiver.Receive(context.Background(), raw); !errors.Is(err, journal.ErrCorrupt) {
+		t.Fatalf("corrupt winner was emitted/accepted: %v", err)
 	}
 }
 
