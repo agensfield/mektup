@@ -352,7 +352,7 @@ func (j *Journal) init(ctx context.Context) error {
 			return err
 		}
 	} else if version == currentSchemaVersion {
-		if err = validateV8Schema(ctx, tx); err != nil {
+		if err = validateCurrentV8Schema(ctx, tx, true); err != nil {
 			return err
 		}
 	}
@@ -862,10 +862,7 @@ func migrateV7ToV8(ctx context.Context, tx *sql.Tx) error {
 }
 
 func validateV8Schema(ctx context.Context, tx *sql.Tx) error {
-	if err := validateV7Schema(ctx, tx); err != nil {
-		return err
-	}
-	return validateObservationColumns(ctx, tx)
+	return validateCurrentV8Schema(ctx, tx, false)
 }
 
 func validateObservationColumns(ctx context.Context, queryer schemaQueryer) error {
@@ -984,6 +981,7 @@ func validateReplyTupleColumns(ctx context.Context, queryer schemaQueryer) error
 
 type schemaQueryer interface {
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+	QueryRowContext(context.Context, string, ...any) *sql.Row
 }
 
 // validateBlockerStructure is shared by normal open validation and read-only

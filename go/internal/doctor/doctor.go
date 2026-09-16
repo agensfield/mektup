@@ -85,6 +85,9 @@ type Options struct {
 	Paths  Paths
 	Probes []Probe
 	Now    func() time.Time
+	// Owner is injectable for deterministic ownership probes. Production
+	// defaults to the current-euid descriptor/filesystem check.
+	Owner func(os.FileInfo) bool
 }
 
 func DefaultOptions(paths Paths) Options { return Options{Paths: paths} }
@@ -102,7 +105,7 @@ func Run(ctx context.Context, opts Options, fix bool) (Report, error) {
 	}
 	probes := opts.Probes
 	if len(probes) == 0 {
-		probes = defaultProbes(opts.Paths)
+		probes = defaultProbes(opts.Paths, opts.Owner)
 	}
 	report := Report{ReadOnly: !fix, Fix: fix, CheckedAt: now, Findings: []Finding{}, Plan: []RepairPlan{}, Repairs: []RepairReceipt{}}
 	for _, probe := range probes {
@@ -144,27 +147,33 @@ func Run(ctx context.Context, opts Options, fix bool) (Report, error) {
 
 func Check(ctx context.Context, opts Options) (Report, error) { return Run(ctx, opts, false) }
 
-func defaultProbes(paths Paths) []Probe {
+func defaultProbes(paths Paths, owners ...func(os.FileInfo) bool) []Probe {
+	owner := ownerCurrent
+	if len(owners) > 0 && owners[0] != nil {
+		owner = owners[0]
+	}
 	return []Probe{
 		ProbeFunc(func(ctx context.Context) ([]Finding, error) {
-			return probeDir(ctx, "state.directory", "state", paths.StateDir)
+			return probeDirWithOwner(ctx, "state.directory", "state", paths.StateDir, owner)
 		}),
 		ProbeFunc(func(ctx context.Context) ([]Finding, error) {
-			return probeFile(ctx, "state.database", "state", childPath(paths.StateDir, "journal.sqlite3"))
+			return probeFileWithOwner(ctx, "state.database", "state", childPath(paths.StateDir, "journal.sqlite3"), owner)
 		}),
 		ProbeFunc(func(ctx context.Context) ([]Finding, error) {
-			return probeFile(ctx, "state.wal", "state", childPath(paths.StateDir, "journal.sqlite3-wal"))
+			return probeFileWithOwner(ctx, "state.wal", "state", childPath(paths.StateDir, "journal.sqlite3-wal"), owner)
 		}),
 		ProbeFunc(func(ctx context.Context) ([]Finding, error) {
-			return probeFile(ctx, "state.shm", "state", childPath(paths.StateDir, "journal.sqlite3-shm"))
+			return probeFileWithOwner(ctx, "state.shm", "state", childPath(paths.StateDir, "journal.sqlite3-shm"), owner)
 		}),
 		ProbeFunc(func(ctx context.Context) ([]Finding, error) {
-			return probeDir(ctx, "config.directory", "config", paths.ConfigDir)
+			return probeDirWithOwner(ctx, "config.directory", "config", paths.ConfigDir, owner)
 		}),
 		ProbeFunc(func(ctx context.Context) ([]Finding, error) {
-			return probeFile(ctx, "config.file", "config", paths.ConfigFile)
+			return probeFileWithOwner(ctx, "config.file", "config", paths.ConfigFile, owner)
 		}),
-		ProbeFunc(func(ctx context.Context) ([]Finding, error) { return probeSocket(ctx, paths.SocketPath) }),
+		ProbeFunc(func(ctx context.Context) ([]Finding, error) {
+			return probeSocketWithOwner(ctx, paths.SocketPath, owner)
+		}),
 		ProbeFunc(func(context.Context) ([]Finding, error) {
 			return []Finding{{ID: "runtime.version", Category: "version", Severity: SeverityOK, Message: runtime.Version()}}, nil
 		}),
@@ -178,7 +187,11 @@ func childPath(parent, child string) string {
 	return filepath.Join(parent, child)
 }
 
-func probeDir(_ context.Context, id, category, path string) ([]Finding, error) {
+func probeDir(ctx context.Context, id, category, path string) ([]Finding, error) {
+	return probeDirWithOwner(ctx, id, category, path, ownerCurrent)
+}
+
+func probeDirWithOwner(_ context.Context, id, category, path string, owner func(os.FileInfo) bool) ([]Finding, error) {
 	if path == "" {
 		return []Finding{{ID: id, Category: category, Severity: SeverityNotice, Message: "not configured", Fixable: false}}, nil
 	}
@@ -197,13 +210,20 @@ func probeDir(_ context.Context, id, category, path string) ([]Finding, error) {
 	if !info.IsDir() {
 		return []Finding{{ID: id, Category: category, Severity: SeverityError, Message: "path is not a directory", Path: path}}, nil
 	}
+	if !owner(info) {
+		return []Finding{{ID: id, Category: category, Severity: SeverityError, Message: "directory is not owned by the current user", Path: path}}, nil
+	}
 	if info.Mode()&0077 != 0 {
 		return []Finding{{ID: id, Category: category, Severity: SeverityWarning, Message: fmt.Sprintf("directory mode %04o is not owner-private", info.Mode().Perm()), Path: path, Fixable: true, SafeFix: true, Fix: chmodFix(path, 0700, info)}}, nil
 	}
 	return []Finding{{ID: id, Category: category, Severity: SeverityOK, Message: "owner-private directory", Path: path}}, nil
 }
 
-func probeFile(_ context.Context, id, category, path string) ([]Finding, error) {
+func probeFile(ctx context.Context, id, category, path string) ([]Finding, error) {
+	return probeFileWithOwner(ctx, id, category, path, ownerCurrent)
+}
+
+func probeFileWithOwner(_ context.Context, id, category, path string, owner func(os.FileInfo) bool) ([]Finding, error) {
 	if path == "" {
 		return []Finding{{ID: id, Category: category, Severity: SeverityNotice, Message: "not configured", Fixable: false}}, nil
 	}
@@ -217,13 +237,20 @@ func probeFile(_ context.Context, id, category, path string) ([]Finding, error) 
 	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 		return []Finding{{ID: id, Category: category, Severity: SeverityError, Message: "path is not a regular file", Path: path}}, nil
 	}
+	if !owner(info) {
+		return []Finding{{ID: id, Category: category, Severity: SeverityError, Message: "file is not owned by the current user", Path: path}}, nil
+	}
 	if info.Mode()&0077 != 0 {
 		return []Finding{{ID: id, Category: category, Severity: SeverityWarning, Message: fmt.Sprintf("file mode %04o is not owner-private", info.Mode().Perm()), Path: path, Fixable: true, SafeFix: true, Fix: chmodFix(path, 0600, info)}}, nil
 	}
 	return []Finding{{ID: id, Category: category, Severity: SeverityOK, Message: "owner-private file", Path: path}}, nil
 }
 
-func probeSocket(_ context.Context, path string) ([]Finding, error) {
+func probeSocket(ctx context.Context, path string) ([]Finding, error) {
+	return probeSocketWithOwner(ctx, path, ownerCurrent)
+}
+
+func probeSocketWithOwner(_ context.Context, path string, owner func(os.FileInfo) bool) ([]Finding, error) {
 	if path == "" {
 		return []Finding{{ID: "socket.path", Category: "socket", Severity: SeverityNotice, Message: "not configured"}}, nil
 	}
@@ -236,6 +263,9 @@ func probeSocket(_ context.Context, path string) ([]Finding, error) {
 	}
 	if info.Mode()&os.ModeSocket == 0 {
 		return []Finding{{ID: "socket.path", Category: "socket", Severity: SeverityError, Message: "path is not a Unix socket", Path: path}}, nil
+	}
+	if !owner(info) {
+		return []Finding{{ID: "socket.path", Category: "socket", Severity: SeverityError, Message: "socket is not owned by the current user", Path: path}}, nil
 	}
 	if info.Mode().Perm()&0077 != 0 {
 		return []Finding{{ID: "socket.path", Category: "socket", Severity: SeverityWarning, Message: fmt.Sprintf("socket mode %04o is not owner-private", info.Mode().Perm()), Path: path, Fixable: true, SafeFix: true, Fix: chmodFix(path, 0600, info)}}, nil

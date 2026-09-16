@@ -116,3 +116,26 @@ func TestDoctorPermissionRepairRefusesSymlink(t *testing.T) {
 		t.Fatalf("symlink repair changed target mode to %04o", info.Mode().Perm())
 	}
 }
+
+func TestDoctorForeignOwnerIsNeverHealthyOrSafeFixable(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	if err := os.Mkdir(state, 0700); err != nil {
+		t.Fatal(err)
+	}
+	report, err := Run(context.Background(), Options{
+		Paths: Paths{StateDir: state},
+		Owner: func(os.FileInfo) bool { return false },
+	}, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, finding := range report.Findings {
+		if finding.ID == "state.directory" && (finding.Severity == SeverityOK || finding.SafeFix || finding.Fixable) {
+			t.Fatalf("foreign-owned state was healthy/fixable: %#v", finding)
+		}
+	}
+	if len(report.Repairs) != 0 {
+		t.Fatalf("foreign-owned state produced repair receipts: %#v", report.Repairs)
+	}
+}

@@ -5,6 +5,7 @@ package doctor
 import (
 	"fmt"
 	"os"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -32,6 +33,10 @@ func safeChmod(path string, mode os.FileMode, expected os.FileInfo) error {
 	}
 	if !actual.Mode().IsRegular() && !actual.IsDir() {
 		return fmt.Errorf("refusing special permission target: %s", path)
+	}
+	stat, ok := actual.Sys().(*syscall.Stat_t)
+	if !ok || uint64(stat.Uid) != uint64(os.Geteuid()) {
+		return fmt.Errorf("refusing foreign-owned permission target: %s", path)
 	}
 	if err := file.Chmod(mode.Perm()); err != nil {
 		return fmt.Errorf("chmod permission target: %w", err)

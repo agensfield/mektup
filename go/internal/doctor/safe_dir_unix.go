@@ -4,6 +4,7 @@ package doctor
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 
@@ -15,6 +16,10 @@ import (
 // redirecting the repair outside the requested absolute path.
 func safeEnsureDir(path string, mode uint32) error {
 	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return err
+	}
+	abs, err = canonicalExistingPrefix(abs)
 	if err != nil {
 		return err
 	}
@@ -56,6 +61,14 @@ func safeEnsureDir(path string, mode uint32) error {
 			unix.Close(next)
 			return fmt.Errorf("directory component %q is not a directory", part)
 		}
+		if !ownerCurrentDescriptor(&stat) && isFinal {
+			unix.Close(next)
+			return fmt.Errorf("directory component %q is not owned by current euid", part)
+		}
+		if !isFinal && stat.Mode&0002 != 0 && stat.Mode&01000 == 0 {
+			unix.Close(next)
+			return fmt.Errorf("directory ancestor %q is world-writable without sticky protection", part)
+		}
 		if created || isFinal {
 			if err := unix.Fchmod(next, mode); err != nil {
 				unix.Close(next)
@@ -66,4 +79,29 @@ func safeEnsureDir(path string, mode uint32) error {
 		fd = next
 	}
 	return nil
+}
+
+// canonicalExistingPrefix resolves existing ancestors such as macOS /var,
+// while leaving missing final components for descriptor-root creation. The
+// resolved path is still traversed with O_NOFOLLOW component opens.
+func canonicalExistingPrefix(path string) (string, error) {
+	for candidate := path; ; candidate = filepath.Dir(candidate) {
+		if _, err := os.Lstat(candidate); err == nil {
+			resolved, err := filepath.EvalSymlinks(candidate)
+			if err != nil {
+				return "", fmt.Errorf("resolve directory ancestor: %w", err)
+			}
+			rel, err := filepath.Rel(candidate, path)
+			if err != nil {
+				return "", err
+			}
+			return filepath.Clean(filepath.Join(resolved, rel)), nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		parent := filepath.Dir(candidate)
+		if parent == candidate {
+			return "", fmt.Errorf("no existing directory ancestor for %s", path)
+		}
+	}
 }
