@@ -197,7 +197,7 @@ func (s Store) reconcileDurableReply(ctx context.Context, receipt mektup.Receipt
 	var match *HistoryItem
 	for i := range items {
 		item := &items[i]
-		if !replyHistoryMatch(*item, endpointID, threadID, claim) {
+		if !replyHistoryMatch(*item, endpointID, threadID, claim, op) {
 			continue
 		}
 		if match != nil {
@@ -229,8 +229,17 @@ func (s Store) reconcileDurableReply(ctx context.Context, receipt mektup.Receipt
 	return updated, nil
 }
 
-func replyHistoryMatch(item HistoryItem, endpointID, threadID string, claim journal.ReplyClaim) bool {
+func replyHistoryMatch(item HistoryItem, endpointID, threadID string, claim journal.ReplyClaim, op journal.OperationRecord) bool {
 	if item.EndpointID != endpointID || item.ThreadID != threadID || item.MessageID != claim.ReplyID || item.ClientMessageID != claim.ReplyID || item.InReplyTo != claim.OriginalID || item.Body == nil {
+		return false
+	}
+	if item.EnvelopeToEndpointID != endpointID || threadIdentity(item.EnvelopeTo) != threadID {
+		return false
+	}
+	if op.TargetEndpointID != "" && item.EnvelopeFromEndpointID != op.TargetEndpointID {
+		return false
+	}
+	if op.TargetRoute != "" && threadIdentity(op.TargetRoute) != "" && threadIdentity(item.EnvelopeFrom) != threadIdentity(op.TargetRoute) {
 		return false
 	}
 	if bodyDigest(item.Body) != claim.Digest || uint64(len(item.Body)) != uint64(claim.BodySize) {
@@ -239,10 +248,23 @@ func replyHistoryMatch(item HistoryItem, endpointID, threadID string, claim jour
 	if item.PayloadSHA256 != "" && item.PayloadSHA256 != claim.Digest {
 		return false
 	}
-	if item.ReplyStatus != "" && item.ReplyStatus != claim.Status {
+	if item.ReplyStatus != claim.Status {
 		return false
 	}
-	return item.ReplyErrorCode == "" || item.ReplyErrorCode == claim.ReplyErrorCode
+	if claim.ReplyErrorCode != "" {
+		return item.ReplyErrorCode == claim.ReplyErrorCode
+	}
+	// An error reply may omit its code only when custody also omitted it.
+	// Successful replies never carry an error code.
+	return item.ReplyErrorCode == ""
+}
+
+func threadIdentity(uri string) string {
+	parsed, err := mektup.ParseThreadURI(uri)
+	if err != nil {
+		return ""
+	}
+	return parsed.ThreadID
 }
 
 func historyEvidenceReference(item HistoryItem) string {

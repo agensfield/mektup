@@ -11,17 +11,21 @@ import (
 // history adapter must obtain it by pinned endpoint/thread IDs; search results
 // are intentionally not representable here.
 type HistoryItem struct {
-	EndpointID      string
-	ThreadID        string
-	TurnID          string
-	ItemID          string
-	MessageID       string
-	ClientMessageID string
-	InReplyTo       string
-	ReplyStatus     string
-	ReplyErrorCode  string
-	Body            []byte
-	PayloadSHA256   string
+	EndpointID             string
+	ThreadID               string
+	TurnID                 string
+	ItemID                 string
+	MessageID              string
+	ClientMessageID        string
+	InReplyTo              string
+	ReplyStatus            string
+	ReplyErrorCode         string
+	EnvelopeToEndpointID   string
+	EnvelopeTo             string
+	EnvelopeFromEndpointID string
+	EnvelopeFrom           string
+	Body                   []byte
+	PayloadSHA256          string
 }
 
 // HistoryPort exposes only exact full-history reads. It has no send, search,

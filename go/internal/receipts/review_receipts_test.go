@@ -12,6 +12,12 @@ import (
 
 type failingReceiptJournal struct{ *journal.Journal }
 
+type reviewHistoryHook func(context.Context, string, string) ([]HistoryItem, error)
+
+func (f reviewHistoryHook) FullHistory(ctx context.Context, endpointID, threadID string) ([]HistoryItem, error) {
+	return f(ctx, endpointID, threadID)
+}
+
 func (failingReceiptJournal) PutReceipt(context.Context, mektup.Receipt) error {
 	return errors.New("injected receipt write failure")
 }
@@ -221,8 +227,11 @@ func TestReconcileDurableReplyObservationUsesExactPinnedReplyRoute(t *testing.T)
 	if err := store.Save(context.Background(), receipt); err != nil {
 		t.Fatal(err)
 	}
-	history := historyStub{items: []HistoryItem{{EndpointID: epSource, ThreadID: "source-thread", TurnID: "turn-1", ItemID: "native-reply", MessageID: replyID, ClientMessageID: replyID, InReplyTo: originalID, ReplyStatus: "success", Body: replyBody}}}
-	badHistory := historyStub{items: []HistoryItem{{EndpointID: epSource, ThreadID: "source-thread", TurnID: "turn-1", ItemID: "native-reply", MessageID: replyID, ClientMessageID: replyID, InReplyTo: originalID, ReplyStatus: "success", Body: []byte("wrong digest")}}}
+	historyItem := HistoryItem{EndpointID: epSource, ThreadID: "source-thread", TurnID: "turn-1", ItemID: "native-reply", MessageID: replyID, ClientMessageID: replyID, InReplyTo: originalID, ReplyStatus: "success", EnvelopeToEndpointID: epSource, EnvelopeTo: receipt.Source.Resolved, EnvelopeFromEndpointID: epTarget, EnvelopeFrom: receipt.Target.Resolved, Body: replyBody}
+	history := historyStub{items: []HistoryItem{historyItem}}
+	historyItem.Body = []byte("wrong digest")
+	badHistory := historyStub{items: []HistoryItem{historyItem}}
+	historyItem.Body = replyBody
 	if _, err := store.Reconcile(context.Background(), receipt.ReceiptID, badHistory); !errors.Is(err, ErrReconcileIncomplete) {
 		t.Fatalf("wrong native digest accepted: %v", err)
 	}
@@ -274,5 +283,55 @@ func TestReconcileDurableReplyRejectsWrongNativeIdentity(t *testing.T) {
 	wrong := historyStub{items: []HistoryItem{{EndpointID: receipt.Target.EndpointID, ThreadID: "target-thread", ItemID: "wrong", MessageID: replyID, ClientMessageID: replyID, InReplyTo: originalID, ReplyStatus: "success", Body: replyBody}}}
 	if _, err := store.Reconcile(context.Background(), receipt.ReceiptID, wrong); !errors.Is(err, ErrReconcileIncomplete) {
 		t.Fatalf("wrong endpoint accepted: %v", err)
+	}
+}
+
+func TestReconcileDurableReplyDoesNotPublishStaleWinner(t *testing.T) {
+	store, j := openStore(t)
+	epSource, epTarget := mektup.NewEndpointID(), mektup.NewEndpointID()
+	originalID, replyA := mektup.NewMessageID(), mektup.NewMessageID()
+	replyBody := []byte("durable reply")
+	receipt := testReceipt(t, mektup.StateReplyAccepted)
+	receipt.Source = mektup.ReceiptIdentity{EndpointID: epSource, ThreadID: "source-thread", Resolved: "codex://source/thread/source-thread"}
+	receipt.Target = mektup.ReceiptIdentity{EndpointID: epTarget, ThreadID: "target-thread", Resolved: "codex://target/thread/target-thread"}
+	receipt.Message.MessageID, receipt.OperationID = originalID, mektup.NewOperationID()
+	if _, err := j.Prepare(context.Background(), journal.Operation{OperationID: receipt.OperationID, MessageID: originalID, SourceRoute: receipt.Source.Resolved, TargetRoute: receipt.Target.Resolved, Semantics: "send", SourceEndpointID: epSource, TargetEndpointID: epTarget, ReplyRoute: receipt.Source.Resolved, ReplyEndpointID: epSource, ReplyThreadID: "source-thread", CustodyRoute: "custody", CustodyStoreID: j.StoreID(), Digest: receipt.Message.PayloadSHA256, BodySize: int64(receipt.Message.PayloadBytes)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.MarkDispatchStarted(context.Background(), receipt.OperationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordResult(context.Background(), receipt.OperationID, journal.StateAccepted, ""); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := j.ClaimReply(context.Background(), journal.ClaimInput{ReplyID: replyA, OriginalID: originalID, Digest: bodyDigest(replyBody), BodySize: int64(len(replyBody)), Status: "success", ReplyRoute: receipt.Source.Resolved, CustodyRoute: "custody", CustodyStoreID: j.StoreID(), Owner: "reply-a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := j.AbandonReply(context.Background(), claim.ReplyID, claim.Owner, claim.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(context.Background(), receipt); err != nil {
+		t.Fatal(err)
+	}
+	item := HistoryItem{EndpointID: epSource, ThreadID: "source-thread", ItemID: "native-a", MessageID: replyA, ClientMessageID: replyA, InReplyTo: originalID, ReplyStatus: "success", EnvelopeToEndpointID: epSource, EnvelopeTo: receipt.Source.Resolved, EnvelopeFromEndpointID: epTarget, EnvelopeFrom: receipt.Target.Resolved, Body: replyBody}
+	history := reviewHistoryHook(func(context.Context, string, string) ([]HistoryItem, error) {
+		winner := mektup.NewMessageID()
+		later, err := j.ClaimReply(context.Background(), journal.ClaimInput{ReplyID: winner, OriginalID: originalID, Digest: bodyDigest(replyBody), BodySize: int64(len(replyBody)), Status: "success", ReplyRoute: receipt.Source.Resolved, CustodyRoute: "custody", CustodyStoreID: j.StoreID(), Owner: "reply-b"})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := j.CommitReply(context.Background(), later.ReplyID, later.Owner, later.Token); err != nil {
+			return nil, err
+		}
+		return []HistoryItem{item}, nil
+	})
+	got, err := store.Reconcile(context.Background(), receipt.ReceiptID, history)
+	if err == nil || got.ContentRef != nil {
+		t.Fatalf("stale winner was published: receipt=%+v err=%v", got, err)
+	}
+	stored, _ := j.Receipt(context.Background(), receipt.ReceiptID)
+	if stored.ContentRef != nil || stored.State != mektup.StateReplyAccepted {
+		t.Fatalf("stale receipt projection persisted: %+v", stored)
 	}
 }

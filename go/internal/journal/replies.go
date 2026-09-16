@@ -1047,6 +1047,14 @@ func reconcileReplyObservationTx(tx *sql.Tx, replyID, nativeItemID, digest strin
 	if state != StateReplyOutcomeUnknown && state != StateReplyAccepted && state != StateReplyObserved {
 		return ErrInvalidTransition
 	}
+	var currentWinner string
+	winnerErr := tx.QueryRow("SELECT reply_id FROM reply_winners WHERE original_id=?", originalID).Scan(&currentWinner)
+	if winnerErr != nil && winnerErr != sql.ErrNoRows {
+		return winnerErr
+	}
+	if winnerErr == nil && currentWinner != replyID {
+		return ErrAlreadyWon
+	}
 	if err := validateObservationIdentityTx(tx, replyID, nativeItemID, digest, "", ""); err != nil {
 		return err
 	}

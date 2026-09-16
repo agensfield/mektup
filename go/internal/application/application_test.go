@@ -41,6 +41,57 @@ type fakeTransport struct {
 	onWrite func([]byte)
 }
 
+func TestReceiptHistoryRejectsWrongEnvelopeDestination(t *testing.T) {
+	root := t.TempDir()
+	codexHome := filepath.Join(root, "codex")
+	if err := os.MkdirAll(filepath.Join(codexHome, "app-server-control"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(codexHome, "app-server-control", "app-server-control.sock"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	configured := endpoint.NewStore(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"))
+	configured.IdentityHome = filepath.Join(root, "identity")
+	local, err := configured.EnsureBuiltinLocal(codexHome)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identityJournal, err := journal.Open(context.Background(), journal.Options{StateDir: filepath.Join(root, "state")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeID := identityJournal.StoreID()
+	if _, err := identityJournal.Prepare(context.Background(), journal.Operation{OperationID: "op_0198f0e0-0000-7000-8000-000000000120", MessageID: "msg_0198f0e0-0000-7000-8000-000000000121", SourceRoute: "codex://" + local.ID + "/thread/source", TargetRoute: "codex://" + local.ID + "/thread/source", Semantics: "message", SourceEndpointID: local.ID, TargetEndpointID: local.ID, ReplyRoute: "codex://" + local.ID + "/thread/source", ReplyEndpointID: local.ID, CustodyRoute: local.ID, CustodyStoreID: storeID, Digest: "sha256:" + strings.Repeat("a", 64), BodySize: 8}); err != nil {
+		t.Fatal(err)
+	}
+	_ = identityJournal.Close()
+	original := mektup.Envelope{MessageID: "msg_0198f0e0-0000-7000-8000-000000000121", Kind: mektup.KindMessage, FromEndpointID: local.ID, From: "codex://" + local.ID + "/thread/source", FromKind: "agent", ToEndpointID: mektup.NewEndpointID(), To: "codex://wrong/thread/wrong", RequestedTarget: "source", ReplyRequested: true, ReplyEndpointID: local.ID, ReplyTo: "codex://" + local.ID + "/thread/source", ReplyCustodyEndpointID: local.ID, ReplyCustodyStoreID: storeID, Body: "question", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	original.PayloadBytes = uint64(len(original.Body))
+	digest := sha256.Sum256([]byte(original.Body))
+	original.PayloadSHA256 = "sha256:" + hex.EncodeToString(digest[:])
+	original.Kind = mektup.KindReply
+	original.InReplyTo = mektup.NewMessageID()
+	original.ReplyStatus = mektup.ReplySuccess
+	envelopeText, err := mektup.RenderEnvelope(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content, _ := json.Marshal([]map[string]string{{"type": "text", "text": string(envelopeText)}})
+	item, _ := json.Marshal(map[string]any{"type": "userMessage", "id": "item_0198f0e0-0000-7000-8000-000000000122", "clientId": original.MessageID, "content": json.RawMessage(content)})
+	items := json.RawMessage("[" + string(item) + "]")
+	session := originalMessagingSession{messagingFakeSession: messagingFakeSession{endpointID: local.ID}, history: []codexapi.Turn{{ID: "turn_0198f0e0-0000-7000-8000-000000000123", RawObject: codexapi.RawObject{Fields: map[string]json.RawMessage{"items": items}}}}}
+	pool := runtime.NewConnectionPool(runtime.SessionFactoryFunc(func(context.Context, endpoint.Endpoint) (runtime.Session, error) { return session, nil }), func(string) (endpoint.Endpoint, error) { return local, nil })
+	defer pool.Close(context.Background())
+	history := runtimeHistory{observe: &runtime.ObservationAdapter{Pool: pool}}
+	reviewItems, err := history.FullHistory(context.Background(), local.ID, "source")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reviewItems) != 0 {
+		t.Fatalf("wrong envelope destination was relabeled as pinned endpoint/thread: %+v", reviewItems)
+	}
+}
+
 func newFakeTransport() *fakeTransport {
 	return &fakeTransport{reads: make(chan appserver.Frame, 16), done: make(chan struct{})}
 }
