@@ -179,8 +179,10 @@ func TestRawServerErrorIsNestedWithoutChangingStableCode(t *testing.T) {
 	if rawErr.Server == nil || rawErr.Server.Code != server.Code || rawErr.Server.Message != server.Message || string(rawErr.Server.Data) != string(server.Data) || rawErr.Server.Generation != server.Generation {
 		t.Fatalf("server evidence = %+v", rawErr.Server)
 	}
-	if nested, ok := rawErr.Details["serverError"].(map[string]any); !ok || nested["data"] != nil {
-		t.Fatalf("stable details duplicated server data: %#v", rawErr.Details["serverError"])
+	nested, ok := rawErr.Details["serverError"].(map[string]any)
+	inlineData, dataOK := nested["data"].(json.RawMessage)
+	if !ok || nested["message"] != server.Message || !dataOK || string(inlineData) != string(server.Data) {
+		t.Fatalf("stable details omitted bounded server evidence: %#v", rawErr.Details["serverError"])
 	}
 	if !errors.Is(err, server) && !errors.Is(err, caller.err) {
 		t.Fatalf("server error was not retained in unwrap chain: %v", err)
@@ -236,6 +238,38 @@ func TestOversizedServerErrorMessageSpillsCompleteEvidenceWithoutInlineDuplicate
 	contents, err := os.ReadFile(rawErr.Server.EvidenceArtifact.Path)
 	if err != nil || !bytes.Contains(contents, []byte(message)) || !bytes.Contains(contents, data) {
 		t.Fatalf("spilled server evidence = %q err=%v", contents, err)
+	}
+}
+
+func TestStableServerErrorPreservesSmallInlineMessageAndData(t *testing.T) {
+	server := &appserver.ServerError{ID: "rpc-inline", Code: -32603, Message: "precise_reason", Data: json.RawMessage(`{"diagnostic":"exact-detail"}`)}
+	caller := &recordingCaller{err: &appserver.CallError{Server: server, Evidence: appserver.WriteEvidence{Phase: appserver.WriteComplete}}}
+	_, err := Execute(context.Background(), caller, Request{Method: "thread/read"})
+	rawErr := requireRawError(t, err)
+	encoded, err := json.Marshal(rawErr.Stable())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(encoded, []byte("precise_reason")) || !bytes.Contains(encoded, []byte("exact-detail")) {
+		t.Fatalf("canonical error lost bounded server evidence: %s", encoded)
+	}
+}
+
+func TestFailedServerErrorSpillDoesNotRetainOversizedSerializableMessage(t *testing.T) {
+	message := strings.Repeat("x", 1<<20)
+	server := &appserver.ServerError{ID: "rpc-failed-spill", Code: -32603, Message: message}
+	caller := &recordingCaller{err: &appserver.CallError{Server: server, Evidence: appserver.WriteEvidence{Phase: appserver.WriteComplete}}}
+	_, err := Execute(context.Background(), caller, Request{Method: "thread/read", Output: OutputOptions{InlineLimit: 32}})
+	rawErr := requireRawError(t, err)
+	encoded, err := json.Marshal(rawErr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) > 8192 {
+		t.Fatalf("failed retention left %d-byte serialized error", len(encoded))
+	}
+	if rawErr.Server == nil || rawErr.Server.Message != "" || rawErr.Server.MessageBytes != int64(len(message)) || rawErr.Server.MessageSHA256 == "" {
+		t.Fatalf("failed retention evidence = %+v", rawErr.Server)
 	}
 }
 

@@ -439,6 +439,11 @@ func retainServerError(ctx context.Context, evidence *ServerErrorEvidence, raw j
 		digest := sha256.Sum256(document)
 		evidence.EvidenceBytes = int64(len(document))
 		evidence.EvidenceSHA256 = "sha256:" + hex.EncodeToString(digest[:])
+		// From this point the complete payload is represented only by bounded
+		// metadata plus the attempted artifact. Even a publication failure must
+		// not leave the oversized message serializable in Error.Server.
+		evidence.Message = ""
+		evidence.Data = nil
 		spillOptions := options
 		if spillOptions.Name == "" {
 			spillOptions.Name = "raw-rpc-error-" + hex.EncodeToString(digest[:]) + ".json"
@@ -447,8 +452,6 @@ func retainServerError(ctx context.Context, evidence *ServerErrorEvidence, raw j
 		if err != nil {
 			return err
 		}
-		evidence.Message = ""
-		evidence.Data = nil
 		evidence.EvidenceArtifact = &receipt
 		return nil
 	}
@@ -492,12 +495,18 @@ func writeArtifact(ctx context.Context, raw json.RawMessage, options OutputOptio
 
 func serverEvidenceDetails(evidence *ServerErrorEvidence) map[string]any {
 	details := map[string]any{"id": evidence.ID, "code": evidence.Code, "messageBytes": evidence.MessageBytes, "messageSHA256": evidence.MessageSHA256}
+	if evidence.Message != "" {
+		details["message"] = evidence.Message
+	}
 	if evidence.Generation != 0 {
 		details["generation"] = evidence.Generation
 	}
 	if evidence.DataBytes != 0 {
 		details["dataBytes"] = evidence.DataBytes
 		details["dataSHA256"] = evidence.DataSHA256
+	}
+	if len(evidence.Data) != 0 {
+		details["data"] = append(json.RawMessage(nil), evidence.Data...)
 	}
 	if evidence.DataArtifact != nil {
 		details["dataArtifact"] = evidence.DataArtifact
