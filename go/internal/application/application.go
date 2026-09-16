@@ -22,6 +22,7 @@ import (
 	"time"
 
 	mektup "github.com/agensfield/mektup/go"
+	"github.com/agensfield/mektup/go/appserver"
 	"github.com/agensfield/mektup/go/internal/artifact"
 	"github.com/agensfield/mektup/go/internal/cli"
 	"github.com/agensfield/mektup/go/internal/codexapi"
@@ -31,6 +32,7 @@ import (
 	"github.com/agensfield/mektup/go/internal/endpoint"
 	"github.com/agensfield/mektup/go/internal/executor"
 	"github.com/agensfield/mektup/go/internal/journal"
+	"github.com/agensfield/mektup/go/internal/logging"
 	"github.com/agensfield/mektup/go/internal/messageexecutor"
 	"github.com/agensfield/mektup/go/internal/rawrpc"
 	"github.com/agensfield/mektup/go/internal/receipts"
@@ -47,6 +49,7 @@ import (
 // direct Unix socket and SSH routes use the bounded OpenSSH proxy bridge.
 type Options struct {
 	Input        io.Reader
+	DebugWriter  io.Writer
 	CodexHome    string
 	ConfigPath   string
 	StateDir     string
@@ -120,7 +123,43 @@ func (e *Environment) Execute(ctx context.Context, inv cli.Invocation) (result c
 	if resources.messaging != nil {
 		return resources.messaging.Execute(ctx, inv)
 	}
-	return executor.New(resources.Ports()).Execute(ctx, inv)
+	result, execErr = executor.New(resources.Ports()).Execute(ctx, inv)
+	if resources.audit != nil {
+		var auditErr error
+		result, auditErr = resources.decorateAudit(ctx, result)
+		if execErr == nil && auditErr != nil {
+			return result, auditErr
+		}
+		if execErr != nil && auditErr != nil {
+			execErr = errors.Join(execErr, auditErr)
+		}
+	}
+	return result, execErr
+}
+
+func (r *resources) decorateAudit(ctx context.Context, result cli.ExecutionResult) (cli.ExecutionResult, error) {
+	receipt, err := r.audit.Finalize(ctx)
+	if err != nil {
+		return result, err
+	}
+	marker := auditMarker(receipt)
+	warning := map[string]any{"code": string(mektup.WarningAuditLoggingEnabled), "message": "sensitive audit capture enabled", "details": map[string]any{"networkTelemetry": false}}
+	for i := range result.Events {
+		if machine, ok := result.Events[i].Machine.(map[string]any); ok {
+			machine["warnings"] = appendWireWarning(machine["warnings"], warning)
+			if data, ok := machine["data"].(map[string]any); ok {
+				data["audit"] = marker
+			}
+		}
+	}
+	if result.Receipt != nil {
+		if value, ok := result.Receipt.(mektup.Receipt); ok {
+			value.Warnings = append(value.Warnings, mektup.Warning{Code: mektup.WarningAuditLoggingEnabled, Message: "sensitive audit capture enabled", Details: map[string]any{"audit": marker}})
+			value.Evidence = append(value.Evidence, mektup.EvidenceRecord{State: value.State, At: time.Now().UTC().Format(time.RFC3339Nano), Kind: "audit", Details: marker})
+			result.Receipt = value
+		}
+	}
+	return result, nil
 }
 
 // ExecuteStream keeps the application resources alive while a messaging
@@ -280,7 +319,73 @@ type resources struct {
 	artifact  *artifact.Store
 	pool      *runtime.ConnectionPool
 	messaging *messageexecutor.Executor
+	logger    *logging.Logger
+	audit     *auditCapture
 	ports     resourcePorts
+}
+
+type auditCapture struct {
+	mu         sync.Mutex
+	logger     *logging.Logger
+	invocation string
+	buf        bytes.Buffer
+	max        int64
+	final      *logging.AuditReceipt
+	err        error
+}
+
+func (a *auditCapture) Observe(direction appserver.FrameDirection, frame appserver.Frame) error {
+	if a == nil {
+		return nil
+	}
+	label := "inbound"
+	if direction == appserver.FrameOutbound {
+		label = "outbound"
+	}
+	record := append([]byte(fmt.Sprintf("%s text %d\n", label, len(frame.Payload))), frame.Payload...)
+	record = append(record, '\n')
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.err != nil {
+		return a.err
+	}
+	if int64(a.buf.Len()+len(record)) > a.max {
+		a.err = logging.ErrTooLarge
+		return a.err
+	}
+	_, _ = a.buf.Write(record)
+	return nil
+}
+
+func (a *auditCapture) Finalize(ctx context.Context) (logging.AuditReceipt, error) {
+	if a == nil {
+		return logging.AuditReceipt{}, nil
+	}
+	a.mu.Lock()
+	if a.final != nil || a.err != nil {
+		var receipt logging.AuditReceipt
+		if a.final != nil {
+			receipt = *a.final
+		}
+		err := a.err
+		a.mu.Unlock()
+		return receipt, err
+	}
+	body := append([]byte(nil), a.buf.Bytes()...)
+	a.mu.Unlock()
+	receipt, err := a.logger.Audit(ctx, logging.AuditOptions{InvocationID: a.invocation, Body: bytes.NewReader(body), MaxBytes: a.max})
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if err != nil {
+		a.err = err
+		return logging.AuditReceipt{}, err
+	}
+	a.final = &receipt
+	return receipt, nil
+}
+
+func auditMarker(receipt logging.AuditReceipt) map[string]any {
+	return map[string]any{"path": receipt.Path, "bytes": receipt.Bytes, "sha256": receipt.SHA256, "complete": receipt.Complete, "mode": receipt.Mode.Mode, "sensitive": receipt.Mode.Sensitive, "networkTelemetry": receipt.Mode.NetworkTelemetry}
 }
 
 func (r *resources) Ports() executor.Ports { return r.ports.Ports }
@@ -358,6 +463,7 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	e.debug(inv, "resource_open", map[string]string{"state": stateDir})
 	var j *journal.Journal
 	var artifacts *artifact.Store
 	var err error
@@ -380,14 +486,43 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 			return nil, fmt.Errorf("open application artifact store: %w", err)
 		}
 	}
+	var logger *logging.Logger
+	var audit *auditCapture
+	if needsLogging(inv) {
+		config := logging.DefaultConfig(filepath.Join(stateDir, "logs"))
+		logger, err = logging.New(config)
+		if err != nil {
+			if j != nil {
+				_ = j.Close()
+			}
+			if artifacts != nil {
+				_ = artifacts.Close()
+			}
+			if inv.Global.Audit {
+				return nil, fmt.Errorf("initialize audit logging: %w", err)
+			}
+			e.debug(inv, "logging_setup_failed", map[string]string{"error": err.Error()})
+		} else {
+			if logErr := logger.Log("command.start", map[string]string{"command": inv.Command, "audit": fmt.Sprint(inv.Global.Audit)}); logErr != nil {
+				e.debug(inv, "logging_write_failed", map[string]string{"error": logErr.Error()})
+			}
+			if inv.Global.Audit {
+				audit = &auditCapture{logger: logger, invocation: fmt.Sprintf("audit-%d", time.Now().UnixNano()), max: config.AuditMaxBytes}
+			}
+		}
+	}
 
 	store := endpoint.NewStoreWithIdentityHome(configPath, stateDir, e.options.IdentityHome)
 	facts := &connectionFacts{values: make(map[string]connection.Info)}
 	pins := &receiptPins{values: make(map[string]endpoint.Endpoint)}
-	connections := &connectionFactory{store: store, codexHome: e.options.CodexHome, options: e.options.Connection, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute, facts: facts, pins: pins}
+	connectionOptions := e.options.Connection
+	if audit != nil {
+		connectionOptions.FrameObserver = audit.Observe
+	}
+	connections := &connectionFactory{store: store, codexHome: e.options.CodexHome, options: connectionOptions, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute, facts: facts, pins: pins}
 	var receipts *receiptStore
 	if j != nil {
-		receipts = &receiptStore{journal: j, endpoints: store, codexHome: e.options.CodexHome, facts: facts, pins: pins}
+		receipts = &receiptStore{journal: j, endpoints: store, codexHome: e.options.CodexHome, facts: facts, pins: pins, audit: audit}
 	}
 	endpoints := endpointPort{store: store, receipts: receipts}
 	input := executor.ReaderInput{In: e.options.Input}
@@ -432,7 +567,29 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 			return nil, err
 		}
 	}
-	return &resources{journal: j, artifact: artifacts, pool: pool, messaging: messaging, ports: resourcePorts{Ports: ports}}, nil
+	return &resources{journal: j, artifact: artifacts, pool: pool, messaging: messaging, logger: logger, audit: audit, ports: resourcePorts{Ports: ports}}, nil
+}
+
+func needsLogging(inv cli.Invocation) bool {
+	if isMessaging(inv) || (inv.Command == "doctor" && !hasOption(inv, "fix")) || (inv.Command == "storage" && len(inv.Position) > 0 && inv.Position[0] == "check") {
+		return inv.Global.Audit
+	}
+	return true
+}
+
+func (e *Environment) debug(inv cli.Invocation, event string, fields map[string]string) {
+	if !inv.Global.Debug || e.options.DebugWriter == nil {
+		return
+	}
+	clean := make([]string, 0, len(fields)+1)
+	clean = append(clean, "command="+inv.Command, "event="+event)
+	for key, value := range fields {
+		if strings.Contains(strings.ToLower(key), "body") || strings.Contains(strings.ToLower(key), "raw") || strings.Contains(strings.ToLower(key), "param") {
+			continue
+		}
+		clean = append(clean, key+"="+logging.RedactForDebug(key, value))
+	}
+	_, _ = fmt.Fprintln(e.options.DebugWriter, "mektup debug:", strings.Join(clean, " "))
 }
 
 func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, j *journal.Journal, store endpoint.EndpointStore, artifacts *artifact.Store, input executor.ReaderInput, facts *connectionFacts) (*runtime.ConnectionPool, *messageexecutor.Executor, error) {
@@ -1376,6 +1533,7 @@ type receiptStore struct {
 	codexHome string
 	facts     *connectionFacts
 	pins      *receiptPins
+	audit     *auditCapture
 }
 
 type receiptPins struct {
@@ -1437,6 +1595,14 @@ func (s receiptStore) save(ctx context.Context, operation, endpointSelector stri
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	identity := mektup.ReceiptIdentity{EndpointID: ep.ID, Alias: ep.Alias, Transport: string(ep.Route.Kind), Requested: endpointSelector, Resolved: ep.Alias}
 	warnings := []mektup.Warning{}
+	var audit logging.AuditReceipt
+	if s.audit != nil {
+		audit, err = s.audit.Finalize(ctx)
+		if err != nil {
+			return mektup.Receipt{}, err
+		}
+		warnings = append(warnings, mektup.Warning{Code: mektup.WarningAuditLoggingEnabled, Message: "sensitive audit capture enabled", Details: map[string]any{"audit": auditMarker(audit)}})
+	}
 	if info, found := s.facts.Get(ep.ID); found {
 		identity.ServerVersion = info.DaemonVersion
 		identity.Compatibility = string(info.Compatibility.Class)
@@ -1449,6 +1615,9 @@ func (s receiptStore) save(ctx context.Context, operation, endpointSelector stri
 		Source: identity, Target: identity,
 		Message:  mektup.ReceiptMessage{MessageID: mektup.NewMessageID(), Kind: string(mektup.KindMessage), PayloadBytes: uint64(len(encoded)), PayloadSHA256: "sha256:" + hex.EncodeToString(digest[:])},
 		Evidence: []mektup.EvidenceRecord{{State: state, At: now, Kind: operation}}, Warnings: warnings, CreatedAt: now, UpdatedAt: now,
+	}
+	if s.audit != nil {
+		receipt.Evidence = append(receipt.Evidence, mektup.EvidenceRecord{State: state, At: now, Kind: "audit", Details: auditMarker(audit)})
 	}
 	if err := s.journal.PutReceipt(ctx, receipt); err != nil {
 		return mektup.Receipt{}, err

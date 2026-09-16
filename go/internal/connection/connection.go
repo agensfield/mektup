@@ -93,6 +93,7 @@ type Options struct {
 	HandshakeTimeout          time.Duration
 	EventCapacity             int
 	WriterCapacity            int
+	FrameObserver             appserver.FrameObserver
 	Dialer                    Dialer
 	ClientDialer              ClientDialer
 	Proxy                     ProxyEvidence
@@ -250,6 +251,7 @@ func Connect(ctx context.Context, route endpoint.Route, options Options) (*Conne
 		HandshakeTimeout:          options.HandshakeTimeout,
 		EventCapacity:             options.EventCapacity,
 		WriterCapacity:            options.WriterCapacity,
+		FrameObserver:             options.FrameObserver,
 	}
 	var (
 		client *appserver.Client

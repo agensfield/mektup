@@ -40,6 +40,7 @@ func run(ctx context.Context, args []string, input io.Reader, output, errorOutpu
 	app.Err = errorOutput
 	environment := application.New(application.Options{
 		Input:           input,
+		DebugWriter:     errorOutput,
 		CodexHome:       os.Getenv("CODEX_HOME"),
 		CurrentThreadID: os.Getenv("CODEX_THREAD_ID"),
 		AgentMode:       os.Getenv("MEKTUP_AGENT") == "1",

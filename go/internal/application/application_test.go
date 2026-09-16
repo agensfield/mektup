@@ -28,6 +28,7 @@ import (
 	"github.com/agensfield/mektup/go/internal/endpoint"
 	"github.com/agensfield/mektup/go/internal/executor"
 	"github.com/agensfield/mektup/go/internal/journal"
+	"github.com/agensfield/mektup/go/internal/logging"
 	"github.com/agensfield/mektup/go/internal/rawrpc"
 	"github.com/agensfield/mektup/go/internal/runtime"
 	"github.com/agensfield/mektup/go/internal/sshproxy"
@@ -94,6 +95,39 @@ func TestReceiptHistoryRejectsWrongEnvelopeDestination(t *testing.T) {
 
 func newFakeTransport() *fakeTransport {
 	return &fakeTransport{reads: make(chan appserver.Frame, 16), done: make(chan struct{})}
+}
+
+func TestAuditCaptureFinalizesExactFramedTrafficAndOverlimitIsAbsent(t *testing.T) {
+	logger, err := logging.New(logging.DefaultConfig(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	capture := &auditCapture{logger: logger, invocation: "audit-test", max: logging.DefaultAuditMaxBytes}
+	if err := capture.Observe(appserver.FrameOutbound, appserver.Frame{Type: appserver.FrameText, Payload: []byte(`{"method":"x","params":{"secret":"keep-in-audit"}}`)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := capture.Observe(appserver.FrameInbound, appserver.Frame{Type: appserver.FrameText, Payload: []byte(`{"result":{"ok":true}}`)}); err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := capture.Finalize(context.Background())
+	if err != nil || !receipt.Complete || receipt.Bytes == 0 || !receipt.Mode.Sensitive || receipt.Mode.NetworkTelemetry {
+		t.Fatalf("audit receipt=%+v err=%v", receipt, err)
+	}
+	data, err := os.ReadFile(receipt.Path)
+	if err != nil || !strings.Contains(string(data), "outbound text") || !strings.Contains(string(data), "inbound text") || !strings.Contains(string(data), "keep-in-audit") {
+		t.Fatalf("audit body=%s err=%v", data, err)
+	}
+	tinyLogger, err := logging.New(logging.Config{Dir: t.TempDir(), AuditMaxBytes: 4})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tiny := &auditCapture{logger: tinyLogger, invocation: "audit-too-large", max: 4}
+	if err := tiny.Observe(appserver.FrameOutbound, appserver.Frame{Type: appserver.FrameText, Payload: []byte("too-large")}); err == nil {
+		t.Fatal("overlimit frame was accepted")
+	}
+	if _, err := os.Stat(filepath.Join(tinyLogger.Config().Dir, "audit", "audit-too-large.audit")); !os.IsNotExist(err) {
+		t.Fatalf("overlimit audit artifact exists: %v", err)
+	}
 }
 
 func (f *fakeTransport) Read(ctx context.Context) (appserver.Frame, error) {

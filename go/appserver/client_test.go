@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -120,6 +122,30 @@ func TestInitializeRetainsEarlyEventsAndParsesMetadata(t *testing.T) {
 		t.Fatalf("initialized write = %+v", initialized)
 	}
 	_ = c.Close(context.Background())
+}
+
+func TestFrameObserverSeesExactInboundAndOutboundTextFrames(t *testing.T) {
+	f := newFakeTransport()
+	var observed []string
+	c := New(f, Options{FrameObserver: func(direction FrameDirection, frame Frame) error {
+		observed = append(observed, fmt.Sprintf("%d:%s", direction, frame.Payload))
+		return nil
+	}})
+	f.onWrite = func(payload []byte) error {
+		var msg map[string]any
+		_ = json.Unmarshal(payload, &msg)
+		if msg["method"] == "initialize" {
+			pushJSON(f, response(`"initialize"`, `{"userAgent":"codex/0.154.0"}`))
+		}
+		return nil
+	}
+	if _, err := c.Initialize(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close(context.Background())
+	if len(observed) < 3 || !strings.Contains(observed[0], `"method":"initialize"`) || !strings.Contains(observed[1], `"userAgent":"codex/0.154.0"`) || !strings.Contains(observed[2], `"method":"initialized"`) {
+		t.Fatalf("observed frames = %#v", observed)
+	}
 }
 
 func TestRawResultServerErrorAndIDs(t *testing.T) {

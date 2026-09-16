@@ -358,6 +358,10 @@ func redact(key, value string) string {
 	return secretPattern.ReplaceAllString(value, "[REDACTED]")
 }
 
+// RedactForDebug applies the same secret redaction as metadata logging without
+// exposing the logger or its file sinks to diagnostic callers.
+func RedactForDebug(key, value string) string { return redact(key, value) }
+
 func copyBounded(ctx context.Context, dst io.Writer, src io.Reader, max int64) (int64, error) {
 	buf := make([]byte, 32*1024)
 	var total int64

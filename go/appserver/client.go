@@ -43,6 +43,19 @@ type Frame struct {
 	Payload []byte
 }
 
+type FrameDirection uint8
+
+const (
+	FrameOutbound FrameDirection = iota
+	FrameInbound
+)
+
+// FrameObserver sees exact text-frame payloads. Outbound callbacks run before
+// the transport write and may reject it; inbound callbacks run after read and
+// may terminate the generation. Observers are diagnostics only and never
+// answer server requests.
+type FrameObserver func(FrameDirection, Frame) error
+
 // Transport is intentionally small so tests can inject a deterministic
 // transport without opening a socket. Read must continue draining the peer;
 // Close must unblock a pending Read.
@@ -269,6 +282,7 @@ type Options struct {
 	WriterCapacity            int
 	ReadByteBudget            int64
 	EventByteBudget           int64
+	FrameObserver             FrameObserver
 }
 
 func (o Options) normalized() Options {
@@ -926,6 +940,15 @@ func (c *Client) readLoop() {
 			}
 			return
 		}
+		if c.options.FrameObserver != nil {
+			if observeErr := c.options.FrameObserver(FrameInbound, Frame{Type: frame.Type, Payload: append([]byte(nil), frame.Payload...)}); observeErr != nil {
+				select {
+				case c.reads <- readResult{err: observeErr}:
+				case <-c.done:
+				}
+				return
+			}
+		}
 		select {
 		case c.reads <- readResult{frame: frame, bytes: size}:
 		case <-c.done:
@@ -1086,12 +1109,17 @@ func (c *Client) pump() {
 				payload, err := marshalRequest(cmd.req)
 				writeStarted := err == nil
 				if writeStarted {
-					// Once ownership enters the transport, a concurrent disconnect
-					// cannot prove that no bytes crossed the boundary.
-					call.phase = WriteMayHaveWritten
-					writeCtx, writeCancel := c.beginWrite(cmd.ctx, cmd.key, true)
-					err = c.transport.Write(writeCtx, payload)
-					c.endWrite(cmd.key, writeCancel)
+					if c.options.FrameObserver != nil {
+						err = c.options.FrameObserver(FrameOutbound, Frame{Type: FrameText, Payload: append([]byte(nil), payload...)})
+					}
+					if err == nil {
+						// Once ownership enters the transport, a concurrent disconnect
+						// cannot prove that no bytes crossed the boundary.
+						call.phase = WriteMayHaveWritten
+						writeCtx, writeCancel := c.beginWrite(cmd.ctx, cmd.key, true)
+						err = c.transport.Write(writeCtx, payload)
+						c.endWrite(cmd.key, writeCancel)
+					}
 				}
 				if err != nil {
 					phase := WriteProvenBeforeWrite
@@ -1113,9 +1141,14 @@ func (c *Client) pump() {
 			case commandNotify:
 				payload, err := marshalNotification(cmd.notify)
 				if err == nil {
-					writeCtx, writeCancel := c.beginWrite(cmd.ctx, "", false)
-					err = c.transport.Write(writeCtx, payload)
-					c.endWrite("", writeCancel)
+					if c.options.FrameObserver != nil {
+						err = c.options.FrameObserver(FrameOutbound, Frame{Type: FrameText, Payload: append([]byte(nil), payload...)})
+					}
+					if err == nil {
+						writeCtx, writeCancel := c.beginWrite(cmd.ctx, "", false)
+						err = c.transport.Write(writeCtx, payload)
+						c.endWrite("", writeCancel)
+					}
 				}
 				if cmd.notifyDone != nil {
 					cmd.notifyDone <- err
