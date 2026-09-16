@@ -7,6 +7,8 @@ package rawrpc
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -378,7 +380,8 @@ func retainResult(ctx context.Context, response *Response, raw json.RawMessage, 
 	}
 	name := options.Name
 	if name == "" {
-		name = fmt.Sprintf("raw-rpc-%d.json", atomic.AddUint64(&nextID, 1))
+		digest := sha256.Sum256(raw)
+		name = "raw-rpc-" + hex.EncodeToString(digest[:]) + ".json"
 	}
 	var receipt artifact.Receipt
 	var err error

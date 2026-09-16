@@ -233,6 +233,43 @@ func TestLargeResponseSpillIncludesDigestAndPrivateArtifact(t *testing.T) {
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("artifact stat=%+v err=%v", info, err)
 	}
+	// A repeated deterministic spill is a successful reuse, not an output
+	// overflow caused by the existing path.
+	repeated, err := Execute(context.Background(), &recordingCaller{result: readResult(string(payload))}, Request{Method: "thread/read", Output: OutputOptions{InlineLimit: 8, Store: store, Name: "response.json"}})
+	if err != nil || repeated.Artifact == nil || repeated.Artifact.Path != response.Artifact.Path || repeated.Artifact.SHA256 != response.Artifact.SHA256 {
+		t.Fatalf("repeated spill response=%+v err=%v", repeated, err)
+	}
+}
+
+func TestDefaultSpillNameIsContentAddressedAcrossStoreReopen(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "artifacts")
+	large := func(value string) json.RawMessage {
+		return json.RawMessage(`{"result":"` + strings.Repeat(value, 64) + `"}`)
+	}
+	firstStore, err := artifact.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstResponse, err := Execute(context.Background(), &recordingCaller{result: readResult(string(large("a")))}, Request{Method: "thread/read", Output: OutputOptions{InlineLimit: 8, Store: firstStore}})
+	if err != nil || firstResponse.Artifact == nil {
+		t.Fatalf("first spill response=%+v err=%v", firstResponse, err)
+	}
+	if err := firstStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := artifact.NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repeated, err := Execute(context.Background(), &recordingCaller{result: readResult(string(large("a")))}, Request{Method: "thread/read", Output: OutputOptions{InlineLimit: 8, Store: reopened}})
+	if err != nil || repeated.Artifact == nil || repeated.Artifact.Path != firstResponse.Artifact.Path {
+		t.Fatalf("reopened identical spill response=%+v err=%v", repeated, err)
+	}
+	different, err := Execute(context.Background(), &recordingCaller{result: readResult(string(large("b")))}, Request{Method: "thread/read", Output: OutputOptions{InlineLimit: 8, Store: reopened}})
+	if err != nil || different.Artifact == nil || different.Artifact.Path == repeated.Artifact.Path {
+		t.Fatalf("different spill response=%+v err=%v", different, err)
+	}
 }
 
 func TestExplicitOutputNoClobberAndForce(t *testing.T) {

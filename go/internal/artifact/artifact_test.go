@@ -51,16 +51,24 @@ func TestSpillReceiptAndPrivatePermissions(t *testing.T) {
 	}
 }
 
-func TestSpillRefusesOverwriteAndRPCForceReplaces(t *testing.T) {
+func TestSpillReusesIdenticalContentAndRPCForceReplaces(t *testing.T) {
 	store, err := NewStore(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Spill(context.Background(), "out", strings.NewReader("one"), Options{}); err != nil {
+	first, err := store.Spill(context.Background(), "out", strings.NewReader("one"), Options{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Spill(context.Background(), "out", strings.NewReader("two"), Options{}); !errors.Is(err, ErrExists) {
-		t.Fatalf("second spill error = %v, want ErrExists", err)
+	second, err := store.Spill(context.Background(), "out", strings.NewReader("one"), Options{})
+	if err != nil || second.Path != first.Path || second.SHA256 != first.SHA256 || !second.Complete {
+		t.Fatalf("identical spill receipt=%+v err=%v", second, err)
+	}
+	if _, err := store.Spill(context.Background(), "out", strings.NewReader("two"), Options{}); !errors.Is(err, ErrConflict) || !errors.Is(err, ErrExists) {
+		t.Fatalf("mismatched spill error = %v, want conflict and exists", err)
+	}
+	if contents, err := os.ReadFile(filepath.Join(store.Root(), "out")); err != nil || string(contents) != "one" {
+		t.Fatalf("mismatched spill changed existing content=%q err=%v", contents, err)
 	}
 	if _, err := store.WriteRPCOutput(context.Background(), "out", strings.NewReader("two"), RPCOutputOptions{Force: true}); err != nil {
 		t.Fatal(err)
@@ -147,7 +155,7 @@ func TestConcurrentNoForcePublicationHasOneWinner(t *testing.T) {
 	for err := range results {
 		if err == nil {
 			winners++
-		} else if !errors.Is(err, ErrExists) {
+		} else if !errors.Is(err, ErrExists) && !errors.Is(err, ErrConflict) {
 			t.Fatalf("concurrent writer error = %v", err)
 		}
 	}
@@ -157,6 +165,72 @@ func TestConcurrentNoForcePublicationHasOneWinner(t *testing.T) {
 	b, err := os.ReadFile(filepath.Join(store.Root(), "same"))
 	if err != nil || len(b) != 100 {
 		t.Fatalf("published bytes = %d, err = %v", len(b), err)
+	}
+}
+
+func TestConcurrentSameContentSpillReusesOneAtomicWinner(t *testing.T) {
+	store, err := NewStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const writers = 12
+	const content = "same content across concurrent writers"
+	results := make(chan struct {
+		receipt Receipt
+		err     error
+	}, writers)
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			receipt, err := store.Spill(context.Background(), "same", strings.NewReader(content), Options{})
+			results <- struct {
+				receipt Receipt
+				err     error
+			}{receipt, err}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	var path, digest string
+	for result := range results {
+		if result.err != nil {
+			t.Fatalf("same-content concurrent spill error = %v", result.err)
+		}
+		if path == "" {
+			path, digest = result.receipt.Path, result.receipt.SHA256
+		}
+		if result.receipt.Path != path || result.receipt.SHA256 != digest || result.receipt.Bytes != int64(len(content)) {
+			t.Fatalf("inconsistent reused receipt = %+v", result.receipt)
+		}
+	}
+}
+
+func TestSpillExistingSymlinkNonRegularAndWrongModeFailClosed(t *testing.T) {
+	root := t.TempDir()
+	store, err := NewStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "wrong-mode"), []byte("same"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Spill(context.Background(), "wrong-mode", strings.NewReader("same"), Options{}); !errors.Is(err, ErrWrongMode) {
+		t.Fatalf("wrong-mode spill error = %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(root, "directory"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Spill(context.Background(), "directory", strings.NewReader("same"), Options{}); !errors.Is(err, ErrNonRegular) {
+		t.Fatalf("directory spill error = %v", err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, "symlink")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Spill(context.Background(), "symlink", strings.NewReader("same"), Options{}); !errors.Is(err, ErrSymlink) {
+		t.Fatalf("symlink spill error = %v", err)
 	}
 }
 

@@ -33,6 +33,10 @@ var (
 	ErrIncomplete  = errors.New("artifact write is incomplete")
 	ErrSymlink     = errors.New("symlinks are not allowed in managed artifact paths")
 	ErrInvalidName = errors.New("invalid artifact name")
+	ErrNonRegular  = errors.New("artifact destination is not a regular file")
+	ErrWrongMode   = errors.New("artifact destination has wrong permissions")
+	ErrConflict    = errors.New("artifact existing content conflicts")
+	ErrCorrupt     = errors.New("artifact existing content is corrupt")
 )
 
 // Options controls a managed artifact write. Force only applies to explicit
@@ -255,7 +259,11 @@ func (s *Store) write(ctx context.Context, name string, src io.Reader, opts Opti
 	}
 	targetName := filepath.Join(parts...)
 	target := filepath.Join(s.root, targetName)
-	if err := checkRootTarget(s.fs, targetName, opts.Force); err != nil {
+	if !rpc {
+		if err := checkSpillTarget(s.fs, targetName); err != nil {
+			return zero, err
+		}
+	} else if err := checkRootTarget(s.fs, targetName, opts.Force); err != nil {
 		return zero, err
 	}
 	tmpName, tmp, err := createRootTemp(s.fs, parentName)
@@ -283,7 +291,11 @@ func (s *Store) write(ctx context.Context, name string, src io.Reader, opts Opti
 	}
 	// A second target check catches a destination appearing after the first
 	// check. Link gives non-force writes no-clobber publication semantics.
-	if err := checkRootTarget(s.fs, targetName, opts.Force); err != nil {
+	if !rpc {
+		if err := checkSpillTarget(s.fs, targetName); err != nil {
+			return zero, err
+		}
+	} else if err := checkRootTarget(s.fs, targetName, opts.Force); err != nil {
 		return zero, err
 	}
 	if opts.Force {
@@ -292,6 +304,9 @@ func (s *Store) write(ctx context.Context, name string, src io.Reader, opts Opti
 		}
 	} else if err := s.fs.Link(tmpName, targetName); err != nil {
 		if errors.Is(err, os.ErrExist) {
+			if !rpc {
+				return s.reuseExisting(ctx, targetName, n, h.Sum(nil), opts)
+			}
 			return zero, ErrExists
 		}
 		return zero, fmt.Errorf("artifact: publish without replacement: %w", err)
@@ -456,6 +471,103 @@ func checkRootTarget(root *os.Root, name string, force bool) error {
 		return ErrExists
 	}
 	return nil
+}
+
+// checkSpillTarget permits an existing owner-private regular file to reach
+// the post-write content comparison. Other existing identities fail closed
+// before any source bytes are published or reused.
+func checkSpillTarget(root *os.Root, name string) error {
+	info, err := root.Lstat(name)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("artifact: inspect destination: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return ErrSymlink
+	}
+	if !info.Mode().IsRegular() {
+		return ErrNonRegular
+	}
+	if info.Mode().Perm() != 0o600 {
+		return ErrWrongMode
+	}
+	return nil
+}
+
+// reuseExisting verifies the winner of a concurrent no-force spill. It opens
+// the final component without following symlinks, checks owner-private regular
+// file identity, then hashes the opened file and confirms the path still names
+// that same file before returning a fresh complete receipt.
+func (s *Store) reuseExisting(ctx context.Context, name string, expectedBytes int64, expectedDigest []byte, opts Options) (Receipt, error) {
+	var zero Receipt
+	f, err := openExistingNoFollow(s.fs, name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return zero, fmt.Errorf("artifact: %w: %w", ErrExists, ErrConflict)
+		}
+		return zero, fmt.Errorf("artifact: inspect existing destination: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return zero, fmt.Errorf("artifact: stat existing destination: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return zero, ErrNonRegular
+	}
+	if info.Mode().Perm() != 0o600 {
+		return zero, ErrWrongMode
+	}
+	if info.Size() != expectedBytes {
+		return zero, fmt.Errorf("artifact: %w: %w: size %d != %d", ErrExists, ErrConflict, info.Size(), expectedBytes)
+	}
+	h := sha256.New()
+	readBytes, err := copyBounded(ctx, h, f, expectedBytes)
+	if err != nil {
+		return zero, fmt.Errorf("artifact: %w: %w: %v", ErrExists, ErrCorrupt, err)
+	}
+	if readBytes != expectedBytes || !equalBytes(h.Sum(nil), expectedDigest) {
+		return zero, fmt.Errorf("artifact: %w: %w", ErrExists, ErrConflict)
+	}
+	finalInfo, err := s.fs.Lstat(name)
+	if err != nil {
+		return zero, fmt.Errorf("artifact: verify existing destination: %w", err)
+	}
+	if finalInfo.Mode()&os.ModeSymlink != 0 {
+		return zero, ErrSymlink
+	}
+	if !finalInfo.Mode().IsRegular() {
+		return zero, ErrNonRegular
+	}
+	if finalInfo.Mode().Perm() != 0o600 || !os.SameFile(info, finalInfo) {
+		return zero, fmt.Errorf("artifact: %w: %w", ErrExists, ErrConflict)
+	}
+	if opts.MediaType == "" {
+		opts.MediaType = DefaultMediaType
+	}
+	return Receipt{
+		Path: targetPath(s.root, name), Bytes: expectedBytes,
+		SHA256:    "sha256:" + hex.EncodeToString(expectedDigest),
+		MediaType: opts.MediaType, Complete: true,
+		RetentionEligible: opts.RetentionEligible, SensitiveOutputPossible: opts.SensitiveOutputPossible,
+		CreatedAt: time.Now().UTC(),
+	}, nil
+}
+
+func targetPath(root, name string) string { return filepath.Join(root, filepath.FromSlash(name)) }
+
+func equalBytes(left, right []byte) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for i := range left {
+		if left[i] != right[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func ensurePrivateDir(dir string) error {

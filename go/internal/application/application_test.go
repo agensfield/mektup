@@ -18,6 +18,7 @@ import (
 
 	mektup "github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/appserver"
+	"github.com/agensfield/mektup/go/internal/artifact"
 	"github.com/agensfield/mektup/go/internal/cli"
 	"github.com/agensfield/mektup/go/internal/codexapi"
 	"github.com/agensfield/mektup/go/internal/connection"
@@ -78,6 +79,28 @@ func (c failingCloseConnection) Codex() executor.Codex { return nil }
 func (c failingCloseConnection) RPC() rawrpc.Caller    { return nil }
 func (c failingCloseConnection) Warnings() []string    { return nil }
 func (c failingCloseConnection) Close() error          { return c.closeErr }
+
+func TestArtifactSpillWriterReusesRepeatedContentAddressedReceipt(t *testing.T) {
+	store, err := artifact.NewStore(filepath.Join(t.TempDir(), "artifacts"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := artifactSpillWriter{store: store}
+	body := []byte("repeatable application artifact")
+	const digest = "sha256:repeatable"
+	first, err := writer.WriteSpill(context.Background(), body, digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := writer.WriteSpill(context.Background(), body, digest)
+	if err != nil || second != first {
+		t.Fatalf("repeated application spill first=%q second=%q err=%v", first, second, err)
+	}
+	info, err := os.Stat(first)
+	if err != nil || info.Mode().Perm() != 0o600 {
+		t.Fatalf("artifact info=%+v err=%v", info, err)
+	}
+}
 
 func (d *recordingDialer) DialClient(_ context.Context, route endpoint.Route, options appserver.Options) (*appserver.Client, error) {
 	d.mu.Lock()
