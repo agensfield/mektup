@@ -700,11 +700,17 @@ func TestMessagingCompositionRegistersOnlyReplyCustody(t *testing.T) {
 		t.Fatal(err)
 	}
 	registryPath := filepath.Join(root, "control-registry.json")
+	configured := endpoint.NewStore(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"))
+	configured.IdentityHome = filepath.Join(root, "identity")
+	local, err := configured.EnsureBuiltinLocal(codexHome)
+	if err != nil {
+		t.Fatal(err)
+	}
 	env := New(Options{CodexHome: codexHome, ConfigPath: filepath.Join(root, "endpoints.json"), StateDir: filepath.Join(root, "state"), IdentityHome: filepath.Join(root, "identity"), Registry: controlreceiver.FileRegistry{Path: registryPath}, CurrentThreadID: "source-thread", ThreadStateProbe: func(context.Context, string, string) (bool, bool, error) { return false, true, nil }, SessionFactory: runtime.SessionFactoryFunc(func(_ context.Context, ep endpoint.Endpoint) (runtime.Session, error) {
 		return messagingFakeSession{endpointID: ep.ID}, nil
 	})})
 	app := &cli.App{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}, Executor: env, Env: []string{"MEKTUP_AGENT=1", "CODEX_HOME=" + codexHome, "CODEX_THREAD_ID=source-thread", "MEKTUP_CONFIG=" + filepath.Join(root, "endpoints.json"), "MEKTUP_STATE_DIR=" + filepath.Join(root, "state")}}
-	target := "codex://local/thread/target-thread"
+	target := "codex://" + local.ID + "/thread/target-thread"
 	if code := app.Run([]string{"send", target, "one-way"}); code != int(cli.ExitSuccess) {
 		t.Fatalf("one-way send exit=%d", code)
 	}

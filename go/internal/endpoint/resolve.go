@@ -20,6 +20,11 @@ func (s EndpointStore) ResolveEndpoint(selector, codexHome string) (Endpoint, er
 	if selector == "local" {
 		return s.EnsureBuiltinLocal(codexHome)
 	}
+	if builtin, ok, err := s.builtinByID(selector); err != nil {
+		return Endpoint{}, err
+	} else if ok {
+		return builtin, nil
+	}
 	cfg, err := s.Load()
 	if err != nil {
 		return Endpoint{}, err

@@ -69,3 +69,21 @@ func TestResolverPinnedAcceptsForeignAliasAndCanonicalizesWireURI(t *testing.T) 
 		t.Fatalf("pinned foreign alias = %#v, want canonical URI %q", got, want)
 	}
 }
+
+func TestResolverResolvesBuiltinTargetByStableID(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "codex")
+	store := endpoint.NewStore(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"))
+	store.IdentityHome = filepath.Join(root, "identity")
+	local, err := store.EnsureBuiltinLocal(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := (ResolverAdapter{Store: store, CodexHome: home}).Resolve(context.Background(), "codex://"+local.ID+"/thread/thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.EndpointID != local.ID || got.ThreadID != "thread-1" {
+		t.Fatalf("builtin stable target=%+v", got)
+	}
+}

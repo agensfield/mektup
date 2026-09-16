@@ -393,6 +393,28 @@ func TestResolveEndpointIDNeverTreatsAliasAsPortableAuthority(t *testing.T) {
 	}
 }
 
+func TestResolveEndpointFindsBuiltinByStableID(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "codex")
+	store := NewStore(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"))
+	store.IdentityHome = filepath.Join(root, "identity")
+	local, err := store.EnsureBuiltinLocal(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := store.ResolveEndpoint(local.ID, home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ID != local.ID || resolved.Alias != "local" || !resolved.Builtin {
+		t.Fatalf("stable builtin resolution=%+v", resolved)
+	}
+	wrong := "ep_01999999-9999-7999-8999-999999999998"
+	if _, err := store.ResolveEndpoint(wrong, home); !errors.Is(err, ErrEndpointNotFound) {
+		t.Fatalf("wrong stable ID error=%v", err)
+	}
+}
+
 func TestSSHArgvCannotCarryShellOrBody(t *testing.T) {
 	route, err := SSHRoute("host; touch /tmp/pwned")
 	if err == nil {
