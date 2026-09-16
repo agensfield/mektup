@@ -144,10 +144,15 @@ func (r *RemoteJournal) ClaimReply(ctx context.Context, input ReplyClaimInput) (
 		return ReplyClaim{}, ErrRemoteCustodyBinding
 	}
 	replyEndpointID := op.ReplyEndpointID
-	if replyEndpointID == "" {
+	if op.InReplyTo != "" {
+		// A reply operation's Target tuple is the original envelope's body
+		// destination. ReplyEndpointID/ReplyRoute/Custody* belong to the
+		// optional child reply requested by this reply operation.
 		replyEndpointID = op.TargetEndpointID
-	}
-	if replyEndpointID == "" || (op.CustodyRoute != "" && (op.CustodyRoute != input.CustodyRoute || op.CustodyStoreID != input.CustodyStoreID)) {
+		if replyEndpointID == "" || op.TargetRoute == "" || input.ReplyRoute != op.TargetRoute {
+			return ReplyClaim{}, ErrRemoteCustodyBinding
+		}
+	} else if replyEndpointID == "" || (op.CustodyRoute != "" && (op.CustodyRoute != input.CustodyRoute || op.CustodyStoreID != input.CustodyStoreID)) {
 		return ReplyClaim{}, ErrRemoteCustodyBinding
 	}
 	route, remote, err := r.route(input.CustodyRoute)
@@ -312,6 +317,9 @@ func (r *RemoteJournal) WaitReply(ctx context.Context, replyID string, timeout t
 			return status, err
 		}
 		if status.State == mektup.StateReplyAccepted || status.State == mektup.StateReplyObserved || status.State == mektup.StateReplyOutcomeUnknown {
+			if status.State == mektup.StateReplyOutcomeUnknown {
+				return status, nil
+			}
 			if claim.joined {
 				status.State = mektup.StateReplyDispatchClaimed
 				status.ReplyID = ""
