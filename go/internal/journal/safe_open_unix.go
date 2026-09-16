@@ -164,42 +164,22 @@ func secureDatabaseFiles(dir, database *os.File) error {
 		return err
 	}
 	for _, name := range []string{"journal.sqlite3-wal", "journal.sqlite3-shm"} {
-		fd, err := unix.Openat(int(dir.Fd()), name, unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		var stat unix.Stat_t
+		err := unix.Fstatat(int(dir.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW)
 		if errors.Is(err, unix.ENOENT) {
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("journal: open %s safely: %w", name, err)
+			return fmt.Errorf("journal: inspect %s safely: %w", name, err)
 		}
-		file := os.NewFile(uintptr(fd), name)
-		if file == nil {
-			_ = unix.Close(fd)
-			return fmt.Errorf("journal: open %s descriptor", name)
+		if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+			return fmt.Errorf("journal: %s is not a regular file", name)
 		}
-		var stat unix.Stat_t
-		statErr := unix.Fstat(int(file.Fd()), &stat)
-		if statErr == nil && stat.Mode&unix.S_IFMT != unix.S_IFREG {
-			statErr = fmt.Errorf("journal: %s is not a regular file", name)
+		if !ownerIsCurrent(&stat) {
+			return fmt.Errorf("journal: %s is not owned by current euid", name)
 		}
-		if statErr == nil && !ownerIsCurrent(&stat) {
-			statErr = fmt.Errorf("journal: %s is not owned by current euid", name)
-		}
-		if statErr == nil && stat.Mode&0777 != 0600 {
-			statErr = unix.Fchmod(int(file.Fd()), 0600)
-		}
-		if statErr == nil {
-			if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
-				statErr = err
-			} else if stat.Mode&0777 != 0600 {
-				statErr = fmt.Errorf("journal: %s is not mode 0600", name)
-			}
-		}
-		closeErr := file.Close()
-		if statErr != nil {
-			return fmt.Errorf("journal: secure %s: %w", name, statErr)
-		}
-		if closeErr != nil {
-			return closeErr
+		if stat.Mode&0777 != 0600 {
+			return fmt.Errorf("journal: %s is not mode 0600", name)
 		}
 	}
 	return nil

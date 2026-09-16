@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -185,6 +186,49 @@ func TestSQLiteJournalDefersObservationWhileClaimIsFenced(t *testing.T) {
 	status, err := a.Lookup(ctx, op.MessageID)
 	if err != nil || status.State != mektup.StateReplyObserved || status.ReplyNativeID != "native" {
 		t.Fatalf("observed projection = %#v err=%v", status, err)
+	}
+}
+
+func TestDeferredObservationCannotExpireCrossHandleAcceptance(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	options := journal.Options{StateDir: dir, Now: func() time.Time { return time.Unix(0, now.Load()) }}
+	first, err := journal.Open(ctx, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := journal.Open(ctx, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	a := SQLiteJournal{Inner: first, SourceEndpointID: epSource, TargetEndpointID: epTarget}
+	b := SQLiteJournal{Inner: second, SourceEndpointID: epSource, TargetEndpointID: epTarget}
+	op := Operation{OperationID: "op_14999999-9999-7999-8999-999999999996", MessageID: "msg_14999999-9999-7999-8999-999999999996", SourceRoute: "codex://local/thread/source", TargetRoute: "codex://local/thread/target", Semantics: "message", Digest: digest("question"), BodySize: 8, ReplyRequested: true, ReplyRoute: "codex://local/thread/source", CustodyRoute: epSource, CustodyStoreID: storeID, SourceEndpointID: epSource, TargetEndpointID: epTarget}
+	if _, err := a.Prepare(ctx, op); err != nil {
+		t.Fatal(err)
+	}
+	input := ReplyClaimInput{ReplyID: "msg_14999999-9999-7999-8999-999999999995", OriginalID: op.MessageID, Digest: digest("answer"), BodySize: 6, Status: "success", ReplyRoute: op.ReplyRoute, CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID, Owner: "receiver"}
+	claim, err := a.ClaimReply(ctx, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.RecordObservedReply(ctx, input, "native", epSource, epSource); !errors.Is(err, ErrObservationPending) {
+		t.Fatalf("body-before-commit observation = %v, want pending", err)
+	}
+	if _, err := b.CommitReply(ctx, claim.ReplyID, claim.Owner, claim.Token); err != nil {
+		t.Fatal(err)
+	}
+	now.Add(31 * int64(time.Second))
+	if err := a.ExpireClaims(ctx); err != nil {
+		t.Fatal(err)
+	}
+	status, err := a.Lookup(ctx, op.MessageID)
+	if err != nil || status.State != mektup.StateReplyAccepted {
+		t.Fatalf("accepted reply expired through stale handle: %#v err=%v", status, err)
 	}
 }
 
