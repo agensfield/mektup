@@ -38,11 +38,12 @@ import (
 // seam for tests and embedders; when absent, Unix routes use appserver's
 // direct Unix socket and SSH routes use the bounded OpenSSH proxy bridge.
 type Options struct {
-	Input       io.Reader
-	CodexHome   string
-	ConfigPath  string
-	StateDir    string
-	ArtifactDir string
+	Input        io.Reader
+	CodexHome    string
+	ConfigPath   string
+	StateDir     string
+	ArtifactDir  string
+	IdentityHome string
 
 	Connection connection.Options
 	SSHConfig  sshproxy.Config
@@ -266,7 +267,7 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 		}
 	}
 
-	store := endpoint.NewStore(configPath, stateDir)
+	store := endpoint.NewStoreWithIdentityHome(configPath, stateDir, e.options.IdentityHome)
 	facts := &connectionFacts{values: make(map[string]connection.Info)}
 	pins := &receiptPins{values: make(map[string]endpoint.Endpoint)}
 	connections := &connectionFactory{store: store, codexHome: e.options.CodexHome, options: e.options.Connection, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute, facts: facts, pins: pins}

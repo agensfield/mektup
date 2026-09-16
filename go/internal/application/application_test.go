@@ -103,7 +103,7 @@ func TestEnvironmentUsesInvocationResolvedFlagAndEnvPaths(t *testing.T) {
 	configFromFlags := filepath.Join(root, "flag-config.json")
 	stateFromEnv := filepath.Join(root, "env-state")
 	configFromEnv := filepath.Join(root, "env-config.json")
-	env := New(Options{CodexHome: codexHome, StateDir: filepath.Join(root, "ignored-state"), ConfigPath: filepath.Join(root, "ignored-config.json")})
+	env := New(Options{CodexHome: codexHome, IdentityHome: filepath.Join(root, "identity"), StateDir: filepath.Join(root, "ignored-state"), ConfigPath: filepath.Join(root, "ignored-config.json")})
 	for _, paths := range []struct{ state, config string }{{stateFromFlags, configFromFlags}, {stateFromEnv, configFromEnv}} {
 		_, err := env.Execute(context.Background(), cli.Invocation{Command: "endpoint", Position: []string{"list"}, Resolved: cli.ResolvedGlobals{Endpoint: "local", StateDir: paths.state, Config: paths.config}})
 		if err != nil {
@@ -118,13 +118,33 @@ func TestEnvironmentUsesInvocationResolvedFlagAndEnvPaths(t *testing.T) {
 			t.Fatalf("journal path %s: %v", paths.state, err)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(stateFromFlags, "endpoint-identities.json")); err != nil {
-		t.Fatalf("flag endpoint identity path: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(stateFromEnv, "endpoint-identities.json")); err != nil {
-		t.Fatalf("env endpoint identity path: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "identity", "endpoint-identities.json")); err != nil {
+		t.Fatalf("shared endpoint identity path: %v", err)
 	}
 	_ = env.Close()
+}
+
+func TestBuiltinIdentityIsSharedAcrossOperationStateDirs(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", filepath.Join(root, "shared-data"))
+	env := New(Options{CodexHome: filepath.Join(root, "codex")})
+	var ids []string
+	for _, name := range []string{"one", "two"} {
+		resources, err := env.openResources(context.Background(), cli.Invocation{Command: "endpoint", Position: []string{"list"}, Resolved: cli.ResolvedGlobals{Config: filepath.Join(root, "config.json"), StateDir: filepath.Join(root, name)}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		store := resources.ports.Connections.(*connectionFactory).store
+		ep, err := store.EnsureBuiltinLocal(env.options.CodexHome)
+		_ = resources.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, ep.ID)
+	}
+	if len(ids) != 2 || ids[0] != ids[1] {
+		t.Fatalf("operation state dirs forked builtin identity: %v", ids)
+	}
 }
 
 func TestDoctorDoesNotCreateStateAndCanReadCorruptJournal(t *testing.T) {
@@ -132,7 +152,7 @@ func TestDoctorDoesNotCreateStateAndCanReadCorruptJournal(t *testing.T) {
 	state := filepath.Join(root, "missing-state")
 	config := filepath.Join(root, "config.json")
 	var out, errOut bytes.Buffer
-	env := New(Options{CodexHome: filepath.Join(root, "codex")})
+	env := New(Options{CodexHome: filepath.Join(root, "codex"), IdentityHome: filepath.Join(root, "identity")})
 	app := &cli.App{Out: &out, Err: &errOut, Executor: env, Env: []string{"MEKTUP_OUTPUT=json", "MEKTUP_STATE_DIR=" + state, "MEKTUP_CONFIG=" + config}}
 	if code := app.Run([]string{"doctor"}); code != int(cli.ExitSuccess) {
 		t.Fatalf("doctor exit=%d stderr=%s", code, errOut.String())
@@ -163,7 +183,7 @@ func TestStorageCorruptOpenUsesStableCode(t *testing.T) {
 		t.Fatal(err)
 	}
 	var out, errOut bytes.Buffer
-	env := New(Options{CodexHome: filepath.Join(root, "codex")})
+	env := New(Options{CodexHome: filepath.Join(root, "codex"), IdentityHome: filepath.Join(root, "identity")})
 	app := &cli.App{Out: &out, Err: &errOut, Executor: env, Env: []string{"MEKTUP_OUTPUT=json", "MEKTUP_STATE_DIR=" + state, "MEKTUP_CONFIG=" + filepath.Join(root, "config.json")}}
 	if code := app.Run([]string{"storage", "status"}); code != int(cli.ExitRejected) || !strings.Contains(out.String(), `"code":"storage_corrupt"`) {
 		t.Fatalf("storage exit=%d output=%s stderr=%s", code, out.String(), errOut.String())
@@ -226,7 +246,7 @@ func TestInjectedAppEnvironmentWinsOverConflictingHostEnvironment(t *testing.T) 
 	t.Setenv("MEKTUP_CONFIG", conflictingConfig)
 	t.Setenv("MEKTUP_STATE_DIR", conflictingState)
 	var out, errOut bytes.Buffer
-	env := New(Options{CodexHome: filepath.Join(root, "codex")})
+	env := New(Options{CodexHome: filepath.Join(root, "codex"), IdentityHome: filepath.Join(root, "identity")})
 	app := &cli.App{In: strings.NewReader(""), Out: &out, Err: &errOut, Env: []string{
 		"MEKTUP_OUTPUT=json", "MEKTUP_CONFIG=" + desiredConfig, "MEKTUP_STATE_DIR=" + desiredState,
 	}, Executor: env}
@@ -234,8 +254,8 @@ func TestInjectedAppEnvironmentWinsOverConflictingHostEnvironment(t *testing.T) 
 		t.Fatalf("exit=%d stderr=%s", code, errOut.String())
 	}
 	_ = env.Close()
-	if _, err := os.Stat(filepath.Join(desiredState, "endpoint-identities.json")); err != nil {
-		t.Fatalf("desired state was not used: %v", err)
+	if _, err := os.Stat(filepath.Join(root, "identity", "endpoint-identities.json")); err != nil {
+		t.Fatalf("shared identity state was not used: %v", err)
 	}
 	if _, err := os.Stat(conflictingState); !os.IsNotExist(err) {
 		t.Fatalf("conflicting host state was touched: %v", err)
@@ -267,7 +287,7 @@ func TestEnvironmentCloseAndExecuteAdmissionIsRaceSafe(t *testing.T) {
 func TestConnectionFactoryPassesExperimentalOptionAndSelectsSSHRoute(t *testing.T) {
 	root := t.TempDir()
 	state := filepath.Join(root, "state")
-	store := endpoint.NewStore(filepath.Join(root, "endpoints.json"), state)
+	store := endpoint.NewStoreWithIdentityHome(filepath.Join(root, "endpoints.json"), state, filepath.Join(root, "identity"))
 	unix, err := endpoint.UnixRoute(filepath.Join(root, "codex.sock"))
 	if err != nil {
 		t.Fatal(err)
@@ -321,7 +341,7 @@ func TestEndpointRemovePinsIdentityBeforeEffect(t *testing.T) {
 	root := t.TempDir()
 	state := filepath.Join(root, "state")
 	config := filepath.Join(root, "config.json")
-	store := endpoint.NewStore(config, state)
+	store := endpoint.NewStoreWithIdentityHome(config, state, filepath.Join(root, "identity"))
 	route, err := endpoint.SSHRoute("example.invalid")
 	if err != nil {
 		t.Fatal(err)
@@ -354,7 +374,7 @@ func TestReceiptPinsConnectedEndpointAcrossAliasReplacement(t *testing.T) {
 	root := t.TempDir()
 	state := filepath.Join(root, "state")
 	config := filepath.Join(root, "config.json")
-	store := endpoint.NewStore(config, state)
+	store := endpoint.NewStoreWithIdentityHome(config, state, filepath.Join(root, "identity"))
 	route, _ := endpoint.SSHRoute("example.invalid")
 	first := endpoint.Endpoint{ID: endpointID(), Alias: "remote", Route: route, Herdr: endpoint.HerdrDisabled}
 	if err := store.Add(first); err != nil {
@@ -394,7 +414,7 @@ func TestReceiptStorePersistsStableEndpointIdentity(t *testing.T) {
 	root := t.TempDir()
 	state := filepath.Join(root, "state")
 	codexHome := filepath.Join(root, "codex")
-	store := endpoint.NewStore(filepath.Join(root, "endpoints.json"), state)
+	store := endpoint.NewStoreWithIdentityHome(filepath.Join(root, "endpoints.json"), state, filepath.Join(root, "identity"))
 	ep, err := store.EnsureBuiltinLocal(codexHome)
 	if err != nil {
 		t.Fatal(err)
@@ -470,7 +490,7 @@ func TestCleanupFailureAddsDurableReceiptWarningProjection(t *testing.T) {
 
 func TestProductionCompositionDoesNotRequireDaemonOrSSHProcessForInjectedRoute(t *testing.T) {
 	root := t.TempDir()
-	store := endpoint.NewStore(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"))
+	store := endpoint.NewStoreWithIdentityHome(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"), filepath.Join(root, "identity"))
 	route, err := endpoint.UnixRoute(filepath.Join(root, "managed.sock"))
 	if err != nil {
 		t.Fatal(err)
