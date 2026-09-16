@@ -201,6 +201,11 @@ type ProcessFactoryFunc func([]string) (Process, error)
 
 func (f ProcessFactoryFunc) New(argv []string) (Process, error) { return f(argv) }
 
+// DefaultProcessFactory returns the production exec-backed process factory.
+// Callers that need deterministic lifecycle tests may supply their own
+// ProcessFactory instead.
+func DefaultProcessFactory() ProcessFactory { return execFactory{} }
+
 type execFactory struct{}
 
 func (execFactory) New(argv []string) (Process, error) {
