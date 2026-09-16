@@ -779,6 +779,46 @@ func TestObservedProjectionStrengthensExistingAcceptedClaim(t *testing.T) {
 	}
 }
 
+func TestObservedWinnerProjectionRejectsDivergentWinnerAndPreservesAcceptedWinner(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	in := claimInput()
+	in.ReplyID = "winner-local"
+	local, err := j.ClaimReply(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := j.CommitReply(context.Background(), local.ReplyID, local.Owner, local.Token); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.RecordObservedWinner(context.Background(), in.OriginalID, "winner-remote", in.Digest, in.Status, "", in.ReplyRoute, in.CustodyRoute, in.CustodyStoreID, "", "", "custody", 2, in.BodySize); !errors.Is(err, ErrIdentityConflict) {
+		t.Fatalf("divergent winner error = %v", err)
+	}
+	winner, _, _, err := j.Winner(context.Background(), in.OriginalID)
+	if err != nil || winner != local.ReplyID {
+		t.Fatalf("local winner changed: %q err=%v", winner, err)
+	}
+}
+
+func TestObservedWinnerWithoutNativeEvidenceRemainsAccepted(t *testing.T) {
+	dir := t.TempDir()
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, dir, &now)
+	prepared(t, j)
+	in := claimInput()
+	if err := j.RecordObservedWinner(context.Background(), in.OriginalID, "winner-accepted", in.Digest, in.Status, "", in.ReplyRoute, in.CustodyRoute, in.CustodyStoreID, "", "", "custody", 1, in.BodySize); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := j.Reply(context.Background(), "winner-accepted")
+	if err != nil || claim.State != StateReplyAccepted {
+		t.Fatalf("winner without native evidence overclaimed: %+v err=%v", claim, err)
+	}
+}
+
 func TestV8SchemaRejectsMissingObservationProvenanceColumns(t *testing.T) {
 	dir := t.TempDir()
 	var now atomic.Int64

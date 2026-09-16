@@ -456,14 +456,6 @@ func (j *Journal) RecordObservedReply(ctx context.Context, in ClaimInput, native
 		if err := tx.QueryRow("SELECT original_id FROM reply_claims WHERE reply_id=?", in.ReplyID).Scan(&originalID); err != nil {
 			return err
 		}
-		var winnerExists bool
-		if err := tx.QueryRow("SELECT EXISTS(SELECT 1 FROM reply_winners WHERE original_id=? AND reply_id<>?)", originalID, in.ReplyID).Scan(&winnerExists); err != nil {
-			return err
-		}
-		if winnerExists {
-			_, _, err = assignReplyCommitTx(tx, originalID, in.ReplyID, now)
-			return err
-		}
 		_, _, err = assignReplyCommitTx(tx, originalID, in.ReplyID, now)
 		return err
 	})
@@ -478,6 +470,10 @@ func (j *Journal) RecordObservedWinner(ctx context.Context, originalID, replyID,
 		return fmt.Errorf("journal: invalid observed winner projection")
 	}
 	now := j.nowUnix()
+	winnerState := StateReplyAccepted
+	if nativeID != "" {
+		winnerState = StateReplyObserved
+	}
 	return j.withTx(ctx, func(tx *sql.Tx) error {
 		var route, custody, existingStore string
 		if err := tx.QueryRow("SELECT reply_route,custody_route,custody_store_id FROM operations WHERE message_id=?", originalID).Scan(&route, &custody, &existingStore); err != nil {
@@ -492,13 +488,17 @@ func (j *Journal) RecordObservedWinner(ctx context.Context, originalID, replyID,
 		var existing ReplyClaim
 		err := scanClaim(tx.QueryRow("SELECT reply_id,original_id,digest,body_size,status,reply_error_code,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,COALESCE(accepted_at,0),COALESCE(commit_seq,0) FROM reply_claims WHERE reply_id=?", replyID), &existing)
 		if err == sql.ErrNoRows {
-			if _, err := tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,accepted_at,commit_seq,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", replyID, originalID, digest, bodySize, status, replyRoute, custodyRoute, storeID, "", "", int64(0), string(StateReplyObserved), now, now, now, commitSeq, errorCode); err != nil {
+			if _, err := tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,accepted_at,commit_seq,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", replyID, originalID, digest, bodySize, status, replyRoute, custodyRoute, storeID, "", "", int64(0), string(winnerState), now, now, now, commitSeq, errorCode); err != nil {
 				return err
 			}
 		} else if err != nil {
 			return err
 		} else if existing.OriginalID != originalID || existing.Digest != digest || existing.BodySize != bodySize || existing.Status != status || existing.ReplyErrorCode != errorCode || existing.ReplyRoute != replyRoute || existing.CustodyRoute != custodyRoute || existing.CustodyStoreID != storeID {
 			return ErrIdentityConflict
+		} else if nativeID != "" && existing.State != StateReplyObserved {
+			if _, err := tx.Exec("UPDATE reply_claims SET state=?,updated_at=? WHERE reply_id=?", string(StateReplyObserved), now, replyID); err != nil {
+				return err
+			}
 		}
 		var currentWinner string
 		err = tx.QueryRow("SELECT reply_id FROM reply_winners WHERE original_id=?", originalID).Scan(&currentWinner)
@@ -508,6 +508,8 @@ func (j *Journal) RecordObservedWinner(ctx context.Context, originalID, replyID,
 			}
 		} else if err != nil {
 			return err
+		} else if currentWinner != replyID {
+			return ErrIdentityConflict
 		}
 		if nativeID != "" {
 			if err := validateObservationIdentityTx(tx, replyID, nativeID, digest, endpointID, controlRoute); err != nil {
