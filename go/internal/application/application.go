@@ -979,7 +979,7 @@ func (r threadTargetResolver) ResolveThreadWithOptions(ctx context.Context, sele
 		if err != nil {
 			return executor.ThreadTarget{}, err
 		}
-		return executor.ThreadTarget{Endpoint: ep.ID, ThreadID: selector, URI: "codex://" + ep.Alias + "/thread/" + selector}, nil
+		return executor.ThreadTarget{Endpoint: ep.Alias, EndpointID: ep.ID, ThreadID: selector, URI: "codex://" + ep.Alias + "/thread/" + selector}, nil
 	}
 	target, err := endpoint.ParseTarget(selector)
 	if err != nil {
@@ -996,7 +996,7 @@ func (r threadTargetResolver) ResolveThreadWithOptions(ctx context.Context, sele
 	if err != nil {
 		return executor.ThreadTarget{}, err
 	}
-	return executor.ThreadTarget{Endpoint: resolved.Endpoint.ID, ThreadID: resolved.ThreadID, URI: target.String()}, nil
+	return executor.ThreadTarget{Endpoint: resolved.Endpoint.Alias, EndpointID: resolved.Endpoint.ID, ThreadID: resolved.ThreadID, URI: target.String()}, nil
 }
 
 func isNativeThreadID(value string) bool {

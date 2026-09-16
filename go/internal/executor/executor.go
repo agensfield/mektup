@@ -93,9 +93,10 @@ type EndpointChecker interface {
 }
 
 type ThreadTarget struct {
-	Endpoint string
-	ThreadID string
-	URI      string
+	Endpoint   string
+	EndpointID string
+	ThreadID   string
+	URI        string
 }
 
 // ThreadTargetResolver converts presentation selectors to a pinned endpoint
@@ -242,7 +243,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		return cli.ExecutionResult{}, missing("receipt journal")
 	}
 	needsExperimental := inv.Position[0] == "fork" && inv.Option("before-turn") != ""
-	endpointSelector, threadID, err := e.resolveThreadTarget(ctx, inv)
+	endpointSelector, endpointID, threadID, err := e.resolveThreadTarget(ctx, inv)
 	if err != nil {
 		return cli.ExecutionResult{}, err
 	}
@@ -324,7 +325,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
 		if name := inv.Option("name"); name != "" {
-			if callErr := e.setThreadName(ctx, api, name, r.Thread.ID, r.Raw, "thread.start", endpointSelector); callErr != nil {
+			if callErr := e.setThreadName(ctx, api, name, r.Thread.ID, r.Raw, "thread.start", endpointID); callErr != nil {
 				return cli.ExecutionResult{}, callErr
 			}
 		}
@@ -347,7 +348,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
 		if name := inv.Option("name"); name != "" {
-			if callErr := e.setThreadName(ctx, api, name, r.Thread.ID, r.Raw, "thread.fork", endpointSelector); callErr != nil {
+			if callErr := e.setThreadName(ctx, api, name, r.Thread.ID, r.Raw, "thread.fork", endpointID); callErr != nil {
 				return cli.ExecutionResult{}, callErr
 			}
 		}
@@ -356,18 +357,18 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		return cli.ExecutionResult{}, usage("unsupported thread subcommand: " + sub)
 	}
 	if collection {
-		return e.collectionResult(ctx, kind, resultKind, data, cursor, warnings, mutating, endpointSelector)
+		return e.collectionResult(ctx, kind, resultKind, data, cursor, warnings, mutating, endpointID)
 	}
-	return e.result(ctx, kind, data, cursor, warnings, mutating, endpointSelector)
+	return e.result(ctx, kind, data, cursor, warnings, mutating, endpointID)
 }
 
-func (e *Executor) resolveThreadTarget(ctx context.Context, inv cli.Invocation) (string, string, error) {
+func (e *Executor) resolveThreadTarget(ctx context.Context, inv cli.Invocation) (string, string, string, error) {
 	sub := inv.Position[0]
 	if sub == "list" || sub == "start" {
-		return inv.Resolved.Endpoint, "", nil
+		return inv.Resolved.Endpoint, inv.Resolved.Endpoint, "", nil
 	}
 	if len(inv.Position) < 2 {
-		return "", "", usage("thread target is required")
+		return "", "", "", usage("thread target is required")
 	}
 	selector := inv.Position[1]
 	if e.ports.Targets != nil {
@@ -379,14 +380,18 @@ func (e *Executor) resolveThreadTarget(ctx context.Context, inv cli.Invocation) 
 			resolved, err = e.ports.Targets.ResolveThread(ctx, selector, inv.Resolved.Endpoint)
 		}
 		if err != nil {
-			return "", "", mapError(err, "not_sent")
+			return "", "", "", mapError(err, "not_sent")
 		}
-		return resolved.Endpoint, resolved.ThreadID, nil
+		endpointID := resolved.EndpointID
+		if endpointID == "" {
+			endpointID = resolved.Endpoint
+		}
+		return resolved.Endpoint, endpointID, resolved.ThreadID, nil
 	}
 	if strings.Contains(selector, "://") {
-		return "", "", &cli.Error{Code: "invalid_target", Message: "thread target resolver is required for URI targets", Effect: "not_sent", Exit: cli.ExitUsage}
+		return "", "", "", &cli.Error{Code: "invalid_target", Message: "thread target resolver is required for URI targets", Effect: "not_sent", Exit: cli.ExitUsage}
 	}
-	return inv.Resolved.Endpoint, selector, nil
+	return inv.Resolved.Endpoint, inv.Resolved.Endpoint, selector, nil
 }
 
 func (e *Executor) search(ctx context.Context, inv cli.Invocation) (result cli.ExecutionResult, execErr error) {

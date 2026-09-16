@@ -392,6 +392,40 @@ func TestConnectionCheckSurfacesDetachFailure(t *testing.T) {
 	}
 }
 
+func TestConnectionFactoryAcceptsPinnedBuiltinAndConfiguredSelectors(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	store := endpoint.NewStoreWithIdentityHome(filepath.Join(root, "endpoints.json"), state, filepath.Join(root, "identity"))
+	local, err := store.EnsureBuiltinLocal(filepath.Join(root, "codex"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	route, err := endpoint.UnixRoute(filepath.Join(root, "remote.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteID := endpointID()
+	if err := store.Add(endpoint.Endpoint{ID: remoteID, Alias: "remote", Route: route, Herdr: endpoint.HerdrDisabled}); err != nil {
+		t.Fatal(err)
+	}
+	var dialers []*recordingDialer
+	factory := &connectionFactory{store: store, codexHome: filepath.Join(root, "codex"), dialerForRoute: func(endpoint.Route, bool) connection.ClientDialer {
+		dialer := &recordingDialer{transport: newFakeTransport()}
+		dialers = append(dialers, dialer)
+		return dialer
+	}}
+	for _, selector := range []string{"local", "remote", remoteID} {
+		opened, err := factory.OpenWithOptions(context.Background(), selector, executor.OpenOptions{})
+		if err != nil {
+			t.Fatalf("selector %s: %v", selector, err)
+		}
+		_ = opened.Close()
+	}
+	if len(dialers) != 3 || dialers[0].routes[0].UnixSocket != local.Route.UnixSocket || dialers[1].routes[0].UnixSocket != route.UnixSocket || dialers[2].routes[0].UnixSocket != route.UnixSocket {
+		t.Fatalf("dialers=%+v local=%+v remote=%+v", dialers, local, route)
+	}
+}
+
 func TestEndpointRemovePinsIdentityBeforeEffect(t *testing.T) {
 	root := t.TempDir()
 	state := filepath.Join(root, "state")
