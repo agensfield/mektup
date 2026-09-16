@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -155,5 +156,17 @@ func TestDecodeObserveResultAllowsErrorWinnerWithoutCode(t *testing.T) {
 	request := sshproxy.ControlRequest{Custody: sshproxy.CustodyRef{EndpointID: remoteCustodyEndpoint}, ReplyDestination: sshproxy.DestinationRef{EndpointID: bodyDestinationEndpoint}}
 	if _, err := decodeObserveResult(response, request); err != nil {
 		t.Fatalf("error winner without optional code rejected: %v", err)
+	}
+	for _, value := range []string{"null", `"4"`, "1.5", "true"} {
+		bad := response
+		bad.Result = bytes.Replace(response.Result, []byte(`"bodyBytes":4`), []byte(`"bodyBytes":`+value), 1)
+		if _, err := decodeObserveResult(bad, request); err == nil {
+			t.Fatalf("bodyBytes %s accepted", value)
+		}
+	}
+	zero := response
+	zero.Result = bytes.Replace(response.Result, []byte(`"bodyBytes":4`), []byte(`"bodyBytes":0`), 1)
+	if _, err := decodeObserveResult(zero, request); err != nil {
+		t.Fatalf("integer bodyBytes zero rejected: %v", err)
 	}
 }

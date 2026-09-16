@@ -673,8 +673,15 @@ func decodeObserveResult(response sshproxy.ControlRequest, request sshproxy.Cont
 	if raw, ok := winner["bodySha256"]; !ok || json.Unmarshal(raw, &out.WinnerDigest) != nil || !validWinnerDigest(out.WinnerDigest) {
 		return out, sshproxy.ErrControlValidation
 	}
-	if raw, ok := winner["bodyBytes"]; !ok || json.Unmarshal(raw, &out.WinnerBodySize) != nil || out.WinnerBodySize < 0 {
+	if raw, ok := winner["bodyBytes"]; !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return out, sshproxy.ErrControlValidation
+	}
+	if raw, ok := winner["bodyBytes"]; ok {
+		var size int64
+		if err := json.Unmarshal(raw, &size); err != nil || size < 0 {
+			return out, sshproxy.ErrControlValidation
+		}
+		out.WinnerBodySize = size
 	}
 	if raw, ok := winner["replyErrorCode"]; ok {
 		if json.Unmarshal(raw, &out.WinnerErrorCode) != nil || out.WinnerErrorCode == "" {
