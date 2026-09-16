@@ -474,7 +474,9 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 		if err != nil {
 			return nil, err
 		}
-		return runtime.OriginalResolver{Observe: observe, Target: service.ResolvedTarget{EndpointID: source.EndpointID, URI: source.URI, ThreadID: threadIDFromURI(source.URI), Loaded: true, Persistent: true}}, nil
+		return runtime.OriginalResolver{Observe: observe, Target: service.ResolvedTarget{EndpointID: source.EndpointID, URI: source.URI, ThreadID: threadIDFromURI(source.URI), Loaded: true, Persistent: true}, ValidateURI: func(_ context.Context, endpointID, uri string) error {
+			return validateEndpointURISelector(store, codexHome, endpointID, uri)
+		}}, nil
 	}
 	prepareCustody := func(prepareCtx context.Context, operation cli.Invocation) error {
 		resolver := resolverFor(operation)
@@ -687,7 +689,9 @@ func (r applicationImportResolver) ResolveOriginal(ctx context.Context, inv cli.
 		return nil, portableRouteError(err)
 	}
 	identity := imported.Receipt.Target
-	return runtime.OriginalResolver{Observe: r.observe, Target: service.ResolvedTarget{EndpointID: routes.target.ID, ThreadID: identity.ThreadID, URI: identity.Resolved, Loaded: true, Persistent: true}}, nil
+	return runtime.OriginalResolver{Observe: r.observe, Target: service.ResolvedTarget{EndpointID: routes.target.ID, ThreadID: identity.ThreadID, URI: identity.Resolved, Loaded: true, Persistent: true}, ValidateURI: func(_ context.Context, endpointID, uri string) error {
+		return validateEndpointURISelector(r.store, r.codexHome, endpointID, uri)
+	}}, nil
 }
 
 func (r applicationImportResolver) ResolveWaitReference(ctx context.Context, _ cli.Invocation, imported receipts.Imported) (string, error) {
@@ -1001,6 +1005,30 @@ func threadIDFromURI(uri string) string {
 		return ""
 	}
 	return parsed.ThreadID
+}
+
+func validateEndpointURISelector(store endpoint.EndpointStore, codexHome, endpointID, uri string) error {
+	address, err := mektup.ParseThreadURI(uri)
+	if err != nil {
+		return err
+	}
+	if _, err := store.ResolveEndpointID(endpointID, codexHome); err != nil {
+		return err
+	}
+	if mektup.ValidateID(address.Endpoint, mektup.EndpointIDPrefix) == nil {
+		if address.Endpoint != endpointID {
+			return fmt.Errorf("stable URI selector %q does not match endpoint %q", address.Endpoint, endpointID)
+		}
+		return nil
+	}
+	mapped, err := store.ResolveEndpoint(address.Endpoint, codexHome)
+	if err != nil {
+		return err
+	}
+	if mapped.ID != endpointID {
+		return fmt.Errorf("URI selector %q maps to endpoint %q, want %q", address.Endpoint, mapped.ID, endpointID)
+	}
+	return nil
 }
 
 func firstNonEmpty(values ...string) string {

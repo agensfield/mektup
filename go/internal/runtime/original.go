@@ -13,8 +13,9 @@ import (
 // OriginalResolver performs exact lookup against one already pinned current
 // thread. It never invokes search, ranks candidates, or resolves a Herdr alias.
 type OriginalResolver struct {
-	Observe service.ObservationPort
-	Target  service.ResolvedTarget
+	Observe     service.ObservationPort
+	Target      service.ResolvedTarget
+	ValidateURI func(context.Context, string, string) error
 }
 
 func (r OriginalResolver) ResolveOriginal(ctx context.Context, reference string) (service.OriginalMessage, error) {
@@ -28,10 +29,10 @@ func (r OriginalResolver) ResolveOriginal(ctx context.Context, reference string)
 	if err != nil {
 		return service.OriginalMessage{}, err
 	}
-	return r.resolveItems(reference, items)
+	return r.resolveItems(ctx, reference, items)
 }
 
-func (r OriginalResolver) resolveItems(reference string, items []service.ObservedItem) (service.OriginalMessage, error) {
+func (r OriginalResolver) resolveItems(ctx context.Context, reference string, items []service.ObservedItem) (service.OriginalMessage, error) {
 	var match *service.OriginalMessage
 	for _, item := range items {
 		if item.ThreadID != "" && item.ThreadID != r.Target.ThreadID {
@@ -53,7 +54,12 @@ func (r OriginalResolver) resolveItems(reference string, items []service.Observe
 		// Both the URI and the native thread ID are checked. This is the fork
 		// guard: an ancestor envelope remains ordinary copied history in a
 		// descendant and cannot become a reply target.
-		if envelope.To != r.Target.URI || envelope.ToEndpointID != r.Target.EndpointID || envelope.ValidateAddressToThread(r.Target.URI) != nil {
+		envelopeAddress, envelopeAddressErr := mektup.ParseThreadURI(envelope.To)
+		targetAddress, targetAddressErr := mektup.ParseThreadURI(r.Target.URI)
+		if envelope.ToEndpointID != r.Target.EndpointID || envelopeAddressErr != nil || targetAddressErr != nil || envelopeAddress.ThreadID != targetAddress.ThreadID {
+			continue
+		}
+		if envelope.To != r.Target.URI && (r.ValidateURI == nil || r.ValidateURI(ctx, r.Target.EndpointID, envelope.To) != nil) {
 			continue
 		}
 		candidate := service.OriginalMessage{Envelope: envelope, CurrentThread: r.Target.URI}

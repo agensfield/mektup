@@ -257,7 +257,7 @@ func discoverLiveOriginal(ctx context.Context, timeout time.Duration, observe se
 					if parseErr != nil || parsed.Kind != mektup.KindMessage || parsed.Body != expectedBody {
 						continue
 					}
-					if original, resolveErr := resolver.resolveItems(parsed.MessageID, history.items); resolveErr == nil {
+					if original, resolveErr := resolver.resolveItems(ctx, parsed.MessageID, history.items); resolveErr == nil {
 						return original, nil
 					}
 				}

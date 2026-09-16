@@ -92,8 +92,8 @@ func (s *Service) reply(ctx context.Context, resolver OriginalResolver, req Repl
 	if err := original.Envelope.Validate(); err != nil {
 		return ReplyResult{}, semantic(mektup.ErrMessageNotFound, "original envelope is invalid", nil, err)
 	}
-	if err := original.Envelope.ValidateAddressToThread(original.CurrentThread); err != nil {
-		return ReplyResult{}, semantic(mektup.ErrMessageNotAddressedThread, "original envelope belongs to another thread", nil, err)
+	if threadID(original.Envelope.To) == "" || threadID(original.Envelope.To) != threadID(original.CurrentThread) {
+		return ReplyResult{}, semantic(mektup.ErrMessageNotAddressedThread, "original envelope belongs to another thread", nil, nil)
 	}
 	if !original.Envelope.ReplyRequested {
 		return ReplyResult{}, semantic(mektup.ErrReplyRouteUnavailable, "original message did not carry a reply route", nil, nil)

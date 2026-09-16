@@ -717,6 +717,9 @@ func TestMessagingCompositionRegistersOnlyReplyCustody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := validateEndpointURISelector(configured, codexHome, local.ID, "codex://local/thread/source"); err != nil {
+		t.Fatalf("legacy alias selector validation: %v", err)
+	}
 	env := New(Options{CodexHome: codexHome, ConfigPath: filepath.Join(root, "endpoints.json"), StateDir: filepath.Join(root, "state"), IdentityHome: filepath.Join(root, "identity"), Registry: controlreceiver.FileRegistry{Path: registryPath}, CurrentThreadID: "source-thread", ThreadStateProbe: func(context.Context, string, string) (bool, bool, error) { return false, true, nil }, SessionFactory: runtime.SessionFactoryFunc(func(_ context.Context, ep endpoint.Endpoint) (runtime.Session, error) {
 		return messagingFakeSession{endpointID: ep.ID}, nil
 	})})
@@ -756,11 +759,11 @@ func TestApplicationReplyResolvesStableOriginalEnvelopeAfterCanonicalWireSend(t 
 		t.Fatal(err)
 	}
 	storeID := identityJournal.StoreID()
-	if _, err := identityJournal.Prepare(context.Background(), journal.Operation{OperationID: "op_0198f0e0-0000-7000-8000-000000000120", MessageID: "msg_0198f0e0-0000-7000-8000-000000000121", SourceRoute: "codex://" + local.ID + "/thread/source", TargetRoute: "codex://" + local.ID + "/thread/source", Semantics: "message", SourceEndpointID: local.ID, TargetEndpointID: local.ID, ReplyRoute: "codex://" + local.ID + "/thread/source", ReplyEndpointID: local.ID, CustodyRoute: local.ID, CustodyStoreID: storeID, Digest: "sha256:" + strings.Repeat("a", 64), BodySize: 8}); err != nil {
+	if _, err := identityJournal.Prepare(context.Background(), journal.Operation{OperationID: "op_0198f0e0-0000-7000-8000-000000000120", MessageID: "msg_0198f0e0-0000-7000-8000-000000000121", SourceRoute: "codex://local/thread/source", TargetRoute: "codex://local/thread/source", Semantics: "message", SourceEndpointID: local.ID, TargetEndpointID: local.ID, ReplyRoute: "codex://local/thread/source", ReplyEndpointID: local.ID, CustodyRoute: local.ID, CustodyStoreID: storeID, Digest: "sha256:" + strings.Repeat("a", 64), BodySize: 8}); err != nil {
 		t.Fatal(err)
 	}
 	_ = identityJournal.Close()
-	original := mektup.Envelope{MessageID: "msg_0198f0e0-0000-7000-8000-000000000121", Kind: mektup.KindMessage, FromEndpointID: local.ID, From: "codex://" + local.ID + "/thread/source", FromKind: "agent", ToEndpointID: local.ID, To: "codex://" + local.ID + "/thread/source", RequestedTarget: "source", ReplyRequested: true, ReplyEndpointID: local.ID, ReplyTo: "codex://" + local.ID + "/thread/source", ReplyCustodyEndpointID: local.ID, Body: "question", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	original := mektup.Envelope{MessageID: "msg_0198f0e0-0000-7000-8000-000000000121", Kind: mektup.KindMessage, FromEndpointID: local.ID, From: "codex://local/thread/source", FromKind: "agent", ToEndpointID: local.ID, To: "codex://local/thread/source", RequestedTarget: "source", ReplyRequested: true, ReplyEndpointID: local.ID, ReplyTo: "codex://local/thread/source", ReplyCustodyEndpointID: local.ID, Body: "question", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	original.ReplyCustodyStoreID = storeID
 	original.PayloadBytes = uint64(len(original.Body))
 	digest := sha256.Sum256([]byte(original.Body))

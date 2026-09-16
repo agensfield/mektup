@@ -82,7 +82,11 @@ func (r ResolverAdapter) ResolvePinned(ctx context.Context, endpointID, uri stri
 	// name the independently resolved endpoint exactly; an alias selector must
 	// be locally configured and map to that same stable endpoint. Neither form
 	// can be silently rewritten into a different relationship tuple.
-	if address.Endpoint != endpointID {
+	if mektup.ValidateID(address.Endpoint, mektup.EndpointIDPrefix) == nil {
+		if address.Endpoint != endpointID {
+			return service.ResolvedTarget{}, fmt.Errorf("runtime: pinned stable URI selector %q does not match endpoint %q", address.Endpoint, endpointID)
+		}
+	} else {
 		mapped, mapErr := r.Store.ResolveEndpoint(address.Endpoint, r.CodexHome)
 		if mapErr != nil || mapped.ID != ep.ID {
 			if mapErr != nil {
