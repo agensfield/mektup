@@ -24,6 +24,11 @@ go install github.com/agensfield/mektup/go/cmd/mektup@v1.0.0
 Run `mektup --skill` for agent-facing operating instructions or
 `mektup --help` for the command surface.
 
+Interactive terminals receive concise tables, summaries, and automatic color.
+Use `--color always|never|auto`, `MEKTUP_COLOR`, or the standard `NO_COLOR`
+environment variable to control decoration. Machine JSONL and redirected human
+output never contain ANSI escapes unless color is explicitly forced.
+
 ## Repository layout
 
 ```text

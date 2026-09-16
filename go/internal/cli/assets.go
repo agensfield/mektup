@@ -23,6 +23,7 @@ Global options:
   --endpoint <alias-or-id>     select destination endpoint
   --config <path>              select configuration location
   --state-dir <path>           select journal location
+  --color auto|always|never    colorize human output when appropriate
   --debug                      enable redacted diagnostics
   --audit                      explicitly enable sensitive audit capture
 

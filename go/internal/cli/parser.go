@@ -16,7 +16,7 @@ type optionSpec struct {
 
 var optionSpecs = map[string]optionSpec{
 	"json": {}, "human": {}, "debug": {}, "audit": {}, "help": {}, "skill": {}, "stdin": {}, "wait": {}, "request-reply": {}, "raw": {}, "blockers": {}, "loaded": {}, "archived": {}, "portable": {}, "content": {}, "dry-run": {}, "fix": {}, "force": {},
-	"endpoint": {value: true}, "config": {value: true}, "state-dir": {value: true}, "file": {value: true}, "delivery-timeout": {value: true}, "wait-timeout": {value: true}, "timeout": {value: true}, "reply-to": {value: true}, "status": {value: true}, "error-code": {value: true}, "receipt-file": {value: true}, "receipts": {value: true}, "cwd": {value: true}, "source": {value: true, repeat: true}, "sort": {value: true}, "order": {value: true}, "limit": {value: true}, "cursor": {value: true}, "view": {value: true}, "turn": {value: true}, "model": {value: true}, "name": {value: true}, "through-turn": {value: true}, "before-turn": {value: true}, "thread": {value: true}, "state": {value: true}, "since": {value: true}, "resolve-as": {value: true}, "reason": {value: true}, "evidence": {value: true}, "ssh": {value: true}, "unix": {value: true}, "id": {value: true}, "herdr": {value: true}, "before": {value: true}, "params": {value: true}, "params-file": {value: true}, "allow-effect": {value: true, repeat: true}, "output": {value: true},
+	"endpoint": {value: true}, "config": {value: true}, "state-dir": {value: true}, "color": {value: true}, "file": {value: true}, "delivery-timeout": {value: true}, "wait-timeout": {value: true}, "timeout": {value: true}, "reply-to": {value: true}, "status": {value: true}, "error-code": {value: true}, "receipt-file": {value: true}, "receipts": {value: true}, "cwd": {value: true}, "source": {value: true, repeat: true}, "sort": {value: true}, "order": {value: true}, "limit": {value: true}, "cursor": {value: true}, "view": {value: true}, "turn": {value: true}, "model": {value: true}, "name": {value: true}, "through-turn": {value: true}, "before-turn": {value: true}, "thread": {value: true}, "state": {value: true}, "since": {value: true}, "resolve-as": {value: true}, "reason": {value: true}, "evidence": {value: true}, "ssh": {value: true}, "unix": {value: true}, "id": {value: true}, "herdr": {value: true}, "before": {value: true}, "params": {value: true}, "params-file": {value: true}, "allow-effect": {value: true, repeat: true}, "output": {value: true},
 }
 
 // Parse validates syntax-independent option shape and returns the invocation.
@@ -78,6 +78,9 @@ func Parse(args []string) (Invocation, error) {
 			if name == "state-dir" {
 				inv.Global.StateDir = value
 			}
+			if name == "color" {
+				inv.Global.Color = value
+			}
 			if !spec.repeat && len(inv.Options[name]) > 0 {
 				return inv, usageError("option --" + name + " may only be supplied once")
 			}
@@ -137,7 +140,7 @@ func validateInvocation(a *App, inv Invocation) *Error {
 	}
 	allowed := allowedOptions(strings.Join(inv.Path, " "))
 	for option := range inv.Options {
-		if option == "help" || option == "json" || option == "human" || option == "debug" || option == "audit" || option == "endpoint" || option == "config" || option == "state-dir" {
+		if option == "help" || option == "json" || option == "human" || option == "debug" || option == "audit" || option == "endpoint" || option == "config" || option == "state-dir" || option == "color" {
 			continue
 		}
 		if !allowed[option] {
@@ -361,7 +364,7 @@ func validateNested(inv Invocation) *Error {
 		}
 	}
 	for option := range inv.Options {
-		if option == "help" || option == "json" || option == "human" || option == "debug" || option == "audit" || option == "endpoint" || option == "config" || option == "state-dir" {
+		if option == "help" || option == "json" || option == "human" || option == "debug" || option == "audit" || option == "endpoint" || option == "config" || option == "state-dir" || option == "color" {
 			continue
 		}
 		if !allowed[option] {

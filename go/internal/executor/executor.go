@@ -850,7 +850,7 @@ func (e *Executor) resultEnvelope(ctx context.Context, eventKind, resultKind, fi
 		// important because App preserves this top-level location verbatim.
 		eventMachine["warnings"] = warningObjects(warnings)
 	}
-	event := cli.OutputEvent{Machine: eventMachine, Human: eventKind}
+	event := cli.OutputEvent{Machine: eventMachine, Human: humanResult(eventKind, data, cursor, subcommand)}
 	result := cli.ExecutionResult{Events: []cli.OutputEvent{event}, Exit: cli.ExitSuccess}
 	if receipt != nil {
 		result.Receipt = receipt
