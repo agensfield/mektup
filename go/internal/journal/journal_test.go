@@ -424,7 +424,11 @@ func TestConcurrentIdenticalClaimsJoinAndConflict(t *testing.T) {
 	now.Store(time.Now().UnixNano())
 	j1 := testJournal(t, dir, &now)
 	prepared(t, j1)
-	j2, err := Open(context.Background(), Options{StateDir: dir, LeaseDuration: time.Second})
+	j2, err := Open(context.Background(), Options{
+		StateDir:      dir,
+		LeaseDuration: time.Second,
+		Now:           func() time.Time { return time.Unix(0, now.Load()) },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
