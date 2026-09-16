@@ -80,15 +80,6 @@ func (r FileRegistry) Register(ctx context.Context, endpointID string, j *journa
 	if resolved, resolveErr := j.ResolveStoreID(ctx, j.StoreID()); resolveErr != nil || resolved != j.StoreID() {
 		return fmt.Errorf("%w: locally opened journal identity is not stable", ErrStoreUnavailable)
 	}
-	verified, err := journal.OpenExisting(ctx, journal.Options{StateDir: stateDir})
-	if err != nil {
-		return fmt.Errorf("%w: verify locally opened journal: %v", ErrStoreUnavailable, err)
-	}
-	resolved, resolveErr := verified.ResolveStoreID(ctx, j.StoreID())
-	closeErr := verified.Close()
-	if resolveErr != nil || closeErr != nil || resolved != j.StoreID() {
-		return fmt.Errorf("%w: local journal store identity mismatch", ErrStoreUnavailable)
-	}
 	if err := ensurePrivateDirectory(filepath.Dir(r.Path)); err != nil {
 		return err
 	}
@@ -147,21 +138,9 @@ func (r FileRegistry) Resolve(ctx context.Context, endpointID, storeID string) (
 	if stateErr != nil || canonical != entry.StateDir {
 		return Store{}, fmt.Errorf("%w: registered state directory unavailable", ErrStoreUnavailable)
 	}
-	dbPath := filepath.Join(entry.StateDir, "journal.sqlite3")
-	dbFile, identity, err := openExistingDatabase(dbPath)
-	if err != nil {
-		return Store{}, err
-	}
 	j, err := journal.OpenExisting(ctx, journal.Options{StateDir: entry.StateDir})
 	if err != nil {
-		_ = dbFile.Close()
 		return Store{}, fmt.Errorf("%w: open registered journal: %v", ErrStoreUnavailable, err)
-	}
-	_ = dbFile.Close()
-	currentIdentity, identityErr := existingDatabaseIdentity(dbPath)
-	if identityErr != nil || currentIdentity != identity {
-		_ = j.Close()
-		return Store{}, fmt.Errorf("%w: registered journal was replaced during open", ErrStoreUnavailable)
 	}
 	resolved, err := j.ResolveStoreID(ctx, storeID)
 	if err != nil || resolved != j.StoreID() {

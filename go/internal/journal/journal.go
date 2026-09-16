@@ -119,12 +119,6 @@ func open(ctx context.Context, opts Options, existing bool) (*Journal, error) {
 		_ = databaseFile.Close()
 		_ = stateDirFile.Close()
 	}
-	if existing {
-		if err := preflightExistingDatabase(ctx, dbPath); err != nil {
-			closeFiles()
-			return nil, err
-		}
-	}
 	if err := verifyPathIdentity(dir, stateIdentity, true); err != nil {
 		closeFiles()
 		return nil, fmt.Errorf("journal: state directory replaced before SQLite open: %w", err)
@@ -144,11 +138,32 @@ func open(ctx context.Context, opts Options, existing bool) (*Journal, error) {
 	// URI pragmas apply to every connection in database/sql's pool. WAL is
 	// required for concurrent swarm processes; FK and busy handling are not
 	// optional safety settings.
-	dsn := "file:" + escapedSQLitePath(dbPath) + "?mode=rw&_pragma=busy_timeout(" + fmt.Sprint(timeout.Milliseconds()) + ")&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
+	dsn := "file:" + escapedSQLitePath(dbPath) + "?mode=rw&_pragma=busy_timeout(" + fmt.Sprint(timeout.Milliseconds()) + ")&_pragma=foreign_keys(1)&_pragma=synchronous(FULL)&_txlock=immediate"
+	if !existing {
+		dsn += "&_pragma=journal_mode(WAL)"
+	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		closeFiles()
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	if existing {
+		// Keep the one preflight connection alive. Closing a separate SQLite
+		// handle for this inode can cancel POSIX advisory locks held by another
+		// journal in the same process.
+		db.SetMaxOpenConns(1)
+		db.SetMaxIdleConns(1)
+		if err := preflightExistingDatabase(ctx, db); err != nil {
+			_ = db.Close()
+			closeFiles()
+			return nil, err
+		}
+		var mode string
+		if err := db.QueryRowContext(ctx, "PRAGMA journal_mode(WAL)").Scan(&mode); err != nil || mode != "wal" {
+			_ = db.Close()
+			closeFiles()
+			return nil, fmt.Errorf("journal: enable WAL on existing database: %w", ErrCorrupt)
+		}
 	}
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(8)
@@ -173,12 +188,7 @@ func open(ctx context.Context, opts Options, existing bool) (*Journal, error) {
 	return j, nil
 }
 
-func preflightExistingDatabase(ctx context.Context, path string) error {
-	db, err := sql.Open("sqlite", "file:"+escapedSQLitePath(path)+"?mode=ro")
-	if err != nil {
-		return fmt.Errorf("journal: existing database preflight: %w", ErrCorrupt)
-	}
-	defer db.Close()
+func preflightExistingDatabase(ctx context.Context, db *sql.DB) error {
 	if err := db.PingContext(ctx); err != nil {
 		return fmt.Errorf("journal: existing database preflight: %w", ErrCorrupt)
 	}
