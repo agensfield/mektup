@@ -50,7 +50,16 @@ func (s EndpointStore) ResolveEndpointID(id, codexHome string) (Endpoint, error)
 	} else if ok {
 		return builtin, nil
 	}
-	return s.ResolveEndpoint(id, codexHome)
+	cfg, err := s.Load()
+	if err != nil {
+		return Endpoint{}, err
+	}
+	for _, configured := range cfg.Endpoints {
+		if configured.ID == id {
+			return configured, nil
+		}
+	}
+	return Endpoint{}, fmt.Errorf("%w: %s", ErrEndpointNotFound, id)
 }
 
 // ResolveDestination resolves only the destination selector. It does not

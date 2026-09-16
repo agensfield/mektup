@@ -372,6 +372,27 @@ func TestLocalHerdrIgnoresSSHEndpointRunner(t *testing.T) {
 	}
 }
 
+func TestResolveEndpointIDNeverTreatsAliasAsPortableAuthority(t *testing.T) {
+	root := t.TempDir()
+	store := NewStoreWithIdentityHome(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"), filepath.Join(root, "identity"))
+	claimedID := "ep_0198f0e0-0000-7000-8000-000000000071"
+	actualID := "ep_0198f0e0-0000-7000-8000-000000000072"
+	route, err := SSHRoute("example.invalid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Add(Endpoint{ID: actualID, Alias: claimedID, Route: route, Herdr: HerdrDisabled}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ResolveEndpointID(claimedID, ""); !errors.Is(err, ErrEndpointNotFound) {
+		t.Fatalf("unmapped stable ID resolved through another endpoint's alias: %v", err)
+	}
+	resolved, err := store.ResolveEndpointID(actualID, "")
+	if err != nil || resolved.ID != actualID {
+		t.Fatalf("configured stable ID did not resolve exactly: endpoint=%+v err=%v", resolved, err)
+	}
+}
+
 func TestSSHArgvCannotCarryShellOrBody(t *testing.T) {
 	route, err := SSHRoute("host; touch /tmp/pwned")
 	if err == nil {
