@@ -825,6 +825,11 @@ func validateControlFixture(data []byte) error {
 }
 
 func validateOriginalStatusResultRunner(result map[string]any) error {
+	for _, field := range []string{"body", "bodyText", "bodyContent", "replyBody"} {
+		if _, present := result[field]; present {
+			return fmt.Errorf("originalStatus result forbids body field %s", field)
+		}
+	}
 	selection, ok := result["selection"].(string)
 	if !ok || selection == "" {
 		return errors.New("originalStatus result requires selection")

@@ -218,7 +218,7 @@
                     "then": { "not": { "required": ["replyErrorCode"] } }
                   }
                 ],
-                "not": { "anyOf": [{ "required": ["eventSeq"] }, { "required": ["replyStatus"] }, { "required": ["fencingToken"] }, { "required": ["lease"] }, { "required": ["winner"] }] }
+                "not": { "anyOf": [{ "required": ["eventSeq"] }, { "required": ["replyStatus"] }, { "required": ["body"] }, { "required": ["bodyText"] }, { "required": ["bodyContent"] }, { "required": ["replyBody"] }, { "required": ["fencingToken"] }, { "required": ["lease"] }, { "required": ["winner"] }] }
               },
               {
                 "properties": {
@@ -238,7 +238,7 @@
                     "then": { "not": { "required": ["replyErrorCode"] } }
                   }
                 ],
-                "not": { "anyOf": [{ "required": ["commitSeq"] }, { "required": ["nativeItemId"] }, { "required": ["replyStatus"] }, { "required": ["fencingToken"] }, { "required": ["lease"] }, { "required": ["winner"] }] }
+                "not": { "anyOf": [{ "required": ["commitSeq"] }, { "required": ["nativeItemId"] }, { "required": ["replyStatus"] }, { "required": ["body"] }, { "required": ["bodyText"] }, { "required": ["bodyContent"] }, { "required": ["replyBody"] }, { "required": ["fencingToken"] }, { "required": ["lease"] }, { "required": ["winner"] }] }
               },
               {
                 "properties": { "selection": { "const": "pending" } },
@@ -250,6 +250,10 @@
                     { "required": ["replyErrorCode"] },
                     { "required": ["bodyBytes"] },
                     { "required": ["bodySha256"] },
+                    { "required": ["body"] },
+                    { "required": ["bodyText"] },
+                    { "required": ["bodyContent"] },
+                    { "required": ["replyBody"] },
                     { "required": ["nativeItemId"] },
                     { "required": ["eventSeq"] },
                     { "required": ["commitSeq"] },

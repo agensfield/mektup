@@ -310,6 +310,11 @@ func validateLeaseObject(value json.RawMessage) error {
 }
 
 func validateOriginalStatusResult(result map[string]json.RawMessage) error {
+	for _, field := range []string{"body", "bodyText", "bodyContent", "replyBody"} {
+		if _, present := result[field]; present {
+			return fmt.Errorf("%w: originalStatus result forbids body field %s, including null", ErrControlValidation, field)
+		}
+	}
 	selection, ok := result["selection"]
 	if !ok {
 		return fmt.Errorf("%w: originalStatus result requires selection", ErrControlValidation)
