@@ -315,6 +315,11 @@ func validateLeaseObject(value json.RawMessage) error {
 }
 
 func validateOriginalStatusResult(result map[string]json.RawMessage) error {
+	for _, field := range []string{"status", "winner"} {
+		if _, present := result[field]; present {
+			return fmt.Errorf("%w: originalStatus result forbids legacy field %s, including null", ErrControlValidation, field)
+		}
+	}
 	for _, field := range []string{"body", "bodyText", "bodyContent", "replyBody"} {
 		if _, present := result[field]; present {
 			return fmt.Errorf("%w: originalStatus result forbids body field %s, including null", ErrControlValidation, field)
@@ -586,16 +591,6 @@ func (r ControlRequest) Validate() error {
 						}
 					}
 				}
-			}
-		} else if r.Operation == "originalStatus" {
-			if _, present := resultObject["status"]; present {
-				return fmt.Errorf("%w: originalStatus result forbids status", ErrControlValidation)
-			}
-			if _, present := resultObject["winner"]; present {
-				return fmt.Errorf("%w: originalStatus result forbids winner", ErrControlValidation)
-			}
-			if err := validateOriginalStatusResult(resultObject); err != nil {
-				return err
 			}
 		}
 		return nil
