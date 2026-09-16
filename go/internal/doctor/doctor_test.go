@@ -139,3 +139,29 @@ func TestDoctorForeignOwnerIsNeverHealthyOrSafeFixable(t *testing.T) {
 		t.Fatalf("foreign-owned state produced repair receipts: %#v", report.Repairs)
 	}
 }
+
+func TestDoctorMissingDirectoryRepairRejectsSubstitutedFinalSymlink(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "unrelated")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	requested := filepath.Join(root, "state")
+	findings, err := probeDir(context.Background(), "state.directory", "state", requested)
+	if err != nil || len(findings) != 1 || findings[0].Fix == nil {
+		t.Fatalf("missing repair findings=%#v err=%v", findings, err)
+	}
+	if err := os.Symlink(target, requested); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := findings[0].Fix(context.Background()); err == nil {
+		t.Fatal("repair followed a substituted final symlink")
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o755 {
+		t.Fatalf("repair changed unrelated target mode to %04o", info.Mode().Perm())
+	}
+}

@@ -82,10 +82,11 @@ func safeEnsureDir(path string, mode uint32) error {
 }
 
 // canonicalExistingPrefix resolves existing ancestors such as macOS /var,
-// while leaving missing final components for descriptor-root creation. The
-// resolved path is still traversed with O_NOFOLLOW component opens.
+// but never resolves the requested final component. A final path that appears
+// between diagnosis and repair must still be opened with O_NOFOLLOW rather
+// than being converted into authority over its symlink target.
 func canonicalExistingPrefix(path string) (string, error) {
-	for candidate := path; ; candidate = filepath.Dir(candidate) {
+	for candidate := filepath.Dir(path); ; candidate = filepath.Dir(candidate) {
 		if _, err := os.Lstat(candidate); err == nil {
 			resolved, err := filepath.EvalSymlinks(candidate)
 			if err != nil {
