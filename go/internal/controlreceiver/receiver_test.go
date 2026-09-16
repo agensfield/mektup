@@ -284,6 +284,38 @@ func TestOriginalStatusResultRejectsAuthorityAndBodyKeysIncludingNull(t *testing
 	}
 }
 
+func TestOriginalStatusRejectsReplyBodyForEverySelection(t *testing.T) {
+	base := map[string]any{"schema": "mektup/control/v1", "kind": "result", "operation": "originalStatus", "operationId": operationID, "originalMessageId": originalID, "custody": map[string]any{"endpointId": receiverEndpoint, "storeId": "store_0198f0e0-0000-7000-8000-000000000002"}, "replyDestination": map[string]any{"endpointId": receiverEndpoint, "threadId": "source", "uri": "codex://local/thread/source"}}
+	selections := map[string]map[string]any{
+		"pending":          {"selection": "pending"},
+		"winner":           {"selection": "winner", "replyMessageId": replyID, "replyStatus": "success", "bodyBytes": 1, "bodySha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "state": "reply_accepted", "commitSeq": 1},
+		"terminal_unknown": {"selection": "terminal_unknown", "replyMessageId": replyID, "replyStatus": "success", "bodyBytes": 1, "bodySha256": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "state": "reply_outcome_unknown", "eventSeq": 1},
+	}
+	for selection, result := range selections {
+		for _, value := range []any{"body", nil} {
+			t.Run(selection+"/replyBody", func(t *testing.T) {
+				document := map[string]any{}
+				for k, v := range base {
+					document[k] = v
+				}
+				copyResult := map[string]any{}
+				for k, v := range result {
+					copyResult[k] = v
+				}
+				copyResult["replyBody"] = value
+				document["result"] = copyResult
+				data, err := json.Marshal(document)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := sshproxy.ValidateControlRequest(data); !errors.Is(err, sshproxy.ErrControlValidation) {
+					t.Fatalf("selection %s accepted replyBody=%v: %v", selection, value, err)
+				}
+			})
+		}
+	}
+}
+
 func TestReceiverOriginalStatusFailsBeforeEmittingCorruptWinner(t *testing.T) {
 	j, _ := openReceiverJournal(t, time.Minute)
 	prepareOriginal(t, j)

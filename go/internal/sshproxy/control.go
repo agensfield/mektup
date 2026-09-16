@@ -630,7 +630,7 @@ func (r ControlRequest) Validate() error {
 }
 
 func validateOriginalStatusResult(result map[string]json.RawMessage) error {
-	for _, field := range []string{"body", "bodyText", "bodyContent"} {
+	for _, field := range []string{"body", "bodyText", "bodyContent", "replyBody"} {
 		if _, ok := result[field]; ok {
 			return fmt.Errorf("%w: originalStatus result forbids %s", ErrControlValidation, field)
 		}
@@ -648,7 +648,7 @@ func validateOriginalStatusResult(result map[string]json.RawMessage) error {
 	if err != nil {
 		return err
 	}
-	selected := []string{"replyMessageId", "replyStatus", "bodyBytes", "bodySha256", "replyBody", "state", "commitSeq", "eventSeq", "replyErrorCode", "nativeItemId"}
+	selected := []string{"replyMessageId", "replyStatus", "bodyBytes", "bodySha256", "state", "commitSeq", "eventSeq", "replyErrorCode", "nativeItemId"}
 	if selection == "pending" {
 		for _, field := range selected {
 			if _, ok := result[field]; ok {
