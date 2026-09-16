@@ -436,8 +436,7 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, j *journal.Journal, store endpoint.EndpointStore, artifacts *artifact.Store, input executor.ReaderInput, facts *connectionFacts) (*runtime.ConnectionPool, *messageexecutor.Executor, error) {
 	codexHome := firstNonEmpty(inv.Resolved.CodexHome, e.options.CodexHome)
 	stateProbe := e.options.ThreadStateProbe
-	herdr := endpoint.NewHerdrResolver(e.options.HerdrRunner)
-	herdr.EndpointRunner = e.options.HerdrEndpointRunner
+	herdr := e.herdrResolver()
 	sessionFactory := e.options.SessionFactory
 	if sessionFactory == nil {
 		sessionFactory = applicationSessionFactory{options: e.options.Connection, sshConfig: e.options.SSHConfig, sshFactory: e.options.SSHFactory, dialerForRoute: e.options.DialerForRoute, facts: facts}
@@ -542,6 +541,18 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 		}
 		return artifactSpillWriter{store: artifacts}, nil
 	}, History: historyFactory, Inspector: inspectorFactory, HumanGate: gateFactory, ImportResolver: importResolver, PrepareCustody: prepareCustody}), nil
+}
+
+func (e *Environment) herdrResolver() *endpoint.HerdrResolver {
+	herdr := endpoint.NewHerdrResolver(e.options.HerdrRunner)
+	herdr.EndpointRunner = e.options.HerdrEndpointRunner
+	if herdr.EndpointRunner == nil {
+		herdr.EndpointRunner = endpoint.RemoteHerdrRunner{
+			Config:  endpoint.HerdrRunnerConfig{SSH: e.options.SSHConfig},
+			Factory: e.options.SSHFactory,
+		}
+	}
+	return herdr
 }
 
 func enrichMessagingReceipt(receipt mektup.Receipt, store endpoint.EndpointStore, codexHome string, facts *connectionFacts) mektup.Receipt {

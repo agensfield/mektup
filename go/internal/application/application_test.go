@@ -27,6 +27,7 @@ import (
 	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/rawrpc"
 	"github.com/agensfield/mektup/go/internal/runtime"
+	"github.com/agensfield/mektup/go/internal/sshproxy"
 	_ "modernc.org/sqlite"
 )
 
@@ -808,5 +809,33 @@ func TestMessagingPoolCleanupWarningIsDurable(t *testing.T) {
 	_ = j.Close()
 	if err != nil || len(stored.Warnings) == 0 {
 		t.Fatalf("cleanup warning was not durable: err=%v receipt=%+v", err, stored)
+	}
+}
+
+func TestMessagingUsesBoundedRemoteHerdrRunnerByDefault(t *testing.T) {
+	factory := sshproxy.ProcessFactoryFunc(func([]string) (sshproxy.Process, error) {
+		return nil, errors.New("not invoked")
+	})
+	environment := New(Options{
+		SSHConfig:  sshproxy.Config{SSHBinary: "/usr/bin/ssh"},
+		SSHFactory: factory,
+	})
+	resolver := environment.herdrResolver()
+	runner, ok := resolver.EndpointRunner.(endpoint.RemoteHerdrRunner)
+	if !ok {
+		t.Fatalf("endpoint runner = %T", resolver.EndpointRunner)
+	}
+	if runner.Config.SSH.SSHBinary != "/usr/bin/ssh" || runner.Factory == nil {
+		t.Fatalf("remote runner was not composed from application SSH options: %#v", runner.Config.SSH)
+	}
+}
+
+func TestMessagingPreservesInjectedHerdrEndpointRunner(t *testing.T) {
+	injected := endpoint.EndpointCommandRunnerFunc(func(context.Context, endpoint.Endpoint, []string) ([]byte, error) {
+		return []byte("{\"agents\":[]}"), nil
+	})
+	environment := New(Options{HerdrEndpointRunner: injected})
+	if _, ok := environment.herdrResolver().EndpointRunner.(endpoint.EndpointCommandRunnerFunc); !ok {
+		t.Fatalf("injected endpoint runner was replaced")
 	}
 }
