@@ -1336,6 +1336,14 @@ func (j *Journal) StateDir() string { return j.stateDir }
 func (j *Journal) StoreID() string  { j.mu.RLock(); defer j.mu.RUnlock(); return j.storeID }
 func (j *Journal) nowUnix() int64   { return j.now().UTC().UnixNano() }
 
+// ValidateOpenIdentity proves that the pathname still names the private
+// directory and database descriptors acquired by this journal. It performs no
+// opens, closes, repairs, or SQLite work, so callers may use it without
+// disturbing WAL locks held by this or another handle in the process.
+func (j *Journal) ValidateOpenIdentity() error {
+	return validateOpenFiles(j.stateDir, j.stateIdentity, j.stateDirFile, filepath.Join(j.stateDir, "journal.sqlite3"), j.dbIdentity, j.databaseFile)
+}
+
 // ResolveStoreID preserves custody references issued by the pre-UUIDv7
 // journal while making the new canonical identity explicit.
 func (j *Journal) ResolveStoreID(ctx context.Context, id string) (string, error) {

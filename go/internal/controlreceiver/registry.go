@@ -73,6 +73,9 @@ func (r FileRegistry) Register(ctx context.Context, endpointID string, j *journa
 	if r.Path == "" || j == nil || !validID(endpointID, mektup.EndpointIDPrefix) {
 		return fmt.Errorf("%w: invalid local registration", ErrRegistryInvalid)
 	}
+	if err := j.ValidateOpenIdentity(); err != nil {
+		return fmt.Errorf("%w: locally opened journal identity changed: %v", ErrStoreUnavailable, err)
+	}
 	stateDir, err := canonicalStateDirectory(j.StateDir())
 	if err != nil {
 		return err

@@ -68,5 +68,27 @@ func verifyPathIdentity(path string, expected fileIdentity, directory bool) erro
 }
 
 func secureDatabaseFiles(_ *os.File, database *os.File) error {
-	return database.Chmod(0600)
+	info, err := database.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0600 {
+		return fmt.Errorf("journal: database is not an owner-private regular file")
+	}
+	return nil
+}
+
+func validateOpenFiles(statePath string, stateIdentity fileIdentity, dir *os.File, databasePath string, databaseIdentity fileIdentity, database *os.File) error {
+	dirInfo, err := dir.Stat()
+	if err != nil || !dirInfo.IsDir() || dirInfo.Mode().Perm() != 0700 {
+		return fmt.Errorf("journal: state directory is not owner-private")
+	}
+	databaseInfo, err := database.Stat()
+	if err != nil || !databaseInfo.Mode().IsRegular() || databaseInfo.Mode().Perm() != 0600 {
+		return fmt.Errorf("journal: database is not owner-private")
+	}
+	if err := verifyPathIdentity(statePath, stateIdentity, true); err != nil {
+		return fmt.Errorf("journal: state directory identity changed: %w", err)
+	}
+	if err := verifyPathIdentity(databasePath, databaseIdentity, false); err != nil {
+		return fmt.Errorf("journal: database identity changed: %w", err)
+	}
+	return nil
 }

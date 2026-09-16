@@ -96,6 +96,64 @@ func TestRegistryRegisterResolveConflictAndOversize(t *testing.T) {
 	}
 }
 
+func TestRegistryResolveRejectsUnsafeDatabaseModeWithoutRepair(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "journal")
+	j, err := journal.Open(context.Background(), journal.Options{StateDir: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := FileRegistry{Path: filepath.Join(root, "registry", controlRegistryFilename)}
+	endpointID := "ep_0198f0e0-0000-7000-8000-000000000001"
+	if err := registry.Register(context.Background(), endpointID, j); err != nil {
+		t.Fatal(err)
+	}
+	if err := j.Close(); err != nil {
+		t.Fatal(err)
+	}
+	database := filepath.Join(state, "journal.sqlite3")
+	if err := os.Chmod(database, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := registry.Resolve(context.Background(), endpointID, j.StoreID()); err == nil {
+		t.Fatal("unsafe database mode resolved")
+	}
+	info, err := os.Stat(database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0644 {
+		t.Fatalf("resolve repaired unsafe mode to %04o", info.Mode().Perm())
+	}
+}
+
+func TestRegistryRegisterRejectsReplacedJournalPath(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "journal")
+	j, err := journal.Open(context.Background(), journal.Options{StateDir: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer j.Close()
+	moved := filepath.Join(root, "moved")
+	if err := os.Rename(state, moved); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := journal.Open(context.Background(), journal.Options{StateDir: state})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer replacement.Close()
+	registry := FileRegistry{Path: filepath.Join(root, "registry", controlRegistryFilename)}
+	endpointID := "ep_0198f0e0-0000-7000-8000-000000000001"
+	if err := registry.Register(context.Background(), endpointID, j); !errors.Is(err, ErrStoreUnavailable) {
+		t.Fatalf("replaced path registration error=%v", err)
+	}
+	if _, err := os.Stat(registry.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replaced path created registry: %v", err)
+	}
+}
+
 func TestBuiltinIdentitySharedAcrossOperationState(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_DATA_HOME", filepath.Join(root, "machine"))

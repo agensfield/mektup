@@ -53,7 +53,7 @@ func acquireStateDirectory(path string, create bool) (*os.File, fileIdentity, er
 		_ = unix.Close(fd)
 		return nil, fileIdentity{}, fmt.Errorf("journal: open state directory descriptor")
 	}
-	identity, err := verifyDirectoryDescriptor(file, 0700)
+	identity, err := verifyDirectoryDescriptor(file, 0700, create)
 	if err != nil {
 		_ = file.Close()
 		return nil, fileIdentity{}, err
@@ -65,7 +65,7 @@ func acquireStateDirectory(path string, create bool) (*os.File, fileIdentity, er
 	return file, identity, nil
 }
 
-func verifyDirectoryDescriptor(file *os.File, mode os.FileMode) (fileIdentity, error) {
+func verifyDirectoryDescriptor(file *os.File, mode os.FileMode, repair bool) (fileIdentity, error) {
 	var stat unix.Stat_t
 	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
 		return fileIdentity{}, fmt.Errorf("journal: stat state directory: %w", err)
@@ -77,6 +77,9 @@ func verifyDirectoryDescriptor(file *os.File, mode os.FileMode) (fileIdentity, e
 		return fileIdentity{}, fmt.Errorf("journal: state directory is not owned by current euid")
 	}
 	if uint32(stat.Mode&0777) != uint32(mode.Perm()) {
+		if !repair {
+			return fileIdentity{}, fmt.Errorf("journal: state directory is not mode %04o", mode.Perm())
+		}
 		if err := unix.Fchmod(int(file.Fd()), uint32(mode.Perm())); err != nil {
 			return fileIdentity{}, fmt.Errorf("journal: protect state directory: %w", err)
 		}
@@ -104,7 +107,7 @@ func acquireDatabase(dir *os.File, path string, create bool) (*os.File, fileIden
 		_ = unix.Close(fd)
 		return nil, fileIdentity{}, fmt.Errorf("journal: open database descriptor")
 	}
-	identity, err := verifyDatabaseDescriptor(file)
+	identity, err := verifyDatabaseDescriptor(file, create)
 	if err != nil {
 		_ = file.Close()
 		return nil, fileIdentity{}, err
@@ -116,7 +119,7 @@ func acquireDatabase(dir *os.File, path string, create bool) (*os.File, fileIden
 	return file, identity, nil
 }
 
-func verifyDatabaseDescriptor(file *os.File) (fileIdentity, error) {
+func verifyDatabaseDescriptor(file *os.File, repair bool) (fileIdentity, error) {
 	var stat unix.Stat_t
 	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
 		return fileIdentity{}, fmt.Errorf("journal: stat database: %w", err)
@@ -128,6 +131,9 @@ func verifyDatabaseDescriptor(file *os.File) (fileIdentity, error) {
 		return fileIdentity{}, fmt.Errorf("journal: database is not owned by current euid")
 	}
 	if stat.Mode&0777 != 0600 {
+		if !repair {
+			return fileIdentity{}, fmt.Errorf("journal: database is not mode 0600")
+		}
 		if err := unix.Fchmod(int(file.Fd()), 0600); err != nil {
 			return fileIdentity{}, fmt.Errorf("journal: protect database: %w", err)
 		}
@@ -160,7 +166,7 @@ func verifyPathIdentity(path string, expected fileIdentity, directory bool) erro
 }
 
 func secureDatabaseFiles(dir, database *os.File) error {
-	if _, err := verifyDatabaseDescriptor(database); err != nil {
+	if _, err := verifyDatabaseDescriptor(database, false); err != nil {
 		return err
 	}
 	for _, name := range []string{"journal.sqlite3-wal", "journal.sqlite3-shm"} {
@@ -181,6 +187,22 @@ func secureDatabaseFiles(dir, database *os.File) error {
 		if stat.Mode&0777 != 0600 {
 			return fmt.Errorf("journal: %s is not mode 0600", name)
 		}
+	}
+	return nil
+}
+
+func validateOpenFiles(statePath string, stateIdentity fileIdentity, dir *os.File, databasePath string, databaseIdentity fileIdentity, database *os.File) error {
+	if _, err := verifyDirectoryDescriptor(dir, 0700, false); err != nil {
+		return err
+	}
+	if _, err := verifyDatabaseDescriptor(database, false); err != nil {
+		return err
+	}
+	if err := verifyPathIdentity(statePath, stateIdentity, true); err != nil {
+		return fmt.Errorf("journal: state directory identity changed: %w", err)
+	}
+	if err := verifyPathIdentity(databasePath, databaseIdentity, false); err != nil {
+		return fmt.Errorf("journal: database identity changed: %w", err)
 	}
 	return nil
 }
