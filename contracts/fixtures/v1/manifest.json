@@ -1,10 +1,13 @@
 {
   "schema": "mektup/contracts/v1/manifest",
-  "contractVersion": "1.0.6",
+  "contractVersion": "1.0.7",
   "fixtures": [
     { "kind": "envelope-metadata", "schema": "Mektup/1", "path": "envelope-agent-request.json" },
     { "kind": "envelope-rendered", "schema": "Mektup/1", "path": "envelope-agent-request.txt" },
     { "kind": "envelope-metadata", "schema": "Mektup/1", "path": "envelope-reply.json" },
+    { "kind": "envelope-negative", "schema": "Mektup/1", "path": "envelope-herdr-name-null.invalid.json", "expected": "invalid" },
+    { "kind": "envelope-negative", "schema": "Mektup/1", "path": "envelope-herdr-name-unsafe.invalid.json", "expected": "invalid" },
+    { "kind": "envelope-negative", "schema": "Mektup/1", "path": "envelope-herdr-name-without-pane.invalid.json", "expected": "invalid" },
     { "kind": "receipt", "schema": "mektup/receipt/v1", "path": "receipt-accepted.json" },
     { "kind": "receipt", "schema": "mektup/receipt/v1", "path": "receipt-outcome-unknown.json" },
     { "kind": "event", "schema": "mektup/event/v1", "path": "event-send-accepted.json" },

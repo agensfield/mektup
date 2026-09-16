@@ -1,4 +1,4 @@
-# Mektup agent guide (contract 1.0.6)
+# Mektup agent guide (contract 1.0.7)
 
 Mektup delivers messages to Codex threads and preserves evidence. Use ordinary
 `mektup send <target> <message>` for one-way delivery. Use
@@ -35,6 +35,12 @@ codex://local/thread/<thread-uuid>
 
 Zero or multiple live Herdr-name matches fail closed. Resolution success proves
 the target identity was found; it is not message delivery evidence.
+
+When the source has one verified Herdr pane association and a safe registered
+agent name, wrapped envelopes may include `from-herdr-name` beside the stable
+`from-herdr` URI. Treat the name as convenient sender presentation only. It is
+not routing, custody, authentication, or proof that the sender understood a
+reply.
 
 Reply custody claim results are an authority union: `claimed` includes the
 current fencing token and lease for the one caller allowed to submit the body;

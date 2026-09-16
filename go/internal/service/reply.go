@@ -125,7 +125,7 @@ func (s *Service) reply(ctx context.Context, resolver OriginalResolver, req Repl
 	} else if err := mektup.ValidateID(replyID, mektup.MessageIDPrefix); err != nil {
 		return ReplyResult{}, semantic(mektup.ErrInvalidArguments, "reply message identity is invalid", nil, err)
 	}
-	e := mektup.Envelope{MessageID: replyID, Kind: mektup.KindReply, FromEndpointID: source.EndpointID, From: source.URI, FromKind: kindOf(source), FromHerdr: source.Herdr,
+	e := mektup.Envelope{MessageID: replyID, Kind: mektup.KindReply, FromEndpointID: source.EndpointID, From: source.URI, FromKind: kindOf(source), FromHerdr: source.Herdr, FromHerdrName: source.HerdrName,
 		ToEndpointID: original.Envelope.ReplyEndpointID, To: wireTargetURI, RequestedTarget: original.Envelope.ReplyTo, InReplyTo: original.Envelope.MessageID,
 		ReplyStatus: req.Status, ReplyErrorCode: req.ErrorCode, Body: req.Body, Provenance: "observed"}
 	e.From = wireSourceURI

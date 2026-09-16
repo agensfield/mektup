@@ -37,6 +37,7 @@ type Envelope struct {
 	From                   string      `json:"from"`
 	FromKind               string      `json:"from-kind"`
 	FromHerdr              string      `json:"from-herdr"`
+	FromHerdrName          string      `json:"from-herdr-name,omitempty"`
 	ToEndpointID           string      `json:"to-endpoint-id"`
 	To                     string      `json:"to"`
 	RequestedTarget        string      `json:"requested-target"`
@@ -63,6 +64,22 @@ var envelopeFields = []string{
 	"to-endpoint-id", "to", "requested-target", "in-reply-to", "reply-requested",
 	"reply-endpoint-id", "reply-to", "reply-custody-endpoint-id", "reply-custody-store-id",
 	"sent-at", "payload-bytes", "payload-sha256", "provenance",
+}
+
+// ValidHerdrDisplayName reports whether value is the exact registered Herdr
+// agent-name grammar. Names are observed presentation metadata, never routing,
+// custody, or authorship authority.
+func ValidHerdrDisplayName(value string) bool {
+	if len(value) == 0 || len(value) > 32 || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for i := 1; i < len(value); i++ {
+		c := value[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
 }
 
 func sha256Digest(body string) string {
@@ -210,6 +227,9 @@ func (e Envelope) normalizedForRender() (Envelope, error) {
 	if e.Provenance == "" {
 		e.Provenance = "observed"
 	}
+	if e.FromHerdr == "" || !ValidHerdrDisplayName(e.FromHerdrName) {
+		e.FromHerdrName = ""
+	}
 	return e, e.Validate()
 }
 
@@ -238,7 +258,8 @@ func RenderEnvelope(e Envelope) ([]byte, error) {
 	values := map[string]any{
 		"message-id": e.MessageID, "kind": string(e.Kind), "from-endpoint-id": e.FromEndpointID,
 		"from": nullableString(e.From), "from-kind": e.FromKind, "from-herdr": nullableString(e.FromHerdr),
-		"to-endpoint-id": e.ToEndpointID, "to": e.To, "requested-target": e.RequestedTarget,
+		"from-herdr-name": e.FromHerdrName,
+		"to-endpoint-id":  e.ToEndpointID, "to": e.To, "requested-target": e.RequestedTarget,
 		"in-reply-to": nullableString(e.InReplyTo), "reply-requested": e.ReplyRequested,
 		"reply-endpoint-id": nullableString(e.ReplyEndpointID), "reply-to": nullableString(e.ReplyTo),
 		"reply-custody-endpoint-id": nullableString(e.ReplyCustodyEndpointID), "reply-custody-store-id": nullableString(e.ReplyCustodyStoreID),
@@ -246,15 +267,22 @@ func RenderEnvelope(e Envelope) ([]byte, error) {
 	}
 	var out strings.Builder
 	out.WriteString("[Mektup/1]\n")
-	fields := envelopeFields
+	fields := append([]string(nil), envelopeFields...)
+	if e.FromHerdrName != "" {
+		fields = append(fields[:6], append([]string{"from-herdr-name"}, fields[6:]...)...)
+	}
 	if e.Kind == KindReply {
 		// Reply status is part of the canonical reply extension and appears
 		// before the timestamp. The sender-defined error code is optional.
-		fields = append(append([]string(nil), envelopeFields[:15]...), "reply-status")
+		timestamp := 0
+		for fields[timestamp] != "sent-at" {
+			timestamp++
+		}
+		fields = append(append([]string(nil), fields[:timestamp]...), "reply-status")
 		if e.ReplyErrorCode != "" {
 			fields = append(fields, "reply-error-code")
 		}
-		fields = append(fields, envelopeFields[15:]...)
+		fields = append(fields, append([]string(nil), envelopeFields[15:]...)...)
 		values["reply-status"] = string(e.ReplyStatus)
 		values["reply-error-code"] = nullableString(e.ReplyErrorCode)
 	}
@@ -385,10 +413,12 @@ func ParseEnvelope(input []byte) (Envelope, error) {
 	}
 	rest := input[len(marker):]
 	fields := make(map[string]scalar, len(envelopeFields))
+	seen := make(map[string]struct{}, len(envelopeFields))
 	known := make(map[string]struct{}, len(envelopeFields))
 	for _, f := range envelopeFields {
 		known[f] = struct{}{}
 	}
+	known["from-herdr-name"] = struct{}{}
 	known["reply-status"] = struct{}{}
 	known["reply-error-code"] = struct{}{}
 	var body []byte
@@ -419,8 +449,21 @@ func ParseEnvelope(input []byte) (Envelope, error) {
 			}
 			continue
 		}
-		if _, ok := fields[key]; ok {
+		if _, ok := seen[key]; ok {
 			return Envelope{}, fmt.Errorf("mektup: duplicate header %q", key)
+		}
+		seen[key] = struct{}{}
+		if key == "from-herdr-name" {
+			if !json.Valid([]byte(raw)) {
+				return Envelope{}, fmt.Errorf("mektup: malformed from-herdr-name header")
+			}
+			var candidate any
+			if json.Unmarshal([]byte(raw), &candidate) == nil {
+				if name, ok := candidate.(string); ok && ValidHerdrDisplayName(name) {
+					fields[key] = scalar{value: name}
+				}
+			}
+			continue
 		}
 		value, err := parseScalar(raw)
 		if err != nil {
@@ -453,6 +496,10 @@ func ParseEnvelope(input []byte) (Envelope, error) {
 	fromHerdr, err := getNullable("from-herdr")
 	if err != nil {
 		return Envelope{}, err
+	}
+	fromHerdrName, _ := getOptionalString(fields, "from-herdr-name")
+	if fromHerdr == "" {
+		fromHerdrName = ""
 	}
 	toEndpoint, err := get("to-endpoint-id")
 	if err != nil {
@@ -528,7 +575,7 @@ func ParseEnvelope(input []byte) (Envelope, error) {
 		}
 	}
 	e := Envelope{MessageID: messageID, Kind: MessageKind(kind), FromEndpointID: fromEndpoint, From: from,
-		FromKind: fromKind, FromHerdr: fromHerdr, ToEndpointID: toEndpoint, To: to, RequestedTarget: requested,
+		FromKind: fromKind, FromHerdr: fromHerdr, FromHerdrName: fromHerdrName, ToEndpointID: toEndpoint, To: to, RequestedTarget: requested,
 		InReplyTo: inReply, ReplyRequested: replyRequested, ReplyEndpointID: replyEndpoint, ReplyTo: replyTo,
 		ReplyCustodyEndpointID: custodyEndpoint, ReplyCustodyStoreID: custodyStore, ReplyStatus: ReplyStatus(replyStatus),
 		ReplyErrorCode: replyError, SentAt: sentAt, PayloadBytes: payloadBytes, PayloadSHA256: digest,
@@ -544,6 +591,13 @@ func getNullableOptional(fields map[string]scalar, name string) (string, error) 
 		return "", nil
 	}
 	return getString(fields, name, true)
+}
+
+func getOptionalString(fields map[string]scalar, name string) (string, error) {
+	if _, ok := fields[name]; !ok {
+		return "", nil
+	}
+	return getString(fields, name, false)
 }
 
 func ParseMessage(input []byte) (Message, error) { return ParseEnvelope(input) }

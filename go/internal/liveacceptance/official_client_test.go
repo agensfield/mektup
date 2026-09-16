@@ -25,7 +25,7 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// TestOfficialInteractiveClientSharedCallback is the locked spec-1.0.6 TUI
+// TestOfficialInteractiveClientSharedCallback is the locked spec-1.0.7 TUI
 // acceptance. Codex's pinned official app-server test client owns the callback
 // and answers through a real PTY; Mektup remains an observer on the same daemon
 // and thread across detach and pending replay.

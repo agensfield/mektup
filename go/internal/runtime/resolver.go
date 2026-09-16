@@ -70,12 +70,16 @@ func (r ResolverAdapter) ResolveSource(ctx context.Context, source string) (serv
 	}
 	uri := codexURI(resolved.Endpoint.ID, resolved.ThreadID)
 	herdrURI := ""
+	herdrName := ""
 	if r.Herdr != nil && resolved.Endpoint.HerdrEnabled() {
 		if provenance, provenanceErr := r.Herdr.ResolveThreadEndpoint(ctx, resolved.Endpoint, resolved.ThreadID); provenanceErr == nil {
 			herdrURI = "herdr://" + resolved.Endpoint.ID + "/pane/" + url.PathEscape(provenance.Pane)
+			if mektup.ValidHerdrDisplayName(provenance.Name) {
+				herdrName = provenance.Name
+			}
 		}
 	}
-	return service.SourceIdentity{EndpointID: resolved.Endpoint.ID, URI: uri, Herdr: herdrURI, Human: false, CustodyEndpointID: firstNonEmpty(r.CustodyEndpointID, resolved.Endpoint.ID), CustodyStoreID: r.CustodyStoreID}, nil
+	return service.SourceIdentity{EndpointID: resolved.Endpoint.ID, URI: uri, Herdr: herdrURI, HerdrName: herdrName, Human: false, CustodyEndpointID: firstNonEmpty(r.CustodyEndpointID, resolved.Endpoint.ID), CustodyStoreID: r.CustodyStoreID}, nil
 }
 
 func (r ResolverAdapter) ResolvePinned(ctx context.Context, endpointID, uri string) (service.ResolvedTarget, error) {

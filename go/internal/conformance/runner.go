@@ -272,6 +272,7 @@ func validateManifestFixture(f manifestFixture) error {
 	want, ok := map[string]string{
 		"envelope-metadata": "Mektup/1",
 		"envelope-rendered": "Mektup/1",
+		"envelope-negative": "Mektup/1",
 		"receipt":           "mektup/receipt/v1",
 		"event":             "mektup/event/v1",
 		"warning":           "mektup/warning/v1",
@@ -306,6 +307,8 @@ func validateFixture(f manifestFixture, data []byte, root string) error {
 		return validateEnvelopeMetadata(data, root)
 	case "envelope-rendered":
 		return validateRenderedEnvelope(data)
+	case "envelope-negative":
+		return validateEnvelopeMetadata(data, root)
 	case "receipt":
 		return validateReceiptFixture(data)
 	case "event":
@@ -349,6 +352,9 @@ func validateRenderedEnvelope(data []byte) error {
 }
 
 func validateEnvelopeMetadata(data []byte, root string) error {
+	if err := validateCanonicalHerdrNameField(data); err != nil {
+		return err
+	}
 	// Envelope implements encoding.TextUnmarshaler for the target-visible
 	// rendering, so JSON metadata must be decoded through a method-free alias.
 	var metadata struct {
@@ -358,6 +364,7 @@ func validateEnvelopeMetadata(data []byte, root string) error {
 		From                   string             `json:"from"`
 		FromKind               string             `json:"from-kind"`
 		FromHerdr              string             `json:"from-herdr"`
+		FromHerdrName          string             `json:"from-herdr-name"`
 		ToEndpointID           string             `json:"to-endpoint-id"`
 		To                     string             `json:"to"`
 		RequestedTarget        string             `json:"requested-target"`
@@ -377,7 +384,7 @@ func validateEnvelopeMetadata(data []byte, root string) error {
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return err
 	}
-	e := mektup.Envelope{MessageID: metadata.MessageID, Kind: metadata.Kind, FromEndpointID: metadata.FromEndpointID, From: metadata.From, FromKind: metadata.FromKind, FromHerdr: metadata.FromHerdr, ToEndpointID: metadata.ToEndpointID, To: metadata.To, RequestedTarget: metadata.RequestedTarget, InReplyTo: metadata.InReplyTo, ReplyRequested: metadata.ReplyRequested, ReplyEndpointID: metadata.ReplyEndpointID, ReplyTo: metadata.ReplyTo, ReplyCustodyEndpointID: metadata.ReplyCustodyEndpointID, ReplyCustodyStoreID: metadata.ReplyCustodyStoreID, ReplyStatus: metadata.ReplyStatus, ReplyErrorCode: metadata.ReplyErrorCode, SentAt: metadata.SentAt, PayloadBytes: metadata.PayloadBytes, PayloadSHA256: metadata.PayloadSHA256, Provenance: metadata.Provenance}
+	e := mektup.Envelope{MessageID: metadata.MessageID, Kind: metadata.Kind, FromEndpointID: metadata.FromEndpointID, From: metadata.From, FromKind: metadata.FromKind, FromHerdr: metadata.FromHerdr, FromHerdrName: metadata.FromHerdrName, ToEndpointID: metadata.ToEndpointID, To: metadata.To, RequestedTarget: metadata.RequestedTarget, InReplyTo: metadata.InReplyTo, ReplyRequested: metadata.ReplyRequested, ReplyEndpointID: metadata.ReplyEndpointID, ReplyTo: metadata.ReplyTo, ReplyCustodyEndpointID: metadata.ReplyCustodyEndpointID, ReplyCustodyStoreID: metadata.ReplyCustodyStoreID, ReplyStatus: metadata.ReplyStatus, ReplyErrorCode: metadata.ReplyErrorCode, SentAt: metadata.SentAt, PayloadBytes: metadata.PayloadBytes, PayloadSHA256: metadata.PayloadSHA256, Provenance: metadata.Provenance}
 	if err := validateEnvelopeFields(e); err != nil {
 		return err
 	}
@@ -406,6 +413,26 @@ func validateEnvelopeMetadata(data []byte, root string) error {
 	return nil
 }
 
+func validateCanonicalHerdrNameField(data []byte) error {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	nameRaw, present := raw["from-herdr-name"]
+	if !present {
+		return nil
+	}
+	var name string
+	if err := json.Unmarshal(nameRaw, &name); err != nil || !mektup.ValidHerdrDisplayName(name) {
+		return errors.New("envelope Herdr presentation name is not canonical")
+	}
+	var pane string
+	if err := json.Unmarshal(raw["from-herdr"], &pane); err != nil || pane == "" {
+		return errors.New("envelope Herdr presentation name requires stable pane provenance")
+	}
+	return nil
+}
+
 func validateEnvelopeFields(e mektup.Envelope) error {
 	if e.Kind != mektup.KindMessage && e.Kind != mektup.KindReply {
 		return fmt.Errorf("invalid envelope kind %q", e.Kind)
@@ -429,6 +456,9 @@ func validateEnvelopeFields(e mektup.Envelope) error {
 		if _, err := mektup.ParseThreadURI(e.From); err != nil {
 			return fmt.Errorf("from: %w", err)
 		}
+	}
+	if e.FromHerdrName != "" && (e.FromHerdr == "" || !mektup.ValidHerdrDisplayName(e.FromHerdrName)) {
+		return errors.New("envelope Herdr presentation name is not canonical")
 	}
 	if strings.HasPrefix(e.RequestedTarget, "codex://") {
 		if _, err := mektup.ParseThreadURI(e.RequestedTarget); err != nil {
@@ -933,11 +963,11 @@ func validateOriginalStatusResultRunner(result map[string]any) error {
 }
 
 func validateScenarioDocuments(s scenariosDocument, t transitionsDocument) error {
-	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.6" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
+	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.7" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
 		return errors.New("scenarios document metadata is incomplete")
 	}
-	if t.SpecVersion != "1.0.6" {
-		return errors.New("transitions document spec revision is not 1.0.6")
+	if t.SpecVersion != "1.0.7" {
+		return errors.New("transitions document spec revision is not 1.0.7")
 	}
 	states := map[string]bool{"none": true}
 	for _, state := range t.States {

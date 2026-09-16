@@ -1,7 +1,7 @@
 {
   "schema": "mektup/conformance/v1/scenarios",
   "version": "1.0.0",
-  "specVersion": "1.0.6",
+  "specVersion": "1.0.7",
   "source": "acceptance-v1.md",
   "profiles": {
     "plain_accept": {
@@ -62,6 +62,7 @@
     { "id": "messaging.wait-on-plain-or-raw-send", "matrix": "messaging", "profile": "usage_rejected", "observable": ["reply_not_requested", "no follow-up message", "no resend"] },
     { "id": "messaging.human-one-way", "matrix": "messaging", "profile": "plain_accept", "observable": ["from-kind human", "source thread may be null", "no correlated reply promise"] },
     { "id": "messaging.human-wait-without-route", "matrix": "messaging", "profile": "usage_rejected", "observable": ["reply_route_required", "no dispatch"] },
+    { "id": "messaging.sender-herdr-name", "matrix": "messaging", "profile": "plain_accept", "observable": ["verified registered name is relayed beside stable pane URI", "missing or malformed optional name does not block delivery", "name never participates in authority or correlation"] },
     { "id": "messaging.duplicate-target-name", "matrix": "messaging", "profile": "usage_rejected", "observable": ["target_ambiguous", "bounded candidates are listed", "no dispatch"] },
     { "id": "messaging.target-changes-after-resolution", "matrix": "messaging", "profile": "plain_accept", "observable": ["retry uses pinned endpoint and thread IDs", "Herdr selector is not re-resolved"] },
 

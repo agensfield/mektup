@@ -127,6 +127,7 @@ type SourceIdentity struct {
 	URI               string
 	Human             bool
 	Herdr             string
+	HerdrName         string
 	CustodyEndpointID string
 	CustodyStoreID    string
 }
@@ -387,7 +388,7 @@ func (s *Service) send(ctx context.Context, req SendRequest, onAccepted Acceptan
 		return SendResult{}, semantic(mektup.ErrInternal, "cannot allocate message identity", nil, err)
 	}
 	envelope := mektup.Envelope{MessageID: messageID, Kind: mektup.KindMessage,
-		FromEndpointID: source.EndpointID, From: wireSourceURI, FromKind: kindOf(source), FromHerdr: source.Herdr,
+		FromEndpointID: source.EndpointID, From: wireSourceURI, FromKind: kindOf(source), FromHerdr: source.Herdr, FromHerdrName: source.HerdrName,
 		ToEndpointID: target.EndpointID, To: wireTargetURI, RequestedTarget: req.Target,
 		ReplyRequested: req.RequestReply, Body: req.Body, Provenance: "observed"}
 	if req.RequestReply {

@@ -1,6 +1,6 @@
-# Mektup v1 language-neutral contracts (spec revision 1.0.6)
+# Mektup v1 language-neutral contracts (spec revision 1.0.7)
 
-The locked product specification revision is 1.0.6. The wire schema identifiers
+The locked product specification revision is 1.0.7. The wire schema identifiers
 remain versioned as `.../v1`; the revision is contract metadata, not a new wire
 schema family.
 
@@ -13,7 +13,10 @@ the exact target-visible envelope metadata remain constrained.
 The target-visible `Mektup/1` body is not JSON. Its metadata schema preserves
 the canonical hyphenated header names; the paired `.txt` fixture is the exact
 LF-delimited rendering and includes the body whose byte count and SHA-256 are
-declared by the header.
+declared by the header. The optional `from-herdr-name` field is observed,
+non-authoritative sender presentation metadata. Canonical emitters include it
+only beside `from-herdr` and only for Herdr's registered-name grammar; receivers
+ignore absent or malformed values without weakening stable identity checks.
 
 Portable receipts contain metadata and content locators only. The receipt
 schema rejects the conventional body-bearing property names (`body`,

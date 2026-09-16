@@ -198,7 +198,7 @@ func validService(r *fakeResolver, d *fakeDelivery, j *fakeJournal) *Service {
 	return &Service{Resolver: r, Delivery: d, Journal: j}
 }
 func baseResolver() fakeResolver {
-	return fakeResolver{source: SourceIdentity{EndpointID: epSource, URI: "codex://local/thread/source", CustodyEndpointID: epSource, CustodyStoreID: storeID}, target: ResolvedTarget{Requested: "target", EndpointID: epTarget, URI: "codex://local/thread/target", ThreadID: "target", Loaded: true}, pinned: ResolvedTarget{EndpointID: epSource, URI: "codex://local/thread/source", ThreadID: "source", Loaded: true}}
+	return fakeResolver{source: SourceIdentity{EndpointID: epSource, URI: "codex://local/thread/source", Herdr: "herdr://local/pane/w3:p29", HerdrName: "mektup-lead", CustodyEndpointID: epSource, CustodyStoreID: storeID}, target: ResolvedTarget{Requested: "target", EndpointID: epTarget, URI: "codex://local/thread/target", ThreadID: "target", Loaded: true}, pinned: ResolvedTarget{EndpointID: epSource, URI: "codex://local/thread/source", ThreadID: "source", Loaded: true}}
 }
 
 func TestWireEnvelopesUseStableEndpointSelectorsAcrossAliases(t *testing.T) {
@@ -219,6 +219,9 @@ func TestWireEnvelopesUseStableEndpointSelectorsAcrossAliases(t *testing.T) {
 	if sent.From != "codex://"+epSource+"/thread/source" || sent.To != "codex://"+epTarget+"/thread/target" || sent.ReplyTo != "codex://"+epSource+"/thread/source" {
 		t.Fatalf("send wire routes from=%q to=%q reply-to=%q", sent.From, sent.To, sent.ReplyTo)
 	}
+	if sent.FromHerdrName != "mektup-lead" {
+		t.Fatalf("send omitted observed Herdr name: %#v", sent)
+	}
 
 	original := mektup.Envelope{MessageID: "msg_07999999-9999-7999-8999-999999999999", Kind: mektup.KindMessage, FromEndpointID: epTarget, From: "codex://sender-devbox/thread/target", FromKind: "agent", ToEndpointID: epSource, To: "codex://sender-local/thread/source", RequestedTarget: "target", ReplyRequested: true, ReplyEndpointID: epSource, ReplyTo: "codex://sender-local/thread/source", ReplyCustodyEndpointID: epSource, ReplyCustodyStoreID: storeID, Body: "question", Provenance: "observed"}
 	original.PayloadBytes = uint64(len(original.Body))
@@ -233,6 +236,9 @@ func TestWireEnvelopesUseStableEndpointSelectorsAcrossAliases(t *testing.T) {
 	}
 	if replied.From != "codex://"+epSource+"/thread/source" || replied.To != "codex://"+epSource+"/thread/source" {
 		t.Fatalf("reply wire routes from=%q to=%q", replied.From, replied.To)
+	}
+	if replied.FromHerdrName != "mektup-lead" {
+		t.Fatalf("reply omitted observed Herdr name: %#v", replied)
 	}
 }
 
