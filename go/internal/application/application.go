@@ -970,7 +970,11 @@ type threadTargetResolver struct {
 }
 
 func (r threadTargetResolver) ResolveThread(ctx context.Context, selector, endpointOverride string) (executor.ThreadTarget, error) {
-	if !strings.Contains(selector, "://") {
+	return r.ResolveThreadWithOptions(ctx, selector, endpointOverride, true)
+}
+
+func (r threadTargetResolver) ResolveThreadWithOptions(ctx context.Context, selector, endpointOverride string, explicitOverride bool) (executor.ThreadTarget, error) {
+	if !strings.Contains(selector, "://") && isNativeThreadID(selector) {
 		ep, err := r.store.ResolveEndpoint(endpointOverride, r.codexHome)
 		if err != nil {
 			return executor.ThreadTarget{}, err
@@ -981,7 +985,7 @@ func (r threadTargetResolver) ResolveThread(ctx context.Context, selector, endpo
 	if err != nil {
 		return executor.ThreadTarget{}, err
 	}
-	if target.Kind == endpoint.TargetCodex && endpointOverride != "" && endpointOverride != "local" {
+	if explicitOverride && target.Endpoint != "" {
 		explicit, explicitErr := r.store.ResolveEndpoint(target.Endpoint, r.codexHome)
 		override, overrideErr := r.store.ResolveEndpoint(endpointOverride, r.codexHome)
 		if explicitErr != nil || overrideErr != nil || explicit.ID != override.ID {
@@ -993,6 +997,21 @@ func (r threadTargetResolver) ResolveThread(ctx context.Context, selector, endpo
 		return executor.ThreadTarget{}, err
 	}
 	return executor.ThreadTarget{Endpoint: resolved.Endpoint.ID, ThreadID: resolved.ThreadID, URI: target.String()}, nil
+}
+
+func isNativeThreadID(value string) bool {
+	if len(value) != 36 || value[8] != '-' || value[13] != '-' || value[18] != '-' || value[23] != '-' {
+		return false
+	}
+	for index, char := range value {
+		if index == 8 || index == 13 || index == 18 || index == 23 {
+			continue
+		}
+		if !((char >= '0' && char <= '9') || (char >= 'a' && char <= 'f') || (char >= 'A' && char <= 'F')) {
+			return false
+		}
+	}
+	return true
 }
 
 func (p endpointPort) List() ([]endpoint.Endpoint, error)              { return p.store.List() }

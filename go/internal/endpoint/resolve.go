@@ -74,7 +74,7 @@ func (s EndpointStore) ResolveDestination(ctx context.Context, target Target, en
 		result.ThreadID = target.ThreadID
 	case TargetAgent, TargetPane, TargetBare:
 		if herdr == nil || !endpoint.HerdrEnabled() {
-			return ResolvedTarget{}, fmt.Errorf("resolver_unavailable: Herdr is disabled for endpoint %s", endpoint.Alias)
+			return ResolvedTarget{}, fmt.Errorf("%w: Herdr is disabled for endpoint %s", ErrResolverUnavailable, endpoint.Alias)
 		}
 		selectorTarget := target
 		if target.Kind == TargetBare {

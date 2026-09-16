@@ -194,6 +194,7 @@ type Globals struct {
 type ResolvedGlobals struct {
 	Output          Presentation
 	Endpoint        string
+	EndpointSource  PathSource
 	Config          string
 	StateDir        string
 	ConfigSource    PathSource
@@ -264,10 +265,13 @@ func resolveGlobals(inv Invocation, env map[string]string) (Invocation, *Error) 
 	config, state := defaultStatePaths(env)
 	configSource, stateSource := PathDefault, PathDefault
 	endpoint := "local"
+	endpointSource := PathDefault
 	if inv.Global.Endpoint != "" {
 		endpoint = inv.Global.Endpoint
+		endpointSource = PathFlag
 	} else if value := strings.TrimSpace(env["MEKTUP_ENDPOINT"]); value != "" {
 		endpoint = value
+		endpointSource = PathEnv
 	}
 	if inv.Global.Config != "" {
 		config = inv.Global.Config
@@ -287,7 +291,7 @@ func resolveGlobals(inv Invocation, env map[string]string) (Invocation, *Error) 
 	if err != nil {
 		return inv, normalizeError(err)
 	}
-	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, Config: config, StateDir: state, ConfigSource: configSource, StateSource: stateSource, CodexHome: strings.TrimSpace(env["CODEX_HOME"]), CurrentThreadID: strings.TrimSpace(env["CODEX_THREAD_ID"]), AgentMode: env["MEKTUP_AGENT"] == "1"}
+	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, EndpointSource: endpointSource, Config: config, StateDir: state, ConfigSource: configSource, StateSource: stateSource, CodexHome: strings.TrimSpace(env["CODEX_HOME"]), CurrentThreadID: strings.TrimSpace(env["CODEX_THREAD_ID"]), AgentMode: env["MEKTUP_AGENT"] == "1"}
 	return inv, nil
 }
 

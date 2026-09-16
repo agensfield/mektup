@@ -104,6 +104,10 @@ type ThreadTargetResolver interface {
 	ResolveThread(context.Context, string, string) (ThreadTarget, error)
 }
 
+type ExplicitThreadTargetResolver interface {
+	ResolveThreadWithOptions(context.Context, string, string, bool) (ThreadTarget, error)
+}
+
 type StoragePort interface {
 	Status(context.Context) (journal.StorageStatus, error)
 	Check(context.Context) (journal.StorageCheck, error)
@@ -320,7 +324,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
 		if name := inv.Option("name"); name != "" {
-			if callErr := e.setThreadName(ctx, api, name, r.Thread.ID, r.Raw, "thread.start", inv.Resolved.Endpoint); callErr != nil {
+			if callErr := e.setThreadName(ctx, api, name, r.Thread.ID, r.Raw, "thread.start", endpointSelector); callErr != nil {
 				return cli.ExecutionResult{}, callErr
 			}
 		}
@@ -343,7 +347,7 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
 		if name := inv.Option("name"); name != "" {
-			if callErr := e.setThreadName(ctx, api, name, r.Thread.ID, r.Raw, "thread.fork", inv.Resolved.Endpoint); callErr != nil {
+			if callErr := e.setThreadName(ctx, api, name, r.Thread.ID, r.Raw, "thread.fork", endpointSelector); callErr != nil {
 				return cli.ExecutionResult{}, callErr
 			}
 		}
@@ -352,9 +356,9 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		return cli.ExecutionResult{}, usage("unsupported thread subcommand: " + sub)
 	}
 	if collection {
-		return e.collectionResult(ctx, kind, resultKind, data, cursor, warnings, mutating, inv.Resolved.Endpoint)
+		return e.collectionResult(ctx, kind, resultKind, data, cursor, warnings, mutating, endpointSelector)
 	}
-	return e.result(ctx, kind, data, cursor, warnings, mutating, inv.Resolved.Endpoint)
+	return e.result(ctx, kind, data, cursor, warnings, mutating, endpointSelector)
 }
 
 func (e *Executor) resolveThreadTarget(ctx context.Context, inv cli.Invocation) (string, string, error) {
@@ -367,7 +371,13 @@ func (e *Executor) resolveThreadTarget(ctx context.Context, inv cli.Invocation) 
 	}
 	selector := inv.Position[1]
 	if e.ports.Targets != nil {
-		resolved, err := e.ports.Targets.ResolveThread(ctx, selector, inv.Resolved.Endpoint)
+		var resolved ThreadTarget
+		var err error
+		if explicit, ok := e.ports.Targets.(ExplicitThreadTargetResolver); ok {
+			resolved, err = explicit.ResolveThreadWithOptions(ctx, selector, inv.Resolved.Endpoint, inv.Resolved.EndpointSource != cli.PathDefault)
+		} else {
+			resolved, err = e.ports.Targets.ResolveThread(ctx, selector, inv.Resolved.Endpoint)
+		}
 		if err != nil {
 			return "", "", mapError(err, "not_sent")
 		}
@@ -1014,6 +1024,18 @@ func mapError(err error, effect string) error {
 	}
 	if errors.Is(err, endpoint.ErrEndpointMismatch) {
 		return &cli.Error{Code: "endpoint_unavailable", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
+	}
+	if errors.Is(err, endpoint.ErrResolverUnavailable) {
+		return &cli.Error{Code: "resolver_unavailable", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
+	}
+	if errors.Is(err, endpoint.ErrResolverNotFound) {
+		return &cli.Error{Code: "target_not_found", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
+	}
+	if errors.Is(err, endpoint.ErrResolverAmbiguous) {
+		return &cli.Error{Code: "target_ambiguous", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
+	}
+	if errors.Is(err, endpoint.ErrResolverStale) {
+		return &cli.Error{Code: "route_unavailable", Message: err.Error(), Effect: "not_sent", Exit: cli.ExitRejected}
 	}
 	var callErr *connection.CallError
 	if errors.As(err, &callErr) && (errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)) && callErr.Evidence.Phase >= appserver.WriteMayHaveWritten {

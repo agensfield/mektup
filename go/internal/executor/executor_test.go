@@ -122,6 +122,10 @@ func (f *fakeTargets) ResolveThread(_ context.Context, selector, _ string) (Thre
 	return ThreadTarget{Endpoint: f.endpoint, ThreadID: f.thread, URI: selector}, nil
 }
 
+func (f *fakeTargets) ResolveThreadWithOptions(ctx context.Context, selector, endpointOverride string, _ bool) (ThreadTarget, error) {
+	return f.ResolveThread(ctx, selector, endpointOverride)
+}
+
 type optionsConnections struct {
 	*fakeConnections
 	options []OpenOptions
