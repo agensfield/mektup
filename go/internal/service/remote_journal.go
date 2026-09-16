@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -55,6 +56,7 @@ type remoteClaim struct {
 	route     endpoint.Route
 	lease     *sshproxy.Lease
 	state     mektup.EvidenceState
+	joined    bool
 }
 
 func (c remoteClaim) activeOwner() bool { return c.input.Owner != "" && c.lease != nil }
@@ -134,11 +136,18 @@ func (r *RemoteJournal) ClaimReply(ctx context.Context, input ReplyClaimInput) (
 	if err := r.init(); err != nil {
 		return ReplyClaim{}, err
 	}
-	op, err := r.operationFor(ctx, input.OriginalID)
+	op, err := r.operationFor(ctx, input.OriginalID, input.ReplyID)
 	if err != nil {
 		return ReplyClaim{}, err
 	}
-	if op.CustodyRoute != input.CustodyRoute || op.CustodyStoreID != input.CustodyStoreID || op.ReplyRoute != input.ReplyRoute || op.ReplyEndpointID == "" {
+	if op.InReplyTo != "" && op.InReplyTo != input.OriginalID {
+		return ReplyClaim{}, ErrRemoteCustodyBinding
+	}
+	replyEndpointID := op.ReplyEndpointID
+	if replyEndpointID == "" {
+		replyEndpointID = op.TargetEndpointID
+	}
+	if replyEndpointID == "" || (op.CustodyRoute != "" && (op.CustodyRoute != input.CustodyRoute || op.CustodyStoreID != input.CustodyStoreID)) {
 		return ReplyClaim{}, ErrRemoteCustodyBinding
 	}
 	route, remote, err := r.route(input.CustodyRoute)
@@ -158,7 +167,8 @@ func (r *RemoteJournal) ClaimReply(ctx context.Context, input ReplyClaimInput) (
 		r.mu.Unlock()
 		return claim, nil
 	}
-	request, err := r.request(op, input, "claim")
+	op.ReplyEndpointID = replyEndpointID
+	request, err := r.request(op, input, "claim", replyEndpointID)
 	if err != nil {
 		return ReplyClaim{}, err
 	}
@@ -173,7 +183,7 @@ func (r *RemoteJournal) ClaimReply(ctx context.Context, input ReplyClaimInput) (
 	r.mu.Lock()
 	current, exists := r.claims[input.ReplyID]
 	if !(exists && current.activeOwner() && claim.Joined) {
-		r.claims[input.ReplyID] = remoteClaim{input: input, operation: op, request: request, route: route, lease: claimLease(response), state: mektup.EvidenceState(claim.State)}
+		r.claims[input.ReplyID] = remoteClaim{input: input, operation: op, request: request, route: route, lease: claimLease(response), state: mektup.EvidenceState(claim.State), joined: claim.Joined}
 	}
 	r.mu.Unlock()
 	return claim, nil
@@ -302,6 +312,11 @@ func (r *RemoteJournal) WaitReply(ctx context.Context, replyID string, timeout t
 			return status, err
 		}
 		if status.State == mektup.StateReplyAccepted || status.State == mektup.StateReplyObserved || status.State == mektup.StateReplyOutcomeUnknown {
+			if claim.joined {
+				status.State = mektup.StateReplyDispatchClaimed
+				status.ReplyID = ""
+				return status, errors.New("joined claim has no correlated child reply")
+			}
 			return status, nil
 		}
 		timer := time.NewTimer(r.PollInterval)
@@ -316,15 +331,20 @@ func (r *RemoteJournal) WaitReply(ctx context.Context, replyID string, timeout t
 	}
 }
 
-func (r *RemoteJournal) operationFor(ctx context.Context, messageID string) (Operation, error) {
+func (r *RemoteJournal) operationFor(ctx context.Context, messageID, replyID string) (Operation, error) {
 	r.mu.Lock()
-	op, ok := r.operations[messageID]
+	op, ok := r.operations[replyID]
 	if !ok {
-		for _, candidate := range r.operations {
-			if candidate.InReplyTo == messageID {
-				op, ok = candidate, true
-				break
+		var candidate Operation
+		matches := 0
+		for _, item := range r.operations {
+			if item.InReplyTo == messageID {
+				candidate = item
+				matches++
 			}
+		}
+		if matches == 1 {
+			op, ok = candidate, true
 		}
 	}
 	r.mu.Unlock()
@@ -375,14 +395,14 @@ func (r *RemoteJournal) claimFor(replyID string) (remoteClaim, bool, error) {
 	return claim, remote, err
 }
 
-func (r *RemoteJournal) request(op Operation, input ReplyClaimInput, operation string) (sshproxy.ControlRequest, error) {
+func (r *RemoteJournal) request(op Operation, input ReplyClaimInput, operation, replyEndpointID string) (sshproxy.ControlRequest, error) {
 	thread, err := mektup.ParseThreadURI(input.ReplyRoute)
 	if err != nil {
 		return sshproxy.ControlRequest{}, fmt.Errorf("%w: reply route: %v", ErrRemoteCustodyBinding, err)
 	}
 	now := r.Now().UTC().Format(time.RFC3339Nano)
 	bytes := input.BodySize
-	return sshproxy.ControlRequest{Schema: "mektup/control/v1", Kind: "request", Operation: operation, OperationID: op.OperationID, ReplyMessageID: input.ReplyID, OriginalMessageID: input.OriginalID, Custody: sshproxy.CustodyRef{EndpointID: input.CustodyRoute, StoreID: input.CustodyStoreID}, ReplyDestination: sshproxy.DestinationRef{EndpointID: op.ReplyEndpointID, ThreadID: thread.ThreadID, URI: input.ReplyRoute}, BodyBytes: &bytes, BodySHA256: input.Digest, ReplyStatus: input.Status, AttemptOwner: input.Owner, RequestedAt: now}, nil
+	return sshproxy.ControlRequest{Schema: "mektup/control/v1", Kind: "request", Operation: operation, OperationID: op.OperationID, ReplyMessageID: input.ReplyID, OriginalMessageID: input.OriginalID, Custody: sshproxy.CustodyRef{EndpointID: input.CustodyRoute, StoreID: input.CustodyStoreID}, ReplyDestination: sshproxy.DestinationRef{EndpointID: replyEndpointID, ThreadID: thread.ThreadID, URI: input.ReplyRoute}, BodyBytes: &bytes, BodySHA256: input.Digest, ReplyStatus: input.Status, AttemptOwner: input.Owner, RequestedAt: now}, nil
 }
 
 func (r *RemoteJournal) invoke(ctx context.Context, route endpoint.Route, request sshproxy.ControlRequest) (sshproxy.ControlRequest, error) {
@@ -426,6 +446,34 @@ func decodeClaimResult(response sshproxy.ControlRequest, input ReplyClaimInput) 
 }
 
 func decodeLeaseResult(response sshproxy.ControlRequest) (*sshproxy.Lease, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(response.Result, &raw); err != nil {
+		return nil, sshproxy.ErrControlValidation
+	}
+	leaseRaw, ok := raw["lease"]
+	if !ok || string(bytes.TrimSpace(leaseRaw)) == "null" {
+		return nil, sshproxy.ErrControlValidation
+	}
+	var leaseObject map[string]json.RawMessage
+	if err := json.Unmarshal(leaseRaw, &leaseObject); err != nil || leaseObject == nil {
+		return nil, sshproxy.ErrControlValidation
+	}
+	for _, field := range []string{"expiresAt", "acquiredAt", "heartbeatAt"} {
+		value, present := leaseObject[field]
+		if !present {
+			if field == "expiresAt" {
+				return nil, sshproxy.ErrControlValidation
+			}
+			continue
+		}
+		if string(bytes.TrimSpace(value)) == "null" {
+			return nil, sshproxy.ErrControlValidation
+		}
+		var text string
+		if err := json.Unmarshal(value, &text); err != nil || !validRemoteTimestamp(text) {
+			return nil, sshproxy.ErrControlValidation
+		}
+	}
 	var result struct {
 		Lease *sshproxy.Lease `json:"lease"`
 	}
