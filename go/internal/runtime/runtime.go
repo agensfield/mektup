@@ -188,9 +188,6 @@ func (p *ConnectionPool) ProbeThreadState(ctx context.Context, endpointID, threa
 	if status == "" || ephemeral == nil {
 		return false, false, errors.New("runtime: thread/read omitted status or persistence metadata")
 	}
-	if status != "active" {
-		return false, !*ephemeral, nil
-	}
 	loadedIDs, err := loadedReader.LoadedThreads(ctx)
 	if err != nil {
 		return false, false, fmt.Errorf("runtime: loaded thread enumeration failed: %w", err)

@@ -84,6 +84,45 @@ func (s *fakeSession) Detach(context.Context) error {
 	return nil
 }
 
+type probeStateSession struct {
+	*fakeSession
+	status    string
+	ephemeral bool
+	loaded    []string
+}
+
+func (s probeStateSession) ThreadState(context.Context, string) (string, *bool, error) {
+	return s.status, &s.ephemeral, nil
+}
+func (s probeStateSession) LoadedThreads(context.Context) ([]string, error) { return s.loaded, nil }
+
+func TestProbeThreadStateUsesExactLoadedMembership(t *testing.T) {
+	endpointID := "ep_01999999-9999-7999-8999-999999999999"
+	cases := []struct {
+		name        string
+		status      string
+		loaded      []string
+		ephemeral   bool
+		wantLoaded  bool
+		wantPersist bool
+	}{
+		{name: "idle loaded", status: "idle", loaded: []string{"thread"}, wantLoaded: true, wantPersist: true},
+		{name: "active absent", status: "active", loaded: nil, wantLoaded: false, wantPersist: true},
+		{name: "active ephemeral loaded", status: "active", loaded: []string{"thread"}, ephemeral: true, wantLoaded: true, wantPersist: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			session := probeStateSession{fakeSession: &fakeSession{endpoint: endpointID}, status: tc.status, ephemeral: tc.ephemeral, loaded: tc.loaded}
+			pool := NewConnectionPool(SessionFactoryFunc(func(context.Context, endpoint.Endpoint) (Session, error) { return session, nil }), func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: endpointID, Alias: "local"}, nil })
+			defer pool.Close(context.Background())
+			loaded, persistent, err := pool.ProbeThreadState(context.Background(), endpointID, "thread")
+			if err != nil || loaded != tc.wantLoaded || persistent != tc.wantPersist {
+				t.Fatalf("state loaded=%v persistent=%v err=%v", loaded, persistent, err)
+			}
+		})
+	}
+}
+
 type fakeFactory struct {
 	session     *fakeSession
 	open        func() *fakeSession
