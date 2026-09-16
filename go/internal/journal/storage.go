@@ -329,7 +329,7 @@ func validateReadOnlySchema(ctx context.Context, db *sql.DB) error {
 			return classifyStorageError(err)
 		}
 		if count != 1 {
-			return fmt.Errorf("%w: required v5 table %s is missing", ErrStorageCorrupt, name)
+			return fmt.Errorf("%w: required v6 table %s is missing", ErrStorageCorrupt, name)
 		}
 	}
 	var presentation int
@@ -337,7 +337,7 @@ func validateReadOnlySchema(ctx context.Context, db *sql.DB) error {
 		return classifyStorageError(err)
 	}
 	if presentation != 1 {
-		return fmt.Errorf("%w: required v5 manual-resolution presentation column is missing", ErrStorageCorrupt)
+		return fmt.Errorf("%w: required v6 manual-resolution presentation column is missing", ErrStorageCorrupt)
 	}
 	if err := validateBlockerStructure(ctx, db); err != nil {
 		return err
@@ -348,7 +348,13 @@ func validateReadOnlySchema(ctx context.Context, db *sql.DB) error {
 			return classifyStorageError(err)
 		}
 		if count != 1 {
-			return fmt.Errorf("%w: required v5 receipt column %s is missing", ErrStorageCorrupt, column)
+			return fmt.Errorf("%w: required v6 receipt column %s is missing", ErrStorageCorrupt, column)
+		}
+	}
+	for _, column := range []string{"reply_endpoint_id", "reply_thread_id"} {
+		var count int
+		if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('operations') WHERE name=?", column).Scan(&count); err != nil || count != 1 {
+			return fmt.Errorf("%w: required v6 operation column %s is missing", ErrStorageCorrupt, column)
 		}
 	}
 	return nil

@@ -5,10 +5,17 @@ not wired into the production command in this lane.
 
 The receiver accepts one `mektup/control/v1` metadata document on stdin. The
 registry path, state directory, executable, journal path, and reply body are
-never selected by that document. A pre-registered owner-private registry maps
-opaque store IDs to trusted local state directories and endpoint IDs. Registry
-lookups require an existing private `journal.sqlite3`; they never initialize a
-missing database.
+never selected by that document. The machine-user registry is fixed at
+`<default-state-root>/control-registry.json`; operation-selected state dirs do
+not relocate it. A pre-registered owner-private registry maps opaque store IDs
+to trusted local state directories and endpoint IDs. Registry lookups require
+an existing private `journal.sqlite3`; they never initialize a missing database.
+
+The journal durably pins reply destination endpoint ID, URI, and thread in the
+original operation. Legacy operations without that tuple fail closed rather
+than inheriting authority from a current alias. Endpoint identities are
+persisted under the shared machine-user default state root, independently of
+operation journal directories.
 
 Claim, heartbeat, commit, abandon, status, and reconcile operate only on the
 validated original operation and selected claim tuple. No app-server request or

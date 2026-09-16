@@ -31,16 +31,42 @@ type Config struct {
 
 const configVersion = 1
 
-// EndpointStore owns one owner-private config document and the identity state
-// used by the built-in local route.  It has no process or transport side
-// effects beyond atomic file persistence.
+// EndpointStore owns one owner-private config document and resolves built-in
+// identities from the machine-user identity home. StateHome remains the
+// operation-selected journal root and never relocates that identity state.
 type EndpointStore struct {
-	ConfigPath string
-	StateHome  string
+	ConfigPath   string
+	StateHome    string
+	IdentityHome string
 }
 
 func NewStore(configPath, stateHome string) EndpointStore {
 	return EndpointStore{ConfigPath: configPath, StateHome: stateHome}
+}
+
+func NewStoreWithIdentityHome(configPath, stateHome, identityHome string) EndpointStore {
+	return EndpointStore{ConfigPath: configPath, StateHome: stateHome, IdentityHome: identityHome}
+}
+
+// DefaultStateRoot is shared by endpoint identities and the control registry.
+// Operation-selected journal directories must not relocate this root.
+func DefaultStateRoot() (string, error) {
+	root := strings.TrimSpace(os.Getenv("XDG_DATA_HOME"))
+	if root == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		root = filepath.Join(home, ".local", "share")
+	}
+	if !filepath.IsAbs(root) {
+		var err error
+		root, err = filepath.Abs(root)
+		if err != nil {
+			return "", err
+		}
+	}
+	return filepath.Join(root, "mektup"), nil
 }
 
 func (s EndpointStore) Load() (Config, error) {

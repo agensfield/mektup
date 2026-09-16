@@ -43,7 +43,7 @@ const (
 
 type EvidenceState string
 
-const currentSchemaVersion = 5
+const currentSchemaVersion = 6
 
 func (s EvidenceState) Valid() bool {
 	switch s {
@@ -244,10 +244,10 @@ func (j *Journal) init(ctx context.Context) error {
 		if _, err = tx.ExecContext(ctx, schemaV1); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
 		}
-		if _, err = tx.ExecContext(ctx, "PRAGMA user_version=5"); err != nil {
+		if _, err = tx.ExecContext(ctx, "PRAGMA user_version=6"); err != nil {
 			return fmt.Errorf("journal migration: %w", err)
 		}
-		if err = validateV5Schema(ctx, tx); err != nil {
+		if err = validateV6Schema(ctx, tx); err != nil {
 			return err
 		}
 	} else if version == 1 {
@@ -257,11 +257,17 @@ func (j *Journal) init(ctx context.Context) error {
 		if err = migrateV4ToV5(ctx, tx); err != nil {
 			return err
 		}
+		if err = migrateV5ToV6(ctx, tx); err != nil {
+			return err
+		}
 	} else if version == 2 {
 		if err = migrateV2ToV4(ctx, tx); err != nil {
 			return err
 		}
 		if err = migrateV4ToV5(ctx, tx); err != nil {
+			return err
+		}
+		if err = migrateV5ToV6(ctx, tx); err != nil {
 			return err
 		}
 	} else if version == 3 {
@@ -271,12 +277,22 @@ func (j *Journal) init(ctx context.Context) error {
 		if err = migrateV4ToV5(ctx, tx); err != nil {
 			return err
 		}
+		if err = migrateV5ToV6(ctx, tx); err != nil {
+			return err
+		}
 	} else if version == 4 {
 		if err = migrateV4ToV5(ctx, tx); err != nil {
 			return err
 		}
+		if err = migrateV5ToV6(ctx, tx); err != nil {
+			return err
+		}
+	} else if version == 5 {
+		if err = migrateV5ToV6(ctx, tx); err != nil {
+			return err
+		}
 	} else if version == currentSchemaVersion {
-		if err = validateV5Schema(ctx, tx); err != nil {
+		if err = validateV6Schema(ctx, tx); err != nil {
 			return err
 		}
 	}
@@ -326,7 +342,7 @@ CREATE TABLE IF NOT EXISTS store_id_aliases (alias TEXT PRIMARY KEY, store_id TE
 CREATE TABLE IF NOT EXISTS operations (
  operation_id TEXT PRIMARY KEY, message_id TEXT NOT NULL UNIQUE,
  source_route TEXT NOT NULL, target_route TEXT NOT NULL, semantics TEXT NOT NULL,
- reply_route TEXT NOT NULL DEFAULT '', custody_route TEXT NOT NULL DEFAULT '', custody_store_id TEXT NOT NULL DEFAULT '',
+ reply_route TEXT NOT NULL DEFAULT '', reply_endpoint_id TEXT NOT NULL DEFAULT '', reply_thread_id TEXT NOT NULL DEFAULT '', custody_route TEXT NOT NULL DEFAULT '', custody_store_id TEXT NOT NULL DEFAULT '',
  digest TEXT NOT NULL, body_size INTEGER NOT NULL CHECK(body_size >= 0),
  state TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
  dispatch_started_at INTEGER, terminal_at INTEGER, error_code TEXT NOT NULL DEFAULT ''
@@ -689,6 +705,48 @@ func validateV5Schema(ctx context.Context, tx *sql.Tx) error {
 		}
 		if count != 1 {
 			return fmt.Errorf("%w: required v5 receipt column %s is missing", ErrCorrupt, column)
+		}
+	}
+	return nil
+}
+
+func migrateV5ToV6(ctx context.Context, tx *sql.Tx) error {
+	if err := validateV5Schema(ctx, tx); err != nil {
+		return err
+	}
+	for _, column := range []string{"reply_endpoint_id", "reply_thread_id"} {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('operations') WHERE name=?", column).Scan(&count); err != nil {
+			return fmt.Errorf("journal migration v6: %w", err)
+		}
+		if count == 0 {
+			if _, err := tx.ExecContext(ctx, "ALTER TABLE operations ADD COLUMN "+column+" TEXT NOT NULL DEFAULT ''"); err != nil {
+				return fmt.Errorf("journal migration v6: %w", err)
+			}
+		} else if count != 1 {
+			return fmt.Errorf("%w: duplicate v6 column operations.%s", ErrCorrupt, column)
+		}
+	}
+	if err := validateV6Schema(ctx, tx); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "PRAGMA user_version=6"); err != nil {
+		return fmt.Errorf("journal migration v6: %w", err)
+	}
+	return nil
+}
+
+func validateV6Schema(ctx context.Context, tx *sql.Tx) error {
+	if err := validateV5Schema(ctx, tx); err != nil {
+		return err
+	}
+	for _, column := range []string{"reply_endpoint_id", "reply_thread_id"} {
+		var count int
+		if err := tx.QueryRowContext(ctx, "SELECT COUNT(*) FROM pragma_table_info('operations') WHERE name=?", column).Scan(&count); err != nil {
+			return fmt.Errorf("journal schema validation: %w", err)
+		}
+		if count != 1 {
+			return fmt.Errorf("%w: required v6 column operations.%s is missing", ErrCorrupt, column)
 		}
 	}
 	return nil

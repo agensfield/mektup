@@ -131,8 +131,81 @@ func (s EndpointStore) builtinByID(id string) (Endpoint, bool, error) {
 	return Endpoint{}, false, nil
 }
 
+// ExistingBuiltinLocal resolves a persisted local identity without creating
+// one. Receiver validation uses this read-only form so input cannot establish
+// endpoint authority.
+func (s EndpointStore) ExistingBuiltinLocal(codexHome string) (Endpoint, error) {
+	if s.StateHome == "" {
+		return Endpoint{}, errors.New("state home is required for built-in local identity")
+	}
+	if codexHome == "" {
+		var err error
+		codexHome, err = defaultCodexHome()
+		if err != nil {
+			return Endpoint{}, err
+		}
+	}
+	home, err := canonicalPath(codexHome)
+	if err != nil {
+		return Endpoint{}, fmt.Errorf("canonicalize CODEX_HOME: %w", err)
+	}
+	socket, err := canonicalPath(filepath.Join(home, localSocketRelative))
+	if err != nil {
+		return Endpoint{}, fmt.Errorf("derive daemon socket: %w", err)
+	}
+	key := home + "\x00" + socket
+	identities, err := s.loadBuiltinIdentities()
+	if err != nil {
+		return Endpoint{}, err
+	}
+	for _, identity := range identities.Entries {
+		if identity.Key != key {
+			continue
+		}
+		route, routeErr := UnixRoute(identity.Socket)
+		if routeErr != nil {
+			return Endpoint{}, routeErr
+		}
+		return Endpoint{ID: identity.EndpointID, Alias: "local", Route: route, Builtin: true, Herdr: HerdrAuto}, nil
+	}
+	return Endpoint{}, fmt.Errorf("%w: persisted local endpoint is unavailable", ErrEndpointNotFound)
+}
+
+// ResolveExistingEndpoint resolves configured or persisted endpoint identity
+// without creating built-in state.
+func (s EndpointStore) ResolveExistingEndpoint(selector, codexHome string) (Endpoint, error) {
+	if selector == "local" {
+		return s.ExistingBuiltinLocal(codexHome)
+	}
+	if builtIn, ok, err := s.builtinByID(selector); err != nil {
+		return Endpoint{}, err
+	} else if ok {
+		return builtIn, nil
+	}
+	cfg, err := s.Load()
+	if err != nil {
+		return Endpoint{}, err
+	}
+	if selector == "" {
+		selector = cfg.Default
+		if selector == "" {
+			return s.ExistingBuiltinLocal(codexHome)
+		}
+	}
+	for _, item := range cfg.Endpoints {
+		if item.Alias == selector || item.ID == selector {
+			return item, nil
+		}
+	}
+	return Endpoint{}, fmt.Errorf("%w: %s", ErrEndpointNotFound, selector)
+}
+
 func (s EndpointStore) builtinPath() string {
-	return filepath.Join(s.StateHome, "endpoint-identities.json")
+	home := s.IdentityHome
+	if home == "" {
+		home, _ = DefaultStateRoot()
+	}
+	return filepath.Join(home, "endpoint-identities.json")
 }
 
 func (s EndpointStore) loadBuiltinIdentities() (builtinIdentities, error) {
@@ -161,10 +234,18 @@ func (s EndpointStore) loadBuiltinIdentities() (builtinIdentities, error) {
 }
 
 func (s EndpointStore) saveBuiltinIdentities(identities builtinIdentities) error {
-	if err := os.MkdirAll(s.StateHome, 0700); err != nil {
+	home := s.IdentityHome
+	if home == "" {
+		var err error
+		home, err = DefaultStateRoot()
+		if err != nil {
+			return err
+		}
+	}
+	if err := os.MkdirAll(home, 0700); err != nil {
 		return fmt.Errorf("create endpoint state home: %w", err)
 	}
-	if err := os.Chmod(s.StateHome, 0700); err != nil {
+	if err := os.Chmod(home, 0700); err != nil {
 		return fmt.Errorf("protect endpoint state home: %w", err)
 	}
 	b, err := json.MarshalIndent(identities, "", "  ")
@@ -172,7 +253,7 @@ func (s EndpointStore) saveBuiltinIdentities(identities builtinIdentities) error
 		return err
 	}
 	b = append(b, '\n')
-	tmp, err := os.CreateTemp(s.StateHome, ".endpoint-identities-*.tmp")
+	tmp, err := os.CreateTemp(home, ".endpoint-identities-*.tmp")
 	if err != nil {
 		return err
 	}

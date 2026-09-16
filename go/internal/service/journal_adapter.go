@@ -12,9 +12,9 @@ import (
 )
 
 // IdentityBinding is the endpoint identity context for one durable operation.
-// The v4 journal schema predates endpoint IDs, so adapters must supply this
-// context separately. It is deliberately keyed by operation/message identity,
-// never by a mutable adapter-wide "current endpoint".
+// The identity registry remains the service-level endpoint capability seam.
+// It is deliberately keyed by operation/message identity, never by a mutable
+// adapter-wide "current endpoint".
 type IdentityBinding struct {
 	SourceEndpointID string
 	TargetEndpointID string
@@ -74,8 +74,8 @@ func (r *MemoryIdentityRegistry) Lookup(_ context.Context, operationID, messageI
 }
 
 // SQLiteJournal adapts the approved metadata-only journal to JournalPort.
-// Endpoint IDs are supplied by the resolver layer because the journal
-// intentionally stores routes, not endpoint registry records.
+// Endpoint IDs are pinned as metadata alongside the reply route; the
+// identity registry remains the service-level endpoint capability seam.
 type SQLiteJournal struct {
 	Inner    *journal.Journal
 	Registry IdentityRegistry
@@ -105,7 +105,7 @@ func (a SQLiteJournal) Prepare(ctx context.Context, op Operation) (Prepared, err
 	} else if op.SourceEndpointID == "" || op.TargetEndpointID == "" {
 		return Prepared{}, errors.New("service: operation endpoint identity registry is required")
 	}
-	r, err := a.Inner.Prepare(ctx, journal.Operation{OperationID: op.OperationID, MessageID: op.MessageID, SourceRoute: op.SourceRoute, TargetRoute: op.TargetRoute, Semantics: op.Semantics, ReplyRoute: op.ReplyRoute, CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID, AttemptOwner: op.AttemptOwner, Digest: op.Digest, BodySize: op.BodySize})
+	r, err := a.Inner.Prepare(ctx, journal.Operation{OperationID: op.OperationID, MessageID: op.MessageID, SourceRoute: op.SourceRoute, TargetRoute: op.TargetRoute, Semantics: op.Semantics, ReplyRoute: op.ReplyRoute, ReplyEndpointID: op.ReplyEndpointID, ReplyThreadID: threadID(op.ReplyRoute), CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID, AttemptOwner: op.AttemptOwner, Digest: op.Digest, BodySize: op.BodySize})
 	if err != nil {
 		return Prepared{}, err
 	}

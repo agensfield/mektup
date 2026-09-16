@@ -11,17 +11,19 @@ import (
 
 // Operation describes metadata persisted before a request can be dispatched.
 type Operation struct {
-	OperationID    string
-	MessageID      string
-	SourceRoute    string
-	TargetRoute    string
-	Semantics      string
-	ReplyRoute     string
-	CustodyRoute   string
-	CustodyStoreID string
-	AttemptOwner   string
-	Digest         string
-	BodySize       int64
+	OperationID     string
+	MessageID       string
+	SourceRoute     string
+	TargetRoute     string
+	Semantics       string
+	ReplyRoute      string
+	ReplyEndpointID string
+	ReplyThreadID   string
+	CustodyRoute    string
+	CustodyStoreID  string
+	AttemptOwner    string
+	Digest          string
+	BodySize        int64
 }
 
 type OperationRecord struct {
@@ -76,9 +78,9 @@ func (j *Journal) Prepare(ctx context.Context, op Operation) (OperationRecord, e
 	err := j.withTx(ctx, func(tx *sql.Tx) error {
 		now := j.nowUnix()
 		var existing OperationRecord
-		err := scanOperation(tx.QueryRow("SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE o.message_id=?", op.MessageID), &existing)
+		err := scanOperation(tx.QueryRow("SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.reply_endpoint_id,o.reply_thread_id,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE o.message_id=?", op.MessageID), &existing)
 		if err == nil {
-			if existing.OperationID == op.OperationID && existing.Digest == op.Digest && existing.BodySize == op.BodySize && existing.SourceRoute == op.SourceRoute && existing.TargetRoute == op.TargetRoute && existing.Semantics == op.Semantics && existing.ReplyRoute == op.ReplyRoute && existing.CustodyRoute == op.CustodyRoute && existing.CustodyStoreID == op.CustodyStoreID {
+			if existing.OperationID == op.OperationID && existing.Digest == op.Digest && existing.BodySize == op.BodySize && existing.SourceRoute == op.SourceRoute && existing.TargetRoute == op.TargetRoute && existing.Semantics == op.Semantics && existing.ReplyRoute == op.ReplyRoute && existing.ReplyEndpointID == op.ReplyEndpointID && existing.ReplyThreadID == op.ReplyThreadID && existing.CustodyRoute == op.CustodyRoute && existing.CustodyStoreID == op.CustodyStoreID {
 				creator = op.AttemptOwner != "" && op.AttemptOwner == existing.AttemptOwner
 				return nil
 			}
@@ -96,7 +98,7 @@ func (j *Journal) Prepare(ctx context.Context, op Operation) (OperationRecord, e
 			attemptOwner = "local-" + attemptToken[:12]
 		}
 		lease := now + j.leaseDuration.Nanoseconds()
-		_, err = tx.Exec("INSERT INTO operations(operation_id,message_id,source_route,target_route,semantics,reply_route,custody_route,custody_store_id,digest,body_size,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", op.OperationID, op.MessageID, op.SourceRoute, op.TargetRoute, op.Semantics, op.ReplyRoute, op.CustodyRoute, op.CustodyStoreID, op.Digest, op.BodySize, string(StatePrepared), now, now)
+		_, err = tx.Exec("INSERT INTO operations(operation_id,message_id,source_route,target_route,semantics,reply_route,reply_endpoint_id,reply_thread_id,custody_route,custody_store_id,digest,body_size,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", op.OperationID, op.MessageID, op.SourceRoute, op.TargetRoute, op.Semantics, op.ReplyRoute, op.ReplyEndpointID, op.ReplyThreadID, op.CustodyRoute, op.CustodyStoreID, op.Digest, op.BodySize, string(StatePrepared), now, now)
 		if err != nil {
 			return err
 		}
@@ -113,7 +115,7 @@ func (j *Journal) Prepare(ctx context.Context, op Operation) (OperationRecord, e
 }
 
 func scanOperation(row interface{ Scan(...any) error }, out *OperationRecord) error {
-	return row.Scan(&out.OperationID, &out.MessageID, &out.SourceRoute, &out.TargetRoute, &out.Semantics, &out.ReplyRoute, &out.CustodyRoute, &out.CustodyStoreID, &out.Digest, &out.BodySize, &out.State, &out.CreatedAt, &out.UpdatedAt, &out.DispatchStartedAt, &out.TerminalAt, &out.ErrorCode, &out.AttemptOwner, &out.AttemptToken, &out.AttemptLeaseUntil)
+	return row.Scan(&out.OperationID, &out.MessageID, &out.SourceRoute, &out.TargetRoute, &out.Semantics, &out.ReplyRoute, &out.ReplyEndpointID, &out.ReplyThreadID, &out.CustodyRoute, &out.CustodyStoreID, &out.Digest, &out.BodySize, &out.State, &out.CreatedAt, &out.UpdatedAt, &out.DispatchStartedAt, &out.TerminalAt, &out.ErrorCode, &out.AttemptOwner, &out.AttemptToken, &out.AttemptLeaseUntil)
 }
 
 func (j *Journal) loadManualResolution(ctx context.Context, operationID string, out *OperationRecord) error {
@@ -139,7 +141,7 @@ func (j *Journal) Operation(ctx context.Context, operationID string) (OperationR
 // the SQL schema to semantic callers.
 func (j *Journal) OperationByMessage(ctx context.Context, messageID string) (OperationRecord, error) {
 	var out OperationRecord
-	err := scanOperation(j.db.QueryRowContext(ctx, "SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE o.message_id=?", messageID), &out)
+	err := scanOperation(j.db.QueryRowContext(ctx, "SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.reply_endpoint_id,o.reply_thread_id,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE o.message_id=?", messageID), &out)
 	if err == sql.ErrNoRows {
 		return out, ErrNotFound
 	}
@@ -154,7 +156,7 @@ func (j *Journal) OperationByMessage(ctx context.Context, messageID string) (Ope
 
 func (j *Journal) operation(ctx context.Context, operationID string, includeToken bool) (OperationRecord, error) {
 	var out OperationRecord
-	err := scanOperation(j.db.QueryRowContext(ctx, "SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE o.operation_id=?", operationID), &out)
+	err := scanOperation(j.db.QueryRowContext(ctx, "SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.reply_endpoint_id,o.reply_thread_id,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE o.operation_id=?", operationID), &out)
 	if err == sql.ErrNoRows {
 		return out, ErrNotFound
 	}
@@ -189,7 +191,7 @@ func (j *Journal) ListOperations(ctx context.Context, query OperationQuery) ([]O
 		args = append(args, query.Since.UTC().UnixNano())
 	}
 	args = append(args, limit)
-	rows, err := j.db.QueryContext(ctx, `SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE `+where+` ORDER BY o.created_at DESC,o.operation_id DESC LIMIT ?`, args...)
+	rows, err := j.db.QueryContext(ctx, `SELECT o.operation_id,o.message_id,o.source_route,o.target_route,o.semantics,o.reply_route,o.reply_endpoint_id,o.reply_thread_id,o.custody_route,o.custody_store_id,o.digest,o.body_size,o.state,o.created_at,o.updated_at,COALESCE(o.dispatch_started_at,0),COALESCE(o.terminal_at,0),o.error_code,COALESCE(a.owner,''),COALESCE(a.token,''),COALESCE(a.lease_until,0) FROM operations o LEFT JOIN attempts a ON a.operation_id=o.operation_id WHERE `+where+` ORDER BY o.created_at DESC,o.operation_id DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}

@@ -44,7 +44,7 @@ func TestParseTargetAndPercentEncoding(t *testing.T) {
 
 func TestConfigAtomicPrivateAndDuplicateRules(t *testing.T) {
 	root := t.TempDir()
-	store := NewStore(filepath.Join(root, "config", "endpoints.json"), filepath.Join(root, "state"))
+	store := NewStoreWithIdentityHome(filepath.Join(root, "config", "endpoints.json"), filepath.Join(root, "state"), filepath.Join(root, "state"))
 	route, err := SSHRoute("ops@example;touch /tmp/pwned")
 	if err == nil {
 		// Semicolons are safe in argv but whitespace is deliberately rejected.
@@ -99,7 +99,7 @@ func TestConfigAtomicPrivateAndDuplicateRules(t *testing.T) {
 
 func TestBuiltinLocalStablePerCanonicalHome(t *testing.T) {
 	root := t.TempDir()
-	store := NewStore(filepath.Join(root, "config.json"), filepath.Join(root, "state"))
+	store := NewStoreWithIdentityHome(filepath.Join(root, "config.json"), filepath.Join(root, "state"), filepath.Join(root, "state"))
 	first, err := store.EnsureBuiltinLocal(filepath.Join(root, "codex-a"))
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +158,7 @@ func TestEndpointPrecedenceAndSourceIndependence(t *testing.T) {
 		t.Fatal(got)
 	}
 	root := t.TempDir()
-	store := NewStore(filepath.Join(root, "config.json"), filepath.Join(root, "state"))
+	store := NewStoreWithIdentityHome(filepath.Join(root, "config.json"), filepath.Join(root, "state"), filepath.Join(root, "state"))
 	route, _ := SSHRoute("example.org")
 	if err := store.Add(Endpoint{Alias: "remote", Route: route}); err != nil {
 		t.Fatal(err)
@@ -195,7 +195,7 @@ func TestEndpointPrecedenceAndSourceIndependence(t *testing.T) {
 
 func TestConcurrentEndpointAddsDoNotLoseUpdates(t *testing.T) {
 	root := t.TempDir()
-	store := NewStore(filepath.Join(root, "config.json"), filepath.Join(root, "state"))
+	store := NewStoreWithIdentityHome(filepath.Join(root, "config.json"), filepath.Join(root, "state"), filepath.Join(root, "state"))
 	route, _ := SSHRoute("example.org")
 	const total = 12
 	var group sync.WaitGroup

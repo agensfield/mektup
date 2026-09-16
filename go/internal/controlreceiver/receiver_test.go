@@ -31,7 +31,11 @@ func openReceiverJournal(t *testing.T, lease time.Duration) (*journal.Journal, s
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = j.Close() })
-	return j, state
+	canonical, err := filepath.EvalSymlinks(j.StateDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return j, canonical
 }
 
 func makeRegistry(t *testing.T, state, storeID string) FileRegistry {
@@ -56,7 +60,7 @@ func prepareOriginal(t *testing.T, j *journal.Journal) {
 	t.Helper()
 	if _, err := j.Prepare(context.Background(), journal.Operation{
 		OperationID: operationID, MessageID: originalID, SourceRoute: "codex://local/thread/source", TargetRoute: "codex://remote/thread/target", Semantics: "message",
-		ReplyRoute: "codex://local/thread/source", CustodyRoute: receiverEndpoint, CustodyStoreID: j.StoreID(), Digest: "sha256:" + strings.Repeat("b", 64), BodySize: 7,
+		ReplyRoute: "codex://local/thread/source", ReplyEndpointID: receiverEndpoint, ReplyThreadID: "source", CustodyRoute: receiverEndpoint, CustodyStoreID: j.StoreID(), Digest: "sha256:" + strings.Repeat("b", 64), BodySize: 7,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -287,7 +291,7 @@ func TestReceiverAllowsDistinctTrustedReplyEndpointTopology(t *testing.T) {
 		return ErrRelationshipMismatch
 	})}
 	otherOriginal := "msg_0198f0e0-0000-7000-8000-000000000088"
-	if _, err := j.Prepare(context.Background(), journal.Operation{OperationID: "op_0198f0e0-0000-7000-8000-000000000088", MessageID: otherOriginal, SourceRoute: "src", TargetRoute: "dst", Semantics: "message", ReplyRoute: "codex://replyhost/thread/source", CustodyRoute: receiverEndpoint, CustodyStoreID: j.StoreID(), Digest: "digest", BodySize: 1}); err != nil {
+	if _, err := j.Prepare(context.Background(), journal.Operation{OperationID: "op_0198f0e0-0000-7000-8000-000000000088", MessageID: otherOriginal, SourceRoute: "src", TargetRoute: "dst", Semantics: "message", ReplyRoute: "codex://replyhost/thread/source", ReplyEndpointID: trustedEndpoint, ReplyThreadID: "source", CustodyRoute: receiverEndpoint, CustodyStoreID: j.StoreID(), Digest: "digest", BodySize: 1}); err != nil {
 		t.Fatal(err)
 	}
 	q := request(j)

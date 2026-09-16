@@ -162,7 +162,7 @@ func (r Receiver) validateOriginal(ctx context.Context, j *journal.Journal, req 
 	if err != nil {
 		return fmt.Errorf("%w: original operation unavailable: %v", ErrRelationshipMismatch, err)
 	}
-	if op.CustodyRoute != req.Custody.EndpointID || op.CustodyStoreID != storeID || op.ReplyRoute == "" || op.ReplyRoute != req.ReplyDestination.URI {
+	if op.CustodyRoute != req.Custody.EndpointID || op.CustodyStoreID != storeID || op.ReplyRoute == "" || op.ReplyRoute != req.ReplyDestination.URI || op.ReplyEndpointID == "" || op.ReplyEndpointID != req.ReplyDestination.EndpointID || op.ReplyThreadID == "" || op.ReplyThreadID != req.ReplyDestination.ThreadID {
 		return ErrRelationshipMismatch
 	}
 	return nil
