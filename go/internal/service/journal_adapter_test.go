@@ -200,7 +200,7 @@ func TestSQLiteReplyWaitDoesNotCountOwnAcceptance(t *testing.T) {
 	}
 	defer inner.Close()
 	r := baseResolver()
-	original := mektup.Envelope{MessageID: "msg_27999999-9999-7999-8999-999999999999", Kind: mektup.KindMessage, FromEndpointID: epSource, From: r.source.URI, FromKind: "agent", ToEndpointID: epTarget, To: r.target.URI, RequestedTarget: "target", ReplyRequested: true, ReplyEndpointID: epSource, ReplyTo: r.source.URI, ReplyCustodyEndpointID: epSource, ReplyCustodyStoreID: storeID, Body: "question", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
+	original := mektup.Envelope{MessageID: "msg_27999999-9999-7999-8999-999999999999", Kind: mektup.KindMessage, FromEndpointID: epSource, From: "codex://" + epSource + "/thread/source", FromKind: "agent", ToEndpointID: epTarget, To: "codex://" + epTarget + "/thread/target", RequestedTarget: "target", ReplyRequested: true, ReplyEndpointID: epSource, ReplyTo: "codex://" + epSource + "/thread/source", ReplyCustodyEndpointID: epSource, ReplyCustodyStoreID: storeID, Body: "question", Provenance: "observed", SentAt: time.Now().UTC().Format(time.RFC3339Nano)}
 	original.PayloadBytes = uint64(len(original.Body))
 	original.PayloadSHA256 = digest(original.Body)
 	if _, err := inner.Prepare(ctx, journal.Operation{OperationID: "op_28999999-9999-7999-8999-999999999999", MessageID: original.MessageID, SourceRoute: original.From, TargetRoute: original.To, Semantics: "message", Digest: original.PayloadSHA256, BodySize: int64(original.PayloadBytes), ReplyRoute: original.ReplyTo, CustodyRoute: original.ReplyCustodyEndpointID, CustodyStoreID: original.ReplyCustodyStoreID}); err != nil {

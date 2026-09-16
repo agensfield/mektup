@@ -78,15 +78,9 @@ func (r ResolverAdapter) ResolvePinned(ctx context.Context, endpointID, uri stri
 	if err != nil {
 		return service.ResolvedTarget{}, err
 	}
-	// Alias is presentation context only. If it differs from the endpoint's
-	// current preferred alias, it must still be an explicitly configured alias
-	// for the same stable endpoint. We never resolve a replacement by name.
-	if address.Endpoint != ep.Alias {
-		mapped, mapErr := r.Store.ResolveEndpoint(address.Endpoint, r.CodexHome)
-		if mapErr != nil || mapped.ID != ep.ID {
-			return service.ResolvedTarget{}, fmt.Errorf("runtime: pinned URI alias %q is not mapped to endpoint %q", address.Endpoint, endpointID)
-		}
-	}
+	// The URI host is relationship metadata, not portable authority. The
+	// stable endpoint ID was resolved independently above, so a sender-local
+	// alias remains valid when this installation uses a different alias.
 	loaded, persistent := true, true
 	if r.StateProbe != nil {
 		loaded, persistent, err = r.StateProbe(ctx, ep.ID, address.ThreadID)
@@ -94,7 +88,7 @@ func (r ResolverAdapter) ResolvePinned(ctx context.Context, endpointID, uri stri
 			return service.ResolvedTarget{}, fmt.Errorf("runtime: pinned target runtime-state preflight failed: %w", err)
 		}
 	}
-	return service.ResolvedTarget{Requested: uri, EndpointID: ep.ID, URI: uri, ThreadID: address.ThreadID, Loaded: loaded, Persistent: persistent}, nil
+	return service.ResolvedTarget{Requested: uri, EndpointID: ep.ID, URI: codexURI(ep.ID, address.ThreadID), ThreadID: address.ThreadID, Loaded: loaded, Persistent: persistent}, nil
 }
 
 func codexURI(alias, threadID string) string {

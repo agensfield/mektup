@@ -865,6 +865,28 @@ func TestPortableAuthorityComparatorUsesImmutableClaims(t *testing.T) {
 	}
 }
 
+func TestPortableApplicationRoutesUseStableIDsAcrossAliases(t *testing.T) {
+	root := t.TempDir()
+	store := endpoint.NewStore(filepath.Join(root, "endpoints.json"), filepath.Join(root, "state"))
+	ep := endpoint.Endpoint{ID: endpointID(), Alias: "receiver-local", Route: endpoint.Route{Kind: endpoint.RouteUnix, UnixSocket: filepath.Join(root, "receiver.sock")}, Herdr: endpoint.HerdrDisabled}
+	if err := store.Add(ep); err != nil {
+		t.Fatal(err)
+	}
+	receipt := mektup.Receipt{
+		Source:   mektup.ReceiptIdentity{EndpointID: ep.ID, ThreadID: "source", Resolved: "codex://sender-local/thread/source"},
+		Target:   mektup.ReceiptIdentity{EndpointID: ep.ID, ThreadID: "target", Resolved: "codex://sender-devbox/thread/target"},
+		Evidence: []mektup.EvidenceRecord{{Details: map[string]any{"custodyRoute": ep.ID, "custodyStoreId": "store_0198f0e0-0000-7000-8000-000000000099"}}},
+	}
+	r := applicationImportResolver{store: store}
+	routes, err := r.verifyPortableRoutes(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if routes.source.ID != ep.ID || routes.target.ID != ep.ID || routes.custody.ID != ep.ID {
+		t.Fatalf("stable route resolution=%+v", routes)
+	}
+}
+
 func TestMessagingPoolCleanupWarningIsDurable(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, "codex")

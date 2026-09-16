@@ -192,6 +192,41 @@ func baseResolver() fakeResolver {
 	return fakeResolver{source: SourceIdentity{EndpointID: epSource, URI: "codex://local/thread/source", CustodyEndpointID: epSource, CustodyStoreID: storeID}, target: ResolvedTarget{Requested: "target", EndpointID: epTarget, URI: "codex://local/thread/target", ThreadID: "target", Loaded: true}, pinned: ResolvedTarget{EndpointID: epSource, URI: "codex://local/thread/source", ThreadID: "source", Loaded: true}}
 }
 
+func TestWireEnvelopesUseStableEndpointSelectorsAcrossAliases(t *testing.T) {
+	r := baseResolver()
+	r.source.URI = "codex://sender-local/thread/source"
+	r.target.URI = "codex://sender-devbox/thread/target"
+	r.pinned.URI = "codex://sender-local/thread/source"
+	d := &fakeDelivery{}
+	j := newFakeJournal()
+	s := validService(&r, d, j)
+	if _, err := s.Send(context.Background(), SendRequest{Target: "codex://sender-devbox/thread/target", Body: "question", RequestReply: true}); err != nil {
+		t.Fatal(err)
+	}
+	sent, err := mektup.ParseEnvelopeString(d.calls[0].text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sent.From != "codex://"+epSource+"/thread/source" || sent.To != "codex://"+epTarget+"/thread/target" || sent.ReplyTo != "codex://"+epSource+"/thread/source" {
+		t.Fatalf("send wire routes from=%q to=%q reply-to=%q", sent.From, sent.To, sent.ReplyTo)
+	}
+
+	original := mektup.Envelope{MessageID: "msg_07999999-9999-7999-8999-999999999999", Kind: mektup.KindMessage, FromEndpointID: epTarget, From: "codex://sender-devbox/thread/target", FromKind: "agent", ToEndpointID: epSource, To: "codex://sender-local/thread/source", RequestedTarget: "target", ReplyRequested: true, ReplyEndpointID: epSource, ReplyTo: "codex://sender-local/thread/source", ReplyCustodyEndpointID: epSource, ReplyCustodyStoreID: storeID, Body: "question", Provenance: "observed"}
+	original.PayloadBytes = uint64(len(original.Body))
+	original.PayloadSHA256 = digest(original.Body)
+	original.SentAt = time.Now().UTC().Format(time.RFC3339Nano)
+	if _, err := s.Reply(context.Background(), originalResolver{original: OriginalMessage{Envelope: original, CurrentThread: original.To}}, ReplyRequest{Reference: original.MessageID, Body: "answer"}); err != nil {
+		t.Fatal(err)
+	}
+	replied, err := mektup.ParseEnvelopeString(d.calls[1].text)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replied.From != "codex://"+epSource+"/thread/source" || replied.To != "codex://"+epSource+"/thread/source" {
+		t.Fatalf("reply wire routes from=%q to=%q", replied.From, replied.To)
+	}
+}
+
 func TestSendPreflightsMeasuredEnvelopeBeforeJournalOrWrite(t *testing.T) {
 	r := baseResolver()
 	d := &fakeDelivery{}

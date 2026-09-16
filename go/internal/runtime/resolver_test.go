@@ -53,3 +53,19 @@ func TestResolverPinnedUsesRuntimeStateProbe(t *testing.T) {
 		t.Fatalf("pinned runtime state = called:%v target:%#v", called, got)
 	}
 }
+
+func TestResolverPinnedAcceptsForeignAliasAndCanonicalizesWireURI(t *testing.T) {
+	store := endpoint.NewStore(filepath.Join(t.TempDir(), "endpoints.json"), t.TempDir())
+	ep := endpoint.Endpoint{ID: testTargetEndpoint, Alias: "receiver-local", Route: endpoint.Route{Kind: endpoint.RouteUnix, UnixSocket: "/tmp/target.sock"}, Herdr: endpoint.HerdrDisabled}
+	if err := store.Add(ep); err != nil {
+		t.Fatal(err)
+	}
+	got, err := (ResolverAdapter{Store: store}).ResolvePinned(context.Background(), ep.ID, "codex://sender-local/thread/thread-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "codex://" + ep.ID + "/thread/thread-1"
+	if got.EndpointID != ep.ID || got.ThreadID != "thread-1" || got.URI != want {
+		t.Fatalf("pinned foreign alias = %#v, want canonical URI %q", got, want)
+	}
+}

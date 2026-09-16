@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -374,18 +375,20 @@ func (s *Service) send(ctx context.Context, req SendRequest, onAccepted Acceptan
 	if req.RequestReply && (source.URI == "" || source.EndpointID == "" || source.CustodyEndpointID == "" || source.CustodyStoreID == "") {
 		return SendResult{}, semantic(mektup.ErrReplyRouteRequired, "reply source and custody identities are incomplete", nil, nil)
 	}
+	wireTargetURI := canonicalThreadURI(target.EndpointID, target.URI)
+	wireSourceURI := canonicalThreadURI(source.EndpointID, source.URI)
 
 	messageID, err := mektup.NewMessageIDChecked()
 	if err != nil {
 		return SendResult{}, semantic(mektup.ErrInternal, "cannot allocate message identity", nil, err)
 	}
 	envelope := mektup.Envelope{MessageID: messageID, Kind: mektup.KindMessage,
-		FromEndpointID: source.EndpointID, From: source.URI, FromKind: kindOf(source), FromHerdr: source.Herdr,
-		ToEndpointID: target.EndpointID, To: target.URI, RequestedTarget: req.Target,
+		FromEndpointID: source.EndpointID, From: wireSourceURI, FromKind: kindOf(source), FromHerdr: source.Herdr,
+		ToEndpointID: target.EndpointID, To: wireTargetURI, RequestedTarget: req.Target,
 		ReplyRequested: req.RequestReply, Body: req.Body, Provenance: "observed"}
 	if req.RequestReply {
 		envelope.ReplyEndpointID = source.EndpointID
-		envelope.ReplyTo = source.URI
+		envelope.ReplyTo = wireSourceURI
 		envelope.ReplyCustodyEndpointID = source.CustodyEndpointID
 		envelope.ReplyCustodyStoreID = source.CustodyStoreID
 	}
@@ -410,11 +413,11 @@ func (s *Service) send(ctx context.Context, req SendRequest, onAccepted Acceptan
 		return SendResult{}, semantic(mektup.ErrInternal, "cannot allocate operation identity", nil, err)
 	}
 	digest := digest(req.Body)
-	sourceRoute := source.URI
+	sourceRoute := wireSourceURI
 	if sourceRoute == "" {
 		sourceRoute = "human://" + source.EndpointID
 	}
-	op := Operation{OperationID: opID, MessageID: messageID, SourceRoute: sourceRoute, TargetRoute: target.URI,
+	op := Operation{OperationID: opID, MessageID: messageID, SourceRoute: sourceRoute, TargetRoute: wireTargetURI,
 		Semantics: semantics(req.Raw), ReplyRoute: envelope.ReplyTo, ReplyEndpointID: envelope.ReplyEndpointID, CustodyRoute: envelope.ReplyCustodyEndpointID,
 		CustodyStoreID: envelope.ReplyCustodyStoreID, Digest: digest, BodySize: int64(len([]byte(req.Body))),
 		ReplyRequested: req.RequestReply, SourceEndpointID: source.EndpointID, TargetEndpointID: target.EndpointID}
@@ -654,4 +657,18 @@ func threadID(uri string) string {
 		return a.ThreadID
 	}
 	return ""
+}
+
+// canonicalThreadURI is the wire selector form. Endpoint aliases are local
+// presentation metadata; envelopes must carry the stable endpoint identity
+// so a receiver with a different alias can independently resolve the route.
+func canonicalThreadURI(endpointID, uri string) string {
+	if endpointID == "" {
+		return uri
+	}
+	address, err := mektup.ParseThreadURI(uri)
+	if err != nil || address.ThreadID == "" {
+		return uri
+	}
+	return "codex://" + endpointID + "/thread/" + url.PathEscape(address.ThreadID)
 }
