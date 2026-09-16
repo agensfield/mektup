@@ -48,6 +48,7 @@ jobs:
           make conformance
           make contracts
           make notices
+          make govulncheck
       - name: Install Syft for the GoReleaser SBOM step
         uses: anchore/sbom-action/download-syft@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
         with:
