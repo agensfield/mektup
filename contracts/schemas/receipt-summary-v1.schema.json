@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agensfield.dev/mektup/contracts/receipt-summary-v1.schema.json",
+  "title": "Mektup v1 compact receipt summary",
+  "type": "object",
+  "required": ["schema", "projection", "canonical", "receiptId", "operationId", "operation", "state", "source", "target", "message", "evidenceCount", "evidence", "warningCount", "warnings"],
+  "properties": {
+    "schema": { "const": "mektup/receipt-summary/v1" },
+    "projection": { "const": "receipt-summary" },
+    "canonical": { "const": false },
+    "receiptId": { "$ref": "common-v1.schema.json#/$defs/receiptId" },
+    "operationId": { "$ref": "common-v1.schema.json#/$defs/operationId" },
+    "operation": { "type": "string", "minLength": 1 },
+    "state": { "type": "string", "minLength": 1 },
+    "source": { "type": "object" },
+    "target": { "type": "object" },
+    "message": { "type": "object" },
+    "evidenceCount": { "type": "integer", "minimum": 0 },
+    "evidence": { "type": "array" },
+    "warningCount": { "type": "integer", "minimum": 0 },
+    "warnings": { "type": "array" }
+  },
+  "additionalProperties": true
+}

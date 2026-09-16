@@ -1,0 +1,22 @@
+{
+  "schema": "mektup/event/v1",
+  "event": "thread.list.completed",
+  "eventId": "evt_0198f0e0-0000-7000-8000-000000000501",
+  "sequence": 1,
+  "operationId": "op_0198f0e0-0000-7000-8000-000000000502",
+  "timestamp": "2026-09-17T00:00:00.000000Z",
+  "terminal": true,
+  "ok": true,
+  "warnings": [],
+  "warningCount": 0,
+  "presentation": "compact",
+  "data": {
+    "resultKind": "thread",
+    "data": [],
+    "count": 0,
+    "requestedLimit": null,
+    "effectiveLimit": 10,
+    "hasMore": false,
+    "nextCursor": null
+  }
+}

@@ -91,6 +91,50 @@ func NewEnvironment(options Options) *Environment { return New(options) }
 
 var _ cli.Executor = (*Environment)(nil)
 var _ cli.StreamingExecutor = (*Environment)(nil)
+var _ cli.CompactRetainer = (*Environment)(nil)
+
+func (e *Environment) RetainCompact(ctx context.Context, inv cli.Invocation, document []byte) (cli.CompactArtifact, error) {
+	if e == nil || len(document) == 0 {
+		return cli.CompactArtifact{}, errors.New("compact retention requires an application environment and encoded record")
+	}
+	_, stateDir := e.paths(inv)
+	artifactRoot := e.options.ArtifactDir
+	if artifactRoot == "" {
+		if err := ensureCompactStateDir(stateDir); err != nil {
+			return cli.CompactArtifact{}, err
+		}
+		artifactRoot = filepath.Join(stateDir, "artifacts")
+	}
+	store, err := artifact.NewStore(artifactRoot)
+	if err != nil {
+		return cli.CompactArtifact{}, err
+	}
+	defer store.Close()
+	digest := sha256.Sum256(document)
+	name := "compact-output-" + hex.EncodeToString(digest[:]) + ".jsonl"
+	receipt, err := store.Spill(ctx, name, bytes.NewReader(document), artifact.Options{MediaType: "application/x-ndjson", SensitiveOutputPossible: true, MaxBytes: 32 << 20})
+	if err != nil {
+		return cli.CompactArtifact{}, err
+	}
+	return cli.CompactArtifact{Path: receipt.Path, Bytes: receipt.Bytes, SHA256: receipt.SHA256}, nil
+}
+
+func ensureCompactStateDir(stateDir string) error {
+	info, err := os.Lstat(stateDir)
+	if errors.Is(err, os.ErrNotExist) {
+		if err := os.Mkdir(stateDir, 0o700); err != nil && !errors.Is(err, os.ErrExist) {
+			return fmt.Errorf("create compact retention state directory: %w", err)
+		}
+		info, err = os.Lstat(stateDir)
+	}
+	if err != nil {
+		return fmt.Errorf("inspect compact retention state directory: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() || info.Mode().Perm() != 0o700 {
+		return errors.New("compact retention state directory must be an owner-private real directory")
+	}
+	return nil
+}
 
 // Execute opens only the resources needed by the production executor for this
 // invocation. No path is taken that starts a daemon.

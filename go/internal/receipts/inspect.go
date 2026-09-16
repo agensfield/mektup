@@ -32,14 +32,16 @@ type TargetInspector interface {
 }
 
 type InspectOptions struct {
-	ReceiptLimit int
-	Blockers     bool
+	ReceiptLimit  int
+	ReceiptCursor string
+	Blockers      bool
 }
 
 type InspectResult struct {
-	Target   TargetIdentity
-	Receipts []mektup.Receipt
-	Blockers []journal.Blocker
+	Target             TargetIdentity
+	Receipts           []mektup.Receipt
+	ReceiptsNextCursor string
+	Blockers           []journal.Blocker
 }
 
 func (s Store) Inspect(ctx context.Context, target string, inspector TargetInspector, options InspectOptions) (InspectResult, error) {
@@ -57,13 +59,17 @@ func (s Store) Inspect(ctx context.Context, target string, inspector TargetInspe
 		return InspectResult{}, err
 	}
 	related := make([]mektup.Receipt, 0)
+	var receiptsNextCursor string
 	if options.ReceiptLimit > 0 {
-		related, err = s.Journal.ListReceipts(ctx, journal.ReceiptQuery{EndpointID: identity.EndpointID, ThreadID: identity.ThreadID, Limit: options.ReceiptLimit})
+		page, pageErr := s.ListPage(ctx, ListOptions{Limit: options.ReceiptLimit, Cursor: options.ReceiptCursor, EndpointID: identity.EndpointID, ThreadID: identity.ThreadID})
+		related, receiptsNextCursor, err = page.Receipts, page.NextCursor, pageErr
 		if err != nil {
 			return InspectResult{}, err
 		}
+	} else if options.ReceiptCursor != "" {
+		return InspectResult{}, fmt.Errorf("%w: receipt cursor requires a positive receipt limit", ErrInvalidArguments)
 	}
-	result := InspectResult{Target: identity, Receipts: related}
+	result := InspectResult{Target: identity, Receipts: related, ReceiptsNextCursor: receiptsNextCursor}
 	if options.Blockers {
 		blockerLimit := options.ReceiptLimit
 		if blockerLimit == 0 {

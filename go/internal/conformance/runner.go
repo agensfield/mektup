@@ -274,6 +274,7 @@ func validateManifestFixture(f manifestFixture) error {
 		"envelope-rendered": "Mektup/1",
 		"envelope-negative": "Mektup/1",
 		"receipt":           "mektup/receipt/v1",
+		"receipt-summary":   "mektup/receipt-summary/v1",
 		"event":             "mektup/event/v1",
 		"warning":           "mektup/warning/v1",
 		"error":             "mektup/error/v1",
@@ -311,6 +312,8 @@ func validateFixture(f manifestFixture, data []byte, root string) error {
 		return validateEnvelopeMetadata(data, root)
 	case "receipt":
 		return validateReceiptFixture(data)
+	case "receipt-summary":
+		return validateReceiptSummaryFixture(data)
 	case "event":
 		return validateEventFixture(data)
 	case "warning":
@@ -328,6 +331,30 @@ func validateFixture(f manifestFixture, data []byte, root string) error {
 	default:
 		return fmt.Errorf("unsupported manifest kind %q", f.Kind)
 	}
+}
+
+func validateReceiptSummaryFixture(data []byte) error {
+	var summary struct {
+		Schema        string `json:"schema"`
+		Projection    string `json:"projection"`
+		Canonical     bool   `json:"canonical"`
+		ReceiptID     string `json:"receiptId"`
+		OperationID   string `json:"operationId"`
+		EvidenceCount int    `json:"evidenceCount"`
+		Evidence      []any  `json:"evidence"`
+		WarningCount  int    `json:"warningCount"`
+		Warnings      []any  `json:"warnings"`
+	}
+	if err := json.Unmarshal(data, &summary); err != nil {
+		return err
+	}
+	if summary.Schema != "mektup/receipt-summary/v1" || summary.Projection != "receipt-summary" || summary.Canonical || !strings.HasPrefix(summary.ReceiptID, "rcpt_") || !strings.HasPrefix(summary.OperationID, "op_") {
+		return errors.New("invalid compact receipt summary identity")
+	}
+	if summary.EvidenceCount != len(summary.Evidence) || summary.WarningCount != len(summary.Warnings) {
+		return errors.New("compact receipt summary counts do not match projected rows")
+	}
+	return nil
 }
 
 func validateRenderedEnvelope(data []byte) error {
@@ -963,11 +990,11 @@ func validateOriginalStatusResultRunner(result map[string]any) error {
 }
 
 func validateScenarioDocuments(s scenariosDocument, t transitionsDocument) error {
-	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.7" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
+	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.8" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
 		return errors.New("scenarios document metadata is incomplete")
 	}
-	if t.SpecVersion != "1.0.7" {
-		return errors.New("transitions document spec revision is not 1.0.7")
+	if t.SpecVersion != "1.0.8" {
+		return errors.New("transitions document spec revision is not 1.0.8")
 	}
 	states := map[string]bool{"none": true}
 	for _, state := range t.States {

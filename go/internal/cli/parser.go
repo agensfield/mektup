@@ -15,8 +15,8 @@ type optionSpec struct {
 }
 
 var optionSpecs = map[string]optionSpec{
-	"json": {}, "human": {}, "debug": {}, "audit": {}, "help": {}, "skill": {}, "stdin": {}, "wait": {}, "request-reply": {}, "raw": {}, "blockers": {}, "loaded": {}, "archived": {}, "portable": {}, "content": {}, "dry-run": {}, "fix": {}, "force": {},
-	"endpoint": {value: true}, "config": {value: true}, "state-dir": {value: true}, "color": {value: true}, "file": {value: true}, "delivery-timeout": {value: true}, "wait-timeout": {value: true}, "timeout": {value: true}, "reply-to": {value: true}, "status": {value: true}, "error-code": {value: true}, "receipt-file": {value: true}, "receipts": {value: true}, "cwd": {value: true}, "source": {value: true, repeat: true}, "sort": {value: true}, "order": {value: true}, "limit": {value: true}, "cursor": {value: true}, "view": {value: true}, "turn": {value: true}, "model": {value: true}, "name": {value: true}, "through-turn": {value: true}, "before-turn": {value: true}, "thread": {value: true}, "state": {value: true}, "since": {value: true}, "resolve-as": {value: true}, "reason": {value: true}, "evidence": {value: true}, "ssh": {value: true}, "unix": {value: true}, "id": {value: true}, "herdr": {value: true}, "before": {value: true}, "params": {value: true}, "params-file": {value: true}, "allow-effect": {value: true, repeat: true}, "output": {value: true},
+	"json": {}, "human": {}, "compact": {}, "debug": {}, "audit": {}, "help": {}, "skill": {}, "stdin": {}, "wait": {}, "request-reply": {}, "raw": {}, "blockers": {}, "loaded": {}, "archived": {}, "portable": {}, "content": {}, "dry-run": {}, "fix": {}, "force": {},
+	"endpoint": {value: true}, "config": {value: true}, "state-dir": {value: true}, "color": {value: true}, "file": {value: true}, "delivery-timeout": {value: true}, "wait-timeout": {value: true}, "timeout": {value: true}, "reply-to": {value: true}, "status": {value: true}, "error-code": {value: true}, "receipt-file": {value: true}, "receipts": {value: true}, "receipts-cursor": {value: true}, "cwd": {value: true}, "source": {value: true, repeat: true}, "sort": {value: true}, "order": {value: true}, "limit": {value: true}, "cursor": {value: true}, "view": {value: true}, "turn": {value: true}, "model": {value: true}, "name": {value: true}, "through-turn": {value: true}, "before-turn": {value: true}, "thread": {value: true}, "state": {value: true}, "since": {value: true}, "resolve-as": {value: true}, "reason": {value: true}, "evidence": {value: true}, "ssh": {value: true}, "unix": {value: true}, "id": {value: true}, "herdr": {value: true}, "before": {value: true}, "params": {value: true}, "params-file": {value: true}, "allow-effect": {value: true, repeat: true}, "output": {value: true},
 }
 
 // Parse validates syntax-independent option shape and returns the invocation.
@@ -62,6 +62,9 @@ func Parse(args []string) (Invocation, error) {
 			}
 			if name == "human" {
 				inv.Global.Human = true
+			}
+			if name == "compact" {
+				inv.Global.Compact = true
 			}
 			if name == "debug" {
 				inv.Global.Debug = true
@@ -132,15 +135,15 @@ func parseOption(arg string) (name, value string, hasValue bool, err error) {
 }
 
 func validateInvocation(a *App, inv Invocation) *Error {
-	if inv.Global.JSON && inv.Global.Human {
-		return usageError("--json and --human are mutually exclusive")
+	if boolCount(inv.Global.JSON, inv.Global.Human, inv.Global.Compact) > 1 {
+		return usageError("--json, --human, and --compact are mutually exclusive")
 	}
 	if len(inv.Path) == 0 {
 		return nil
 	}
 	allowed := allowedOptions(strings.Join(inv.Path, " "))
 	for option := range inv.Options {
-		if option == "help" || option == "json" || option == "human" || option == "debug" || option == "audit" || option == "endpoint" || option == "config" || option == "state-dir" || option == "color" {
+		if option == "help" || option == "json" || option == "human" || option == "compact" || option == "debug" || option == "audit" || option == "endpoint" || option == "config" || option == "state-dir" || option == "color" {
 			continue
 		}
 		if !allowed[option] {
@@ -301,6 +304,9 @@ func validateOptionSyntax(inv Invocation) *Error {
 			if err != nil || n < 0 {
 				return usageError("--" + option + " requires a non-negative integer")
 			}
+			if inv.Resolved.Compact && n > CompactMaxLimit {
+				return usageError("--" + option + " exceeds compact maximum 25; use explicit --json for a larger complete page")
+			}
 		}
 	}
 	if has(inv, "status") && inv.Option("status") != "success" && inv.Option("status") != "error" {
@@ -345,6 +351,16 @@ func stdinIsInteractive(in io.Reader) bool {
 
 func has(inv Invocation, option string) bool { return len(inv.Options[option]) > 0 }
 
+func boolCount(values ...bool) int {
+	count := 0
+	for _, value := range values {
+		if value {
+			count++
+		}
+	}
+	return count
+}
+
 func validateNested(inv Invocation) *Error {
 	if len(inv.Position) < 1 {
 		return usageError("missing subcommand for " + inv.Command)
@@ -364,7 +380,7 @@ func validateNested(inv Invocation) *Error {
 		}
 	}
 	for option := range inv.Options {
-		if option == "help" || option == "json" || option == "human" || option == "debug" || option == "audit" || option == "endpoint" || option == "config" || option == "state-dir" || option == "color" {
+		if option == "help" || option == "json" || option == "human" || option == "compact" || option == "debug" || option == "audit" || option == "endpoint" || option == "config" || option == "state-dir" || option == "color" {
 			continue
 		}
 		if !allowed[option] {
@@ -440,7 +456,7 @@ var allowedOptionTable = map[string]string{
 	"send":              "stdin file request-reply wait delivery-timeout wait-timeout reply-to raw",
 	"reply":             "stdin file status error-code wait delivery-timeout wait-timeout receipt-file reply-to",
 	"wait":              "timeout receipt-file",
-	"inspect":           "receipts blockers",
+	"inspect":           "receipts receipts-cursor blockers",
 	"search":            "thread archived source limit cursor",
 	"thread list":       "loaded archived cwd source sort order limit cursor",
 	"thread read":       "",
@@ -449,7 +465,7 @@ var allowedOptionTable = map[string]string{
 	"thread start":      "cwd model name",
 	"thread resume":     "",
 	"thread fork":       "through-turn before-turn name",
-	"receipt list":      "state since limit",
+	"receipt list":      "state since limit cursor",
 	"receipt show":      "portable content",
 	"receipt reconcile": "",
 	"receipt resolve":   "resolve-as reason evidence",

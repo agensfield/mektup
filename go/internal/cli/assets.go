@@ -19,7 +19,7 @@ const usageText = `Mektup: reliable Codex thread control
 Usage: mektup [global-options] <command> [command-options]
 
 Global options:
-  --json | --human             select machine JSONL or concise human output
+  --json | --human | --compact select full JSONL, concise human, or bounded JSONL
   --endpoint <alias-or-id>     select destination endpoint
   --config <path>              select configuration location
   --state-dir <path>           select journal location
@@ -31,7 +31,7 @@ Messaging:
   send <target> [message|--stdin|--file <path>] [--request-reply] [--wait]
   reply <message-or-receipt-id> [message|--stdin|--file <path>] [--wait]
   wait <receipt-or-message-id> [--timeout <duration>]
-  inspect <target> [--receipts <limit>] [--blockers]
+  inspect <target> [--receipts <limit>] [--receipts-cursor <token>] [--blockers]
 
 Targets:
   <unique-live-herdr-name>
@@ -51,10 +51,10 @@ Receipts/endpoints/storage:
   doctor [--fix]
 
 Offline:
-  version [--json]
+  version [--json|--compact]
   completion <zsh|bash|fish>
   --skill
-  docs agents|commands [--json]|envelopes|receipts
+  docs agents|commands|envelopes|receipts [--json|--compact]
 
 Use mektup help <command> for command-specific guidance.
 `
@@ -75,7 +75,7 @@ error; --error-code requires --status error.
 
 Wait never sends or edits a message. Plain/raw sends fail reply_not_requested.
 `,
-	"inspect": `Usage: mektup inspect <target> [--receipts <limit>] [--blockers]
+	"inspect": `Usage: mektup inspect <target> [--receipts <limit>] [--receipts-cursor <token>] [--blockers]
 
 Inspect resolves a target without sending a message. A bare target is a unique
 live Herdr agent name. Address a known Codex thread directly as:
@@ -84,24 +84,26 @@ live Herdr agent name. Address a known Codex thread directly as:
 
 The default includes up to 10 related receipts. Use --receipts 0 for an
 identity-only existence check, or --blockers to include callback blockers.
+Compact receipt pages include an opaque nextCursor consumed by
+--receipts-cursor with the same target and filters.
 `,
-	"docs": `Usage: mektup docs agents|commands [--json]|envelopes|receipts
+	"docs": `Usage: mektup docs agents|commands|envelopes|receipts [--json|--compact]
 
 Documentation is embedded and works without endpoint or journal state.
 `,
-	"search": "Usage: mektup search <query> [--thread <target>] [--archived] [--source <kind>]...\n",
+	"search": "Usage: mektup search <query> [--thread <target>] [--archived] [--source <kind>]... [--limit <n>] [--cursor <token>]\n",
 	"thread": `Usage: mektup thread list|read|turns|items|start|resume|fork [options]
 
 Read and lifecycle commands accept a configured target URI. A known local
 thread UUID can be addressed as codex://local/thread/<thread-uuid>.
 `,
-	"receipt":    "Usage: mektup receipt list|show|reconcile|resolve [options]\n",
+	"receipt":    "Usage: mektup receipt list [--limit <n>] [--cursor <token>]|show|reconcile|resolve [options]\n",
 	"endpoint":   "Usage: mektup endpoint list|show|add|remove|check [options]\n",
 	"storage":    "Usage: mektup storage status|check|maintain|vacuum [options]\n",
 	"rpc":        "Usage: mektup rpc <method> [--params|--params-file|--stdin] [--allow-effect <class>]...\n",
 	"doctor":     "Usage: mektup doctor [--fix]\n",
 	"completion": "Usage: mektup completion <zsh|bash|fish>\n",
-	"version":    "Usage: mektup version [--json]\n",
+	"version":    "Usage: mektup version [--json|--compact]\n",
 }
 
 func completionScript(shell string) string {

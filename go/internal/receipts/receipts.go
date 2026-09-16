@@ -6,6 +6,7 @@ package receipts
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -78,14 +79,41 @@ func (s Store) now() time.Time {
 }
 
 type ListOptions struct {
-	State mektup.EvidenceState
-	Since time.Time
-	Limit int
+	State      mektup.EvidenceState
+	Since      time.Time
+	Limit      int
+	Cursor     string
+	EndpointID string
+	ThreadID   string
 }
+
+type ListPage struct {
+	Receipts   []mektup.Receipt
+	NextCursor string
+}
+
+type receiptCursor struct {
+	Version    int    `json:"v"`
+	StoreID    string `json:"store"`
+	State      string `json:"state,omitempty"`
+	Since      int64  `json:"since,omitempty"`
+	EndpointID string `json:"endpointId,omitempty"`
+	ThreadID   string `json:"threadId,omitempty"`
+	AnchorAt   int64  `json:"anchorAt"`
+	AnchorID   string `json:"anchorId"`
+	LastAt     int64  `json:"lastAt"`
+	LastID     string `json:"lastId"`
+}
+
+type storeIdentity interface{ StoreID() string }
 
 func (s Store) List(ctx context.Context, options ListOptions) ([]mektup.Receipt, error) {
 	if err := s.valid(); err != nil {
 		return nil, err
+	}
+	if options.Cursor != "" {
+		page, err := s.ListPage(ctx, options)
+		return page.Receipts, err
 	}
 	limit, err := boundedLimit(options.Limit)
 	if err != nil {
@@ -94,7 +122,106 @@ func (s Store) List(ctx context.Context, options ListOptions) ([]mektup.Receipt,
 	if options.State != "" && !options.State.Valid() {
 		return nil, fmt.Errorf("%w: invalid state %q", ErrInvalidArguments, options.State)
 	}
-	return s.Journal.ListReceipts(ctx, journal.ReceiptQuery{State: options.State, Since: options.Since, Limit: limit})
+	return s.Journal.ListReceipts(ctx, journal.ReceiptQuery{State: options.State, Since: options.Since, EndpointID: options.EndpointID, ThreadID: options.ThreadID, Limit: limit})
+}
+
+func (s Store) ListPage(ctx context.Context, options ListOptions) (ListPage, error) {
+	if err := s.valid(); err != nil {
+		return ListPage{}, err
+	}
+	limit, err := boundedLimit(options.Limit)
+	if err != nil {
+		return ListPage{}, err
+	}
+	if options.State != "" && !options.State.Valid() {
+		return ListPage{}, fmt.Errorf("%w: invalid state %q", ErrInvalidArguments, options.State)
+	}
+	identity, ok := s.Journal.(storeIdentity)
+	if !ok || identity.StoreID() == "" {
+		return ListPage{}, fmt.Errorf("%w: receipt store identity is unavailable", ErrInvalidArguments)
+	}
+	queryLimit := limit + 1
+	query := journal.ReceiptQuery{State: options.State, Since: options.Since, EndpointID: options.EndpointID, ThreadID: options.ThreadID, Limit: queryLimit, FetchExtra: true}
+	var cursor receiptCursor
+	if options.Cursor != "" {
+		cursor, err = decodeReceiptCursor(options.Cursor)
+		if err != nil || cursor.Version != 1 || cursor.StoreID != identity.StoreID() || cursor.State != string(options.State) || cursor.Since != unixNano(options.Since) || cursor.EndpointID != options.EndpointID || cursor.ThreadID != options.ThreadID || cursor.AnchorAt <= 0 || cursor.AnchorID == "" || cursor.LastAt <= 0 || cursor.LastID == "" {
+			return ListPage{}, fmt.Errorf("%w: receipt cursor does not match this store and query", ErrInvalidArguments)
+		}
+		query.AnchorAt, query.AnchorID = time.Unix(0, cursor.AnchorAt).UTC(), cursor.AnchorID
+		query.BeforeAt, query.BeforeID = time.Unix(0, cursor.LastAt).UTC(), cursor.LastID
+	}
+	items, err := s.Journal.ListReceipts(ctx, query)
+	if err != nil {
+		return ListPage{}, err
+	}
+	hasMore := len(items) > limit
+	if hasMore {
+		items = items[:limit]
+	}
+	page := ListPage{Receipts: items}
+	if !hasMore || len(items) == 0 {
+		return page, nil
+	}
+	firstAt, err := receiptCreatedAt(items[0].CreatedAt)
+	if err != nil {
+		return ListPage{}, err
+	}
+	if options.Cursor == "" {
+		cursor = receiptCursor{Version: 1, StoreID: identity.StoreID(), State: string(options.State), Since: unixNano(options.Since), EndpointID: options.EndpointID, ThreadID: options.ThreadID, AnchorAt: firstAt.UnixNano(), AnchorID: items[0].ReceiptID}
+	}
+	lastAt, err := receiptCreatedAt(items[len(items)-1].CreatedAt)
+	if err != nil {
+		return ListPage{}, err
+	}
+	cursor.LastAt, cursor.LastID = lastAt.UnixNano(), items[len(items)-1].ReceiptID
+	page.NextCursor, err = encodeReceiptCursor(cursor)
+	if err != nil {
+		return ListPage{}, err
+	}
+	return page, nil
+}
+
+func encodeReceiptCursor(cursor receiptCursor) (string, error) {
+	document, err := json.Marshal(cursor)
+	if err != nil {
+		return "", err
+	}
+	return "rc1." + base64.RawURLEncoding.EncodeToString(document), nil
+}
+
+func decodeReceiptCursor(value string) (receiptCursor, error) {
+	var cursor receiptCursor
+	if len(value) > 8192 {
+		return cursor, ErrInvalidArguments
+	}
+	encoded, ok := strings.CutPrefix(value, "rc1.")
+	if !ok {
+		return cursor, ErrInvalidArguments
+	}
+	document, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || len(document) > 4096 {
+		return cursor, ErrInvalidArguments
+	}
+	if err := json.Unmarshal(document, &cursor); err != nil {
+		return cursor, ErrInvalidArguments
+	}
+	return cursor, nil
+}
+
+func unixNano(value time.Time) int64 {
+	if value.IsZero() {
+		return 0
+	}
+	return value.UTC().UnixNano()
+}
+
+func receiptCreatedAt(value string) (time.Time, error) {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("%w: invalid receipt createdAt", ErrInvalidArguments)
+	}
+	return parsed.UTC(), nil
 }
 
 type ShowOptions struct {

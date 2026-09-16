@@ -28,11 +28,20 @@ type ReceiptQuery struct {
 	Since      time.Time
 	EndpointID string
 	ThreadID   string
+	AnchorAt   time.Time
+	AnchorID   string
+	BeforeAt   time.Time
+	BeforeID   string
 	Limit      int
+	FetchExtra bool
 }
 
 func (q ReceiptQuery) limit() (int, error) {
-	if q.Limit < 0 || q.Limit > MaxReceiptQueryLimit {
+	max := MaxReceiptQueryLimit
+	if q.FetchExtra {
+		max++
+	}
+	if q.Limit < 0 || q.Limit > max {
 		return 0, fmt.Errorf("journal: receipt limit must be between 0 and %d", MaxReceiptQueryLimit)
 	}
 	if q.Limit == 0 {
@@ -261,6 +270,16 @@ func (j *Journal) ListReceipts(ctx context.Context, query ReceiptQuery) ([]mektu
 	} else if query.ThreadID != "" {
 		where = append(where, "(source_thread_id=? OR target_thread_id=?)")
 		args = append(args, query.ThreadID, query.ThreadID)
+	}
+	if !query.AnchorAt.IsZero() {
+		where = append(where, "(created_at<? OR (created_at=? AND receipt_id<=?))")
+		anchor := query.AnchorAt.UTC().UnixNano()
+		args = append(args, anchor, anchor, query.AnchorID)
+	}
+	if !query.BeforeAt.IsZero() {
+		where = append(where, "(created_at<? OR (created_at=? AND receipt_id<?))")
+		before := query.BeforeAt.UTC().UnixNano()
+		args = append(args, before, before, query.BeforeID)
 	}
 	args = append(args, limit)
 	rows, err := j.db.QueryContext(ctx, `SELECT document FROM receipts WHERE `+strings.Join(where, " AND ")+` ORDER BY created_at DESC, receipt_id DESC LIMIT ?`, args...)

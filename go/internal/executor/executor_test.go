@@ -228,7 +228,7 @@ func invocation(command string, position ...string) cli.Invocation {
 func TestOwnedCommandsUseOnlyInjectedPorts(t *testing.T) {
 	conn := &fakeConnection{api: fakeCodex{scoped: true}}
 	connections := &fakeConnections{conn: conn}
-	endpoints := &fakeEndpoints{}
+	endpoints := &fakeEndpoints{item: endpoint.Endpoint{ID: mektup.NewEndpointID(), Alias: "local"}}
 	storage := &fakeStorage{}
 	doctorPort := &fakeDoctor{}
 	receipts := &fakeReceipts{}

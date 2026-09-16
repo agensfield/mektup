@@ -1,4 +1,4 @@
-# Mektup v1 conformance scenarios (spec revision 1.0.7)
+# Mektup v1 conformance scenarios (spec revision 1.0.8)
 
 `v1/state-transitions.json` is the language-neutral delivery and reply
 evidence state machine. Its forbidden transitions are part of the contract:

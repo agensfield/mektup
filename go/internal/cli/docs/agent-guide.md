@@ -1,4 +1,4 @@
-# Mektup agent guide (contract 1.0.7)
+# Mektup agent guide (contract 1.0.8)
 
 Mektup delivers messages to Codex threads and preserves evidence. Use ordinary
 `mektup send <target> <message>` for one-way delivery. Use
@@ -10,9 +10,19 @@ the cases where your next action strictly depends on the correlated reply.
 Do not infer that acceptance means the recipient read, understood, or finished
 the message. A final receipt is always emitted for successful mutations. In
 machine mode, stdout is JSONL lifecycle events and stderr is reserved for
-explicit diagnostics. Use `--json` for machine output or `--human` for concise
-interactive output. Agent mode is selected conservatively by explicit flags,
-`MEKTUP_AGENT=1`, or a nonempty `CODEX_THREAD_ID`.
+explicit diagnostics. Implicit agent mode (`MEKTUP_AGENT=1` or a nonempty
+`CODEX_THREAD_ID`) uses bounded compact JSONL. Use explicit `--json` or
+`MEKTUP_OUTPUT=json` for the compatible full machine page, `--compact` for a
+deliberate compact page, or `--human` for concise interactive output.
+
+Compact collections default to 10 rows and accept at most 25. Continue with
+the returned opaque `nextCursor` and the command's `--cursor` option; inspect
+uses `receiptsPage.nextCursor` with `--receipts-cursor`. Cursors are bound to
+the store and exact query. Compact previews do not erase information: every
+row retains exact endpoint/thread/history or receipt locators, and deliberate
+`--view full`, `--portable`, and `--content` requests keep their exact output.
+If compact output still cannot fit the hard record bound, Mektup reports a
+typed terminal and an owner-private artifact or durable receipt locator.
 
 Exactly one message body source is allowed: one positional string, `--stdin`,
 or `--file <path>`. `--raw` is unwrapped one-way delivery and cannot be used

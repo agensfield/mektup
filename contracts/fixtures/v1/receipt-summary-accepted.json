@@ -1,0 +1,16 @@
+{
+  "schema": "mektup/receipt-summary/v1",
+  "projection": "receipt-summary",
+  "canonical": false,
+  "receiptId": "rcpt_0198f0e0-0000-7000-8000-000000000511",
+  "operationId": "op_0198f0e0-0000-7000-8000-000000000512",
+  "operation": "send",
+  "state": "accepted",
+  "source": { "endpointId": "ep_0198f0e0-0000-7000-8000-000000000513", "threadId": "source" },
+  "target": { "endpointId": "ep_0198f0e0-0000-7000-8000-000000000514", "threadId": "target" },
+  "message": { "messageId": "msg_0198f0e0-0000-7000-8000-000000000515" },
+  "evidenceCount": 1,
+  "evidence": [{ "state": "accepted", "kind": "native_acceptance" }],
+  "warningCount": 0,
+  "warnings": []
+}

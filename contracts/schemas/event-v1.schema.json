@@ -38,7 +38,9 @@
         "thread.read.completed",
         "thread.turns.completed",
         "thread.items.completed",
-        "search.completed"
+        "search.completed",
+        "compact_output_too_large",
+        "compact.decode_failed"
       ]
     },
     "eventId": { "$ref": "common-v1.schema.json#/$defs/eventId" },
@@ -51,6 +53,8 @@
       "type": "array",
       "items": { "$ref": "warning-v1.schema.json" }
     },
+    "presentation": { "const": "compact" },
+    "warningCount": { "type": "integer", "minimum": 0 },
     "data": { "type": "object" }
   },
   "additionalProperties": true

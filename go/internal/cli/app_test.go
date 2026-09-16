@@ -127,8 +127,8 @@ func TestVersionReportsLockedContractRevision(t *testing.T) {
 	if version.ContractVersion != ContractVersion {
 		t.Fatalf("contract version=%q constant=%q", version.ContractVersion, ContractVersion)
 	}
-	if version.ContractVersion != "1.0.7" {
-		t.Fatalf("contract version=%q, want 1.0.7", version.ContractVersion)
+	if version.ContractVersion != "1.0.8" {
+		t.Fatalf("contract version=%q, want 1.0.8", version.ContractVersion)
 	}
 }
 

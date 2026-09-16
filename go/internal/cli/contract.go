@@ -25,9 +25,10 @@ func commandContract() commandContractDocument {
 		Schema:   CommandSchema,
 		Contract: ContractVersion,
 		Presentation: []string{
-			"explicit --json/--human",
-			"MEKTUP_AGENT=1",
-			"nonempty CODEX_THREAD_ID",
+			"explicit --json/--human/--compact",
+			"implicit compact for MEKTUP_AGENT=1",
+			"implicit compact for nonempty CODEX_THREAD_ID",
+			"MEKTUP_OUTPUT=json selects full JSONL",
 			"interactive human default",
 		},
 		ExitClasses: map[string]int{
@@ -38,7 +39,7 @@ func commandContract() commandContractDocument {
 			{Name: "send", Usage: "mektup send <target> [message|--stdin|--file <path>] [--request-reply] [--wait]", Effects: []string{"network-read", "thread-write"}, RetrySafety: "classified-temporary-rejection-only", Availability: "endpoint and target", Result: "send.accepted then optional reply event", Receipt: "required", HumanGate: false},
 			{Name: "reply", Usage: "mektup reply <message-or-receipt-id> [message|--stdin|--file <path>] [--wait]", Effects: []string{"network-read", "thread-write"}, RetrySafety: "same-id idempotent; unknown never resent", Availability: "pinned source endpoint and custody", Result: "reply.accepted then optional reply event", Receipt: "required", HumanGate: false},
 			{Name: "wait", Usage: "mektup wait <receipt-or-message-id> [--timeout <duration>]", Effects: []string{"network-read"}, RetrySafety: "safe observation", Availability: "custody or pinned source endpoint", Result: "reply or wait_incomplete", Receipt: "existing receipt", HumanGate: false},
-			{Name: "inspect", Usage: "mektup inspect <target> [--receipts <limit>] [--blockers]", Effects: []string{"network-read"}, RetrySafety: "safe observation", Availability: "endpoint and target", Result: "bounded identity/runtime metadata", Receipt: "none required", HumanGate: false},
+			{Name: "inspect", Usage: "mektup inspect <target> [--receipts <limit>] [--receipts-cursor <token>] [--blockers]", Effects: []string{"network-read"}, RetrySafety: "safe observation", Availability: "endpoint and target", Result: "bounded identity/runtime metadata", Receipt: "none required", HumanGate: false},
 			{Name: "search", Usage: "mektup search <query> [--thread <target>]", Effects: []string{"network-read"}, RetrySafety: "safe observation", Availability: "endpoint/backend search capability", Result: "bounded thread or message matches", Receipt: "read event", HumanGate: false},
 			{Name: "thread", Usage: "mektup thread list|read|turns|items|start|resume|fork", Effects: []string{"network-read", "thread-write for start/resume/fork"}, RetrySafety: "reads safe; mutations pinned and receipted", Availability: "endpoint/app-server", Result: "bounded metadata/transcript or thread URI", Receipt: "mutation required", HumanGate: false},
 			{Name: "receipt", Usage: "mektup receipt list|show|reconcile|resolve", Effects: []string{"read; network-read for reconcile; thread-write for resolve"}, RetrySafety: "read safe; resolve explicit assertion", Availability: "journal and optionally endpoint", Result: "bounded receipt/evidence", Receipt: "resolve required", HumanGate: true},

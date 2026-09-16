@@ -64,6 +64,7 @@ for data in "$fixture_dir"/*.json; do
 		envelope-*.json) schema="$schema_dir/mektup-envelope-v1.schema.json" ;;
 		error-*.json) schema="$schema_dir/error-v1.schema.json" ;;
 		event-*.json) schema="$schema_dir/event-v1.schema.json" ;;
+		receipt-summary-*.json) schema="$schema_dir/receipt-summary-v1.schema.json" ;;
 		receipt-*.json) schema="$schema_dir/receipt-v1.schema.json" ;;
 		warning-*.json) schema="$schema_dir/warning-v1.schema.json" ;;
 		*)
