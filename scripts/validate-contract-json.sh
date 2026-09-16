@@ -10,7 +10,7 @@ root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 contracts="$root/contracts"
 schema_dir="$contracts/schemas"
 fixture_dir="$contracts/fixtures/v1"
-ajv_cli_version=5.0.0
+validator="$root/node_modules/.bin/ajv"
 
 if [ ! -d "$schema_dir" ] || [ ! -d "$fixture_dir" ]; then
 	printf '%s\n' "contracts/schemas and contracts/fixtures/v1 are required" >&2
@@ -20,10 +20,11 @@ command -v jq >/dev/null 2>&1 || {
 	printf '%s\n' "jq is required for contract JSON syntax validation" >&2
 	exit 1
 }
-command -v npx >/dev/null 2>&1 || {
-	printf '%s\n' "npx is required for Draft 2020-12 contract validation" >&2
+
+if [ ! -x "$validator" ]; then
+	printf '%s\n' "contract validator is missing; run npm ci --ignore-scripts --no-audit --no-fund" >&2
 	exit 1
-}
+fi
 
 json_count=$(find "$contracts" -type f -name '*.json' -print | wc -l | tr -d ' ')
 if [ "$json_count" -eq 0 ]; then
@@ -50,7 +51,7 @@ validate_fixture() {
 	for candidate in "$schema_dir"/*.schema.json; do
 		[ "$candidate" = "$schema" ] || set -- "$@" -r "$candidate"
 	done
-	npx --yes "ajv-cli@$ajv_cli_version" validate \
+	"$validator" validate \
 		--spec=draft2020 --strict=false \
 		-s "$schema" "$@" -d "$data" >/dev/null
 }

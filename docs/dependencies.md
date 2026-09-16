@@ -77,6 +77,21 @@ explicit module-prefetch step. Archives include `LICENSE`, the generated
 repository's MIT `LICENSE` is therefore present alongside, but not merged into,
 the dependency notices.
 
+## Contract validator setup
+
+Contract JSON validation uses the committed `package.json` and
+`package-lock.json` closure for `ajv-cli` `5.0.0`. On a clean checkout, install
+that exact closure with:
+
+```sh
+npm ci --ignore-scripts --no-audit --no-fund
+./scripts/validate-contract-json.sh
+```
+
+The validator script invokes only `node_modules/.bin/ajv`; it does not run
+`npx`, resolve a mutable package tag, or access the network. CI performs the
+networked `npm ci` installation as a distinct step before running validation.
+
 ## Vulnerability scanning
 
 Vulnerability scanning is intentionally separate from archive generation. CI
