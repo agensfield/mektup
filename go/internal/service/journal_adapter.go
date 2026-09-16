@@ -98,14 +98,25 @@ func (a SQLiteJournal) Prepare(ctx context.Context, op Operation) (Prepared, err
 	if err := a.valid(); err != nil {
 		return Prepared{}, err
 	}
+	if op.SourceEndpointID == "" {
+		op.SourceEndpointID = a.SourceEndpointID
+	}
+	if op.TargetEndpointID == "" {
+		op.TargetEndpointID = a.TargetEndpointID
+	}
+	if op.ReplyEndpointID == "" {
+		op.ReplyEndpointID = a.ReplyEndpointID
+	}
+	if op.SourceEndpointID == "" || op.TargetEndpointID == "" {
+		return Prepared{}, errors.New("service: operation endpoint identity is required")
+	}
+	binding := IdentityBinding{SourceEndpointID: op.SourceEndpointID, TargetEndpointID: op.TargetEndpointID, ReplyEndpointID: op.ReplyEndpointID}
 	if a.Registry != nil {
-		if err := a.Registry.Bind(ctx, op.OperationID, op.MessageID, IdentityBinding{SourceEndpointID: op.SourceEndpointID, TargetEndpointID: op.TargetEndpointID, ReplyEndpointID: op.ReplyEndpointID}); err != nil {
+		if err := a.Registry.Bind(ctx, op.OperationID, op.MessageID, binding); err != nil {
 			return Prepared{}, err
 		}
-	} else if op.SourceEndpointID == "" || op.TargetEndpointID == "" {
-		return Prepared{}, errors.New("service: operation endpoint identity registry is required")
 	}
-	r, err := a.Inner.Prepare(ctx, journal.Operation{OperationID: op.OperationID, MessageID: op.MessageID, SourceRoute: op.SourceRoute, TargetRoute: op.TargetRoute, Semantics: op.Semantics, ReplyRoute: op.ReplyRoute, ReplyEndpointID: op.ReplyEndpointID, ReplyThreadID: threadID(op.ReplyRoute), CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID, AttemptOwner: op.AttemptOwner, Digest: op.Digest, BodySize: op.BodySize})
+	r, err := a.Inner.Prepare(ctx, journal.Operation{OperationID: op.OperationID, MessageID: op.MessageID, SourceRoute: op.SourceRoute, TargetRoute: op.TargetRoute, Semantics: op.Semantics, SourceEndpointID: op.SourceEndpointID, TargetEndpointID: op.TargetEndpointID, ReplyRoute: op.ReplyRoute, ReplyEndpointID: op.ReplyEndpointID, ReplyThreadID: threadID(op.ReplyRoute), CustodyRoute: op.CustodyRoute, CustodyStoreID: op.CustodyStoreID, AttemptOwner: op.AttemptOwner, Digest: op.Digest, BodySize: op.BodySize})
 	if err != nil {
 		return Prepared{}, err
 	}
@@ -176,17 +187,24 @@ func (a SQLiteJournal) Lookup(ctx context.Context, ref string) (OperationStatus,
 }
 
 func (a SQLiteJournal) binding(ctx context.Context, r journal.OperationRecord) (IdentityBinding, error) {
+	if r.SourceEndpointID == "" || r.TargetEndpointID == "" {
+		return IdentityBinding{}, errors.New("service: durable operation endpoint identity is unavailable")
+	}
+	durable := IdentityBinding{SourceEndpointID: r.SourceEndpointID, TargetEndpointID: r.TargetEndpointID, ReplyEndpointID: r.ReplyEndpointID}
 	if a.Registry != nil {
-		return a.Registry.Lookup(ctx, r.OperationID, r.MessageID)
+		registered, err := a.Registry.Lookup(ctx, r.OperationID, r.MessageID)
+		if err != nil {
+			return IdentityBinding{}, err
+		}
+		if registered != durable {
+			return IdentityBinding{}, errors.New("service: durable and registry endpoint identity conflict")
+		}
 	}
-	if a.SourceEndpointID == "" || a.TargetEndpointID == "" {
-		return IdentityBinding{}, errors.New("service: operation endpoint identity is unavailable")
-	}
-	return IdentityBinding{SourceEndpointID: a.SourceEndpointID, TargetEndpointID: a.TargetEndpointID, ReplyEndpointID: a.ReplyEndpointID}, nil
+	return durable, nil
 }
 
 func operationStatus(r journal.OperationRecord, sourceID, targetID string) OperationStatus {
-	return OperationStatus{Operation: Operation{OperationID: r.OperationID, MessageID: r.MessageID, SourceRoute: r.SourceRoute, TargetRoute: r.TargetRoute, Semantics: r.Semantics, ReplyRoute: r.ReplyRoute, CustodyRoute: r.CustodyRoute, CustodyStoreID: r.CustodyStoreID, Digest: r.Digest, BodySize: r.BodySize, ReplyRequested: r.ReplyRoute != "", SourceEndpointID: sourceID, TargetEndpointID: targetID}, State: mektup.EvidenceState(r.State), ErrorCode: r.ErrorCode}
+	return OperationStatus{Operation: Operation{OperationID: r.OperationID, MessageID: r.MessageID, SourceRoute: r.SourceRoute, TargetRoute: r.TargetRoute, Semantics: r.Semantics, ReplyRoute: r.ReplyRoute, ReplyEndpointID: r.ReplyEndpointID, CustodyRoute: r.CustodyRoute, CustodyStoreID: r.CustodyStoreID, Digest: r.Digest, BodySize: r.BodySize, ReplyRequested: r.ReplyRoute != "", SourceEndpointID: sourceID, TargetEndpointID: targetID}, State: mektup.EvidenceState(r.State), ErrorCode: r.ErrorCode}
 }
 
 func (a SQLiteJournal) ClaimReply(ctx context.Context, in ReplyClaimInput) (ReplyClaim, error) {

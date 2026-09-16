@@ -329,7 +329,7 @@ func validateReadOnlySchema(ctx context.Context, db *sql.DB) error {
 			return classifyStorageError(err)
 		}
 		if count != 1 {
-			return fmt.Errorf("%w: required v6 table %s is missing", ErrStorageCorrupt, name)
+			return fmt.Errorf("%w: required current table %s is missing", ErrStorageCorrupt, name)
 		}
 	}
 	var presentation int
@@ -337,7 +337,7 @@ func validateReadOnlySchema(ctx context.Context, db *sql.DB) error {
 		return classifyStorageError(err)
 	}
 	if presentation != 1 {
-		return fmt.Errorf("%w: required v6 manual-resolution presentation column is missing", ErrStorageCorrupt)
+		return fmt.Errorf("%w: required manual-resolution presentation column is missing", ErrStorageCorrupt)
 	}
 	if err := validateBlockerStructure(ctx, db); err != nil {
 		return err
@@ -352,6 +352,9 @@ func validateReadOnlySchema(ctx context.Context, db *sql.DB) error {
 		}
 	}
 	if err := validateReplyTupleColumns(ctx, db); err != nil {
+		return err
+	}
+	if err := validateEndpointColumns(ctx, db); err != nil {
 		return err
 	}
 	return nil

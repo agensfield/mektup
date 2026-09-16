@@ -39,3 +39,8 @@ func TestJournalAdapterUsesPerOperationIdentityRegistry(t *testing.T) {
 		t.Fatalf("operation identities crossed: first=%#v second=%#v", first, second)
 	}
 }
+
+func TestJournalAdapterDoesNotRequireMemoryRegistry(t *testing.T) {
+	inner, err := journal.Open(context.Background(), journal.Options{StateDir: t.TempDir()}); if err != nil { t.Fatal(err) }; defer inner.Close()
+	if _, err := NewJournalAdapter(inner, nil); err != nil { t.Fatal(err) }
+}
