@@ -83,8 +83,11 @@ func TestLiveBodyCarryAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sourceURI := "codex://live/thread/" + source.Thread.ID
-	targetURI := "codex://live/thread/" + target.Thread.ID
+	// Production resolution pins the stable endpoint ID before the envelope is
+	// created. Keep the live harness on that canonical wire identity rather
+	// than the human alias used only to configure the endpoint.
+	sourceURI := "codex://" + endpointID + "/thread/" + source.Thread.ID
+	targetURI := "codex://" + endpointID + "/thread/" + target.Thread.ID
 	targetResolved := service.ResolvedTarget{EndpointID: endpointID, URI: targetURI, ThreadID: target.Thread.ID, Loaded: true, Persistent: true}
 	senderResolver := liveResolver{source: service.SourceIdentity{EndpointID: endpointID, URI: sourceURI, CustodyEndpointID: endpointID, CustodyStoreID: store.StoreID()}, target: targetResolved}
 	receiverResolver := liveResolver{source: service.SourceIdentity{EndpointID: endpointID, URI: targetURI, CustodyEndpointID: endpointID, CustodyStoreID: store.StoreID()}, target: targetResolved, replyURI: sourceURI}
