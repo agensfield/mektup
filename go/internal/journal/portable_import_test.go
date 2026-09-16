@@ -64,6 +64,37 @@ func TestImportOriginalStatusPendingCreatesNoAttempt(t *testing.T) {
 	}
 }
 
+func TestImportOriginalStatusPreservesExistingAttemptAuthority(t *testing.T) {
+	for _, selection := range []string{OriginalStatusWinner, OriginalStatusTerminalUnknown} {
+		t.Run(selection, func(t *testing.T) {
+			var now atomic.Int64
+			now.Store(time.Now().UnixNano())
+			j := testJournal(t, t.TempDir(), &now)
+			prepared := prepared(t, j)
+			in := portableImportInput(prepared.Operation, selection, portableImportReply("017"))
+			if selection == OriginalStatusTerminalUnknown {
+				in.EventSeq = 17
+			}
+			var owner, token string
+			var lease int64
+			if err := j.db.QueryRow("SELECT owner,token,lease_until FROM attempts WHERE operation_id=?", prepared.OperationID).Scan(&owner, &token, &lease); err != nil {
+				t.Fatal(err)
+			}
+			if err := j.ImportOriginalStatus(context.Background(), in); err != nil {
+				t.Fatal(err)
+			}
+			var afterOwner, afterToken string
+			var afterLease int64
+			if err := j.db.QueryRow("SELECT owner,token,lease_until FROM attempts WHERE operation_id=?", prepared.OperationID).Scan(&afterOwner, &afterToken, &afterLease); err != nil {
+				t.Fatal(err)
+			}
+			if owner != afterOwner || token != afterToken || lease != afterLease {
+				t.Fatalf("portable projection changed dispatch authority: before=%q/%q/%d after=%q/%q/%d", owner, token, lease, afterOwner, afterToken, afterLease)
+			}
+		})
+	}
+}
+
 func TestImportOriginalStatusWinnerIsIdempotentAcrossRestart(t *testing.T) {
 	dir := t.TempDir()
 	var now atomic.Int64
@@ -115,15 +146,42 @@ func TestImportOriginalStatusUnknownPreservesRemoteEventOrderingAndIsIdempotent(
 	if err := j.db.QueryRow("SELECT seq FROM events WHERE reply_id=?", in.ReplyID).Scan(&seq); err != nil {
 		t.Fatal(err)
 	}
-	if seq != in.EventSeq {
-		t.Fatalf("remote event order not preserved: got %d want %d", seq, in.EventSeq)
+	if seq < 1 || seq == in.EventSeq {
+		t.Fatalf("remote event sequence was used as local key: got %d remote %d", seq, in.EventSeq)
 	}
 	status, err := j.OriginalStatus(context.Background(), op.MessageID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.Selection != OriginalStatusTerminalUnknown || status.TerminalEventSeq != in.EventSeq {
-		t.Fatalf("unknown selection=%+v", status)
+	if status.Selection != OriginalStatusTerminalUnknown || status.TerminalEventSeq != seq {
+		t.Fatalf("unknown selection=%+v local_seq=%d", status, seq)
+	}
+}
+
+func TestImportOriginalStatusUnknownMapsRemoteEventToFreshLocalSequence(t *testing.T) {
+	var now atomic.Int64
+	now.Store(time.Now().UnixNano())
+	j := testJournal(t, t.TempDir(), &now)
+	prepared(t, j) // unrelated local event occupies sequence one
+	op := portableImportOperation("016")
+	in := portableImportInput(op, OriginalStatusTerminalUnknown, portableImportReply("016"))
+	in.EventSeq = 1 // valid remotely, but not a local SQLite primary key
+	if err := j.ImportOriginalStatus(context.Background(), in); err != nil {
+		t.Fatalf("remote/local sequence collision rejected import: %v", err)
+	}
+	var seq int64
+	if err := j.db.QueryRow("SELECT seq FROM events WHERE reply_id=?", in.ReplyID).Scan(&seq); err != nil {
+		t.Fatal(err)
+	}
+	if seq <= 1 {
+		t.Fatalf("import did not allocate a fresh local event sequence: %d", seq)
+	}
+	if err := j.ImportOriginalStatus(context.Background(), in); err != nil {
+		t.Fatalf("repeated unknown import was not idempotent: %v", err)
+	}
+	status, err := j.OriginalStatus(context.Background(), op.MessageID)
+	if err != nil || status.TerminalEventSeq != seq {
+		t.Fatalf("local event selection=%+v err=%v", status, err)
 	}
 }
 

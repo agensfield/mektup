@@ -82,22 +82,24 @@ func (j *Journal) ImportOperation(ctx context.Context, op Operation, state Evide
 }
 
 func importOperationTx(tx *sql.Tx, op Operation, state EvidenceState, errorCode string, now int64) error {
-	return importOperationTxAt(tx, op, state, errorCode, now, true)
+	return importOperationTxAt(tx, op, state, errorCode, now, true, true)
 }
 
-func importOperationTxAt(tx *sql.Tx, op Operation, state EvidenceState, errorCode string, now int64, emitEvent bool) error {
+func importOperationTxAt(tx *sql.Tx, op Operation, state EvidenceState, errorCode string, now int64, emitEvent, requireNoAttempts bool) error {
 	var existing OperationRecord
 	err := scanOperation(tx.QueryRow(operationSelect+"o.operation_id=?", op.OperationID), &existing)
 	if err == nil {
 		if existing.OperationID != op.OperationID || existing.MessageID != op.MessageID || existing.SourceRoute != op.SourceRoute || existing.TargetRoute != op.TargetRoute || existing.Semantics != op.Semantics || existing.SourceEndpointID != op.SourceEndpointID || existing.TargetEndpointID != op.TargetEndpointID || existing.ReplyRoute != op.ReplyRoute || existing.ReplyEndpointID != op.ReplyEndpointID || existing.ReplyThreadID != op.ReplyThreadID || existing.CustodyRoute != op.CustodyRoute || existing.CustodyStoreID != op.CustodyStoreID || existing.Digest != op.Digest || existing.BodySize != op.BodySize {
 			return ErrIdentityConflict
 		}
-		var attempts int
-		if err := tx.QueryRow("SELECT COUNT(1) FROM attempts WHERE operation_id=?", op.OperationID).Scan(&attempts); err != nil {
-			return err
-		}
-		if attempts != 0 {
-			return ErrIdentityConflict
+		if requireNoAttempts {
+			var attempts int
+			if err := tx.QueryRow("SELECT COUNT(1) FROM attempts WHERE operation_id=?", op.OperationID).Scan(&attempts); err != nil {
+				return err
+			}
+			if attempts != 0 {
+				return ErrIdentityConflict
+			}
 		}
 		return nil
 	}

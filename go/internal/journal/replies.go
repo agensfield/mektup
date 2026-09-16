@@ -75,7 +75,7 @@ func (j *Journal) ImportOriginalStatus(ctx context.Context, in OriginalStatusImp
 	}
 	return j.withTx(ctx, func(tx *sql.Tx) error {
 		now := j.nowUnix()
-		if err := importOperationTxAt(tx, in.Operation, StatePrepared, "portable_import", now, false); err != nil {
+		if err := importOperationTxAt(tx, in.Operation, StatePrepared, "portable_import", now, false, false); err != nil {
 			return err
 		}
 		switch in.Selection {
@@ -262,7 +262,7 @@ func importTerminalUnknownTx(tx *sql.Tx, in OriginalStatusImport, now int64) err
 		if existing.OriginalID != in.Operation.MessageID || existing.Digest != in.Digest || existing.BodySize != in.BodySize || existing.Status != in.Status || existing.ReplyErrorCode != in.ErrorCode || existing.ReplyRoute != in.Operation.ReplyRoute || existing.CustodyRoute != in.Operation.CustodyRoute || existing.CustodyStoreID != in.Operation.CustodyStoreID || existing.State != StateReplyOutcomeUnknown {
 			return ErrIdentityConflict
 		}
-		return ensureImportedEventTx(tx, existing.ReplyID, StateReplyOutcomeUnknown, in.EventSeq, now)
+		return ensureImportedEventTx(tx, existing.ReplyID, StateReplyOutcomeUnknown, now)
 	}
 	if err != sql.ErrNoRows {
 		return err
@@ -270,7 +270,7 @@ func importTerminalUnknownTx(tx *sql.Tx, in OriginalStatusImport, now int64) err
 	if _, err := tx.Exec("INSERT INTO reply_claims(reply_id,original_id,digest,body_size,status,reply_route,custody_route,custody_store_id,owner,token,lease_until,state,created_at,updated_at,reply_error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", in.ReplyID, in.Operation.MessageID, in.Digest, in.BodySize, in.Status, in.Operation.ReplyRoute, in.Operation.CustodyRoute, in.Operation.CustodyStoreID, "", "", int64(0), string(StateReplyOutcomeUnknown), now, now, in.ErrorCode); err != nil {
 		return err
 	}
-	return ensureImportedEventTx(tx, in.ReplyID, StateReplyOutcomeUnknown, in.EventSeq, now)
+	return ensureImportedEventTx(tx, in.ReplyID, StateReplyOutcomeUnknown, now)
 }
 
 func validateOriginalSelectedClaim(claim ReplyClaim, seq int64, native string, winner bool) error {
@@ -823,31 +823,7 @@ func importObservedWinnerTx(tx *sql.Tx, in OriginalStatusImport, now int64) erro
 	return nil
 }
 
-func ensureImportedEventTx(tx *sql.Tx, replyID string, state EvidenceState, remoteSeq int64, now int64) error {
-	if remoteSeq > 0 {
-		var replySeq int64
-		err := tx.QueryRow("SELECT seq FROM events WHERE reply_id=? AND kind='reply.abandoned' AND state=? ORDER BY seq LIMIT 1", replyID, string(state)).Scan(&replySeq)
-		if err == nil && replySeq != remoteSeq {
-			return ErrIdentityConflict
-		}
-		if err != nil && err != sql.ErrNoRows {
-			return err
-		}
-		var kind, existingReply string
-		var existingState EvidenceState
-		err = tx.QueryRow("SELECT kind,COALESCE(reply_id,''),state FROM events WHERE seq=?", remoteSeq).Scan(&kind, &existingReply, &existingState)
-		if err == nil {
-			if existingReply != replyID || kind != "reply.abandoned" || existingState != state {
-				return ErrIdentityConflict
-			}
-			return nil
-		}
-		if err != sql.ErrNoRows {
-			return err
-		}
-		_, err = tx.Exec("INSERT INTO events(seq,kind,operation_id,reply_id,state,at) VALUES(?,?,?,?,?,?)", remoteSeq, "reply.abandoned", "", replyID, string(state), now)
-		return err
-	}
+func ensureImportedEventTx(tx *sql.Tx, replyID string, state EvidenceState, now int64) error {
 	var count int
 	if err := tx.QueryRow("SELECT COUNT(1) FROM events WHERE reply_id=? AND kind='reply.abandoned' AND state=?", replyID, string(state)).Scan(&count); err != nil {
 		return err
