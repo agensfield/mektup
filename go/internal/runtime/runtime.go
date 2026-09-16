@@ -522,11 +522,26 @@ func (s *connectionSession) ThreadState(ctx context.Context, threadID string) (s
 }
 
 func (s *connectionSession) LoadedThreads(ctx context.Context) ([]string, error) {
-	result, err := s.api.LoadedThreads(ctx, "", codexapi.MaxThreadPageLimit)
-	if err != nil {
-		return nil, err
+	var all []string
+	cursor := ""
+	for pageNo := 0; pageNo < codexapi.MaxReconciliationPages; pageNo++ {
+		result, err := s.api.LoadedThreads(ctx, cursor, codexapi.MaxThreadPageLimit)
+		if err != nil {
+			return nil, err
+		}
+		if len(all)+len(result.Data) > codexapi.MaxReconciliationItems {
+			return nil, codexapi.ErrPaginationExceeded
+		}
+		all = append(all, result.Data...)
+		if result.NextCursor == "" {
+			return all, nil
+		}
+		if result.NextCursor == cursor {
+			return nil, codexapi.ErrPaginationStalled
+		}
+		cursor = result.NextCursor
 	}
-	return result.Data, nil
+	return nil, codexapi.ErrPaginationExceeded
 }
 
 func (s *connectionSession) ItemsHistory(ctx context.Context, threadID string) ([]codexapi.ItemEntry, error) {

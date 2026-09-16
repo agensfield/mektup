@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -121,6 +122,67 @@ func TestProbeThreadStateUsesExactLoadedMembership(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConnectionSessionLoadedThreadsPaginatesAndFencesGaps(t *testing.T) {
+	threadJSON := func(ephemeral bool) json.RawMessage {
+		return json.RawMessage(fmt.Sprintf(`{"thread":{"id":"thread","cliVersion":"x","createdAt":1,"cwd":"/tmp","ephemeral":%t,"modelProvider":"openai","preview":"p","projectId":null,"sessionId":"s","source":"cli","status":{"type":"idle","activeFlags":[]},"turns":[],"updatedAt":1}}`, ephemeral))
+	}
+	t.Run("page two membership", func(t *testing.T) {
+		caller := codexapi.FuncCaller(func(_ context.Context, method string, params json.RawMessage) (json.RawMessage, *codexapi.ServerError, error) {
+			if method == "thread/read" {
+				return threadJSON(false), nil, nil
+			}
+			var request struct {
+				Cursor string `json:"cursor"`
+			}
+			_ = json.Unmarshal(params, &request)
+			if request.Cursor == "" {
+				return json.RawMessage(`{"data":["other"],"nextCursor":"page-2"}`), nil, nil
+			}
+			return json.RawMessage(`{"data":["thread"],"nextCursor":""}`), nil, nil
+		})
+		endpointID := "ep_01999999-9999-7999-8999-999999999999"
+		session := &connectionSession{endpointID: endpointID, api: codexapi.New(caller, codexapi.Options{})}
+		pool := NewConnectionPool(SessionFactoryFunc(func(context.Context, endpoint.Endpoint) (Session, error) { return session, nil }), func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: endpointID, Alias: "local"}, nil })
+		defer pool.Close(context.Background())
+		loaded, persistent, err := pool.ProbeThreadState(context.Background(), endpointID, "thread")
+		if err != nil || !loaded || !persistent {
+			t.Fatalf("page two state loaded=%v persistent=%v err=%v", loaded, persistent, err)
+		}
+	})
+	t.Run("repeated cursor", func(t *testing.T) {
+		caller := codexapi.FuncCaller(func(_ context.Context, method string, _ json.RawMessage) (json.RawMessage, *codexapi.ServerError, error) {
+			if method == "thread/read" {
+				return threadJSON(false), nil, nil
+			}
+			return json.RawMessage(`{"data":[],"nextCursor":"same"}`), nil, nil
+		})
+		endpointID := "ep_01999999-9999-7999-8999-999999999998"
+		session := &connectionSession{endpointID: endpointID, api: codexapi.New(caller, codexapi.Options{})}
+		pool := NewConnectionPool(SessionFactoryFunc(func(context.Context, endpoint.Endpoint) (Session, error) { return session, nil }), func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: endpointID, Alias: "local"}, nil })
+		defer pool.Close(context.Background())
+		if _, _, err := pool.ProbeThreadState(context.Background(), endpointID, "thread"); !errors.Is(err, codexapi.ErrPaginationStalled) {
+			t.Fatalf("repeated cursor err=%v", err)
+		}
+	})
+	t.Run("page bound", func(t *testing.T) {
+		calls := 0
+		caller := codexapi.FuncCaller(func(_ context.Context, method string, _ json.RawMessage) (json.RawMessage, *codexapi.ServerError, error) {
+			if method == "thread/read" {
+				return threadJSON(false), nil, nil
+			}
+			calls++
+			return json.RawMessage(fmt.Sprintf(`{"data":[],"nextCursor":"page-%d"}`, calls)), nil, nil
+		})
+		endpointID := "ep_01999999-9999-8999-8999-999999999998"
+		session := &connectionSession{endpointID: endpointID, api: codexapi.New(caller, codexapi.Options{})}
+		pool := NewConnectionPool(SessionFactoryFunc(func(context.Context, endpoint.Endpoint) (Session, error) { return session, nil }), func(string) (endpoint.Endpoint, error) { return endpoint.Endpoint{ID: endpointID, Alias: "local"}, nil })
+		defer pool.Close(context.Background())
+		if _, _, err := pool.ProbeThreadState(context.Background(), endpointID, "thread"); !errors.Is(err, codexapi.ErrPaginationExceeded) {
+			t.Fatalf("page bound err=%v calls=%d", err, calls)
+		}
+	})
 }
 
 type fakeFactory struct {
