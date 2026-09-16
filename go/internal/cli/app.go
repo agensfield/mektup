@@ -922,6 +922,9 @@ func receiptHuman(receipt any) string {
 	if id, ok := object["receiptId"].(string); ok && id != "" {
 		parts = append(parts, "receipt="+id)
 	}
+	if warnings, ok := object["warnings"].([]any); ok && len(warnings) != 0 {
+		parts = append(parts, fmt.Sprintf("warnings=%d", len(warnings)))
+	}
 	return strings.Join(parts, " ")
 }
 
