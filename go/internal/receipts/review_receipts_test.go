@@ -235,6 +235,11 @@ func TestReconcileDurableReplyObservationUsesExactPinnedReplyRoute(t *testing.T)
 	if _, err := store.Reconcile(context.Background(), receipt.ReceiptID, badHistory); !errors.Is(err, ErrReconcileIncomplete) {
 		t.Fatalf("wrong native digest accepted: %v", err)
 	}
+	contradictory := historyItem
+	contradictory.EnvelopeTo = "codex://" + mektup.NewEndpointID() + "/thread/source-thread"
+	if _, err := store.Reconcile(context.Background(), receipt.ReceiptID, historyStub{items: []HistoryItem{contradictory}}); !errors.Is(err, ErrReconcileIncomplete) {
+		t.Fatalf("contradictory destination URI accepted: %v", err)
+	}
 	updated, err := store.Reconcile(context.Background(), receipt.ReceiptID, history)
 	if err != nil {
 		t.Fatal(err)

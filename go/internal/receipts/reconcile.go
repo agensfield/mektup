@@ -233,13 +233,13 @@ func replyHistoryMatch(item HistoryItem, endpointID, threadID string, claim jour
 	if item.EndpointID != endpointID || item.ThreadID != threadID || item.MessageID != claim.ReplyID || item.ClientMessageID != claim.ReplyID || item.InReplyTo != claim.OriginalID || item.Body == nil {
 		return false
 	}
-	if item.EnvelopeToEndpointID != endpointID || threadIdentity(item.EnvelopeTo) != threadID {
+	if item.EnvelopeToEndpointID != endpointID || item.EnvelopeTo != claim.ReplyRoute {
 		return false
 	}
 	if op.TargetEndpointID != "" && item.EnvelopeFromEndpointID != op.TargetEndpointID {
 		return false
 	}
-	if op.TargetRoute != "" && threadIdentity(op.TargetRoute) != "" && threadIdentity(item.EnvelopeFrom) != threadIdentity(op.TargetRoute) {
+	if op.TargetRoute != "" && item.EnvelopeFrom != op.TargetRoute {
 		return false
 	}
 	if bodyDigest(item.Body) != claim.Digest || uint64(len(item.Body)) != uint64(claim.BodySize) {
