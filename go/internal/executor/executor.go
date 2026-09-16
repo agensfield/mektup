@@ -331,7 +331,11 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread turns requires a thread identifier")
 		}
-		r, callErr := api.ThreadTurns(ctx, codexapi.TurnsOptions{ThreadID: threadID, Cursor: inv.Option("cursor"), Limit: optionInt(inv, "limit"), SortDirection: inv.Option("order"), ItemsView: inv.Option("view")})
+		itemsView := inv.Option("view")
+		if itemsView == "" {
+			itemsView = "summary"
+		}
+		r, callErr := api.ThreadTurns(ctx, codexapi.TurnsOptions{ThreadID: threadID, Cursor: inv.Option("cursor"), Limit: optionInt(inv, "limit"), SortDirection: inv.Option("order"), ItemsView: itemsView})
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}

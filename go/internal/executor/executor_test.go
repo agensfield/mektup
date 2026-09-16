@@ -21,9 +21,10 @@ import (
 )
 
 type fakeCodex struct {
-	scoped    bool
-	allowName bool
-	threadIDs *[]string
+	scoped       bool
+	allowName    bool
+	threadIDs    *[]string
+	turnsOptions *codexapi.TurnsOptions
 }
 
 func (f fakeCodex) ThreadList(context.Context, codexapi.ThreadListOptions) (codexapi.ThreadListResponse, error) {
@@ -35,7 +36,10 @@ func (f fakeCodex) ThreadRead(_ context.Context, options codexapi.ThreadReadOpti
 	}
 	return codexapi.ThreadReadResponse{Raw: json.RawMessage(`{"thread":{"id":"thr_1"}}`)}, nil
 }
-func (f fakeCodex) ThreadTurns(context.Context, codexapi.TurnsOptions) (codexapi.ThreadTurnsResponse, error) {
+func (f fakeCodex) ThreadTurns(_ context.Context, options codexapi.TurnsOptions) (codexapi.ThreadTurnsResponse, error) {
+	if f.turnsOptions != nil {
+		*f.turnsOptions = options
+	}
 	return codexapi.ThreadTurnsResponse{Raw: json.RawMessage(`{"data":[],"nextCursor":"turns"}`), NextCursor: "turns"}, nil
 }
 func (f fakeCodex) ThreadItems(context.Context, codexapi.ItemsOptions) (codexapi.ThreadItemsResponse, error) {
@@ -520,6 +524,17 @@ func TestAppJSONLUsesLockedReadAndStorageFamilies(t *testing.T) {
 				t.Fatalf("subcommand=%v want=%s", data["subcommand"], tc.subcommand)
 			}
 		})
+	}
+}
+
+func TestThreadTurnsDefaultsToSummaryView(t *testing.T) {
+	var options codexapi.TurnsOptions
+	e := New(Ports{Connections: &fakeConnections{conn: &fakeConnection{api: fakeCodex{turnsOptions: &options}}}, Receipts: &fakeReceipts{}})
+	if _, err := e.Execute(context.Background(), invocation("thread", "turns", "thr_1")); err != nil {
+		t.Fatal(err)
+	}
+	if options.ItemsView != "summary" {
+		t.Fatalf("default items view = %q, want summary", options.ItemsView)
 	}
 }
 
