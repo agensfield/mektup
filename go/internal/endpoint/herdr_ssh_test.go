@@ -168,7 +168,7 @@ func TestRemoteHerdrRunnerBoundsOutputAndReaps(t *testing.T) {
 	}
 	_, err := runner.RunEndpoint(context.Background(), testEndpoint(t, "route.example"), []string{"herdr", "agent", "list"})
 	var failure *HerdrRunnerFailure
-	if !errors.As(err, &failure) || failure.Kind != HerdrRunnerOutputFailure || !failure.OutputTruncated {
+	if !errors.Is(err, ErrResolverUnavailable) || !errors.As(err, &failure) || failure.Kind != HerdrRunnerOutputFailure || !failure.OutputTruncated {
 		t.Fatalf("overflow error = %#v", err)
 	}
 	p.mu.Lock()
@@ -210,7 +210,7 @@ func TestRemoteHerdrRunnerCancellationIsBoundedAndReaps(t *testing.T) {
 		t.Fatal("cancellation exceeded bound")
 	}
 	var failure *HerdrRunnerFailure
-	if !errors.As(err, &failure) || failure.Kind != HerdrRunnerCanceled || !errors.Is(err, context.Canceled) {
+	if !errors.Is(err, ErrResolverUnavailable) || !errors.As(err, &failure) || failure.Kind != HerdrRunnerCanceled || !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancel error = %#v", err)
 	}
 	p.mu.Lock()
@@ -233,7 +233,7 @@ func TestRemoteHerdrRunnerReadFailureCannotBecomeSuccess(t *testing.T) {
 	}
 	_, err := runner.RunEndpoint(context.Background(), testEndpoint(t, "route.example"), []string{"herdr", "agent", "list"})
 	var failure *HerdrRunnerFailure
-	if !errors.As(err, &failure) || failure.Kind != HerdrRunnerCommandFailure || !strings.Contains(failure.Error(), "synthetic read failure") {
+	if !errors.Is(err, ErrResolverUnavailable) || !errors.As(err, &failure) || failure.Kind != HerdrRunnerCommandFailure || !strings.Contains(failure.Error(), "synthetic read failure") {
 		t.Fatalf("read failure = %#v", err)
 	}
 }
@@ -247,7 +247,7 @@ func TestRemoteHerdrRunnerPreservesExitAndStderrEvidence(t *testing.T) {
 	}
 	_, err := runner.RunEndpoint(context.Background(), testEndpoint(t, "route.example"), []string{"herdr", "agent", "list"})
 	var failure *HerdrRunnerFailure
-	if !errors.As(err, &failure) || failure.Kind != HerdrRunnerCommandFailure || failure.ExitCode != 7 || failure.Stderr != "failure" {
+	if !errors.Is(err, ErrResolverUnavailable) || !errors.As(err, &failure) || failure.Kind != HerdrRunnerCommandFailure || failure.ExitCode != 7 || failure.Stderr != "failure" {
 		t.Fatalf("exit evidence = %#v", err)
 	}
 	if strings.Contains(failure.Error(), "failure") {

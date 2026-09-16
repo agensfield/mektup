@@ -55,7 +55,7 @@ func (f *HerdrRunnerFailure) Unwrap() error {
 	if f == nil {
 		return nil
 	}
-	return f.Err
+	return errors.Join(ErrResolverUnavailable, f.Err)
 }
 
 type HerdrRunnerConfig struct {
