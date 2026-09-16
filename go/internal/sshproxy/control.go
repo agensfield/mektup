@@ -403,6 +403,16 @@ func (r ControlRequest) Validate() error {
 					return fmt.Errorf("%w: observe result forbids %s", ErrControlValidation, field)
 				}
 			}
+			if raw, present := resultObject["status"]; present {
+				if text, err := rawString(raw, "result.status"); err != nil || text == "" {
+					return fmt.Errorf("%w: observe result status must be a nonempty string", ErrControlValidation)
+				}
+			}
+			if raw, present := resultObject["winner"]; present {
+				if _, err := rawObject(raw, "result.winner"); err != nil {
+					return fmt.Errorf("%w: observe result winner must be an object", ErrControlValidation)
+				}
+			}
 		}
 		return nil
 	}
@@ -424,7 +434,7 @@ func (r ControlRequest) Validate() error {
 		}
 	case "status", "reconcile":
 	case "observe":
-		if r.NativeItemID == "" || r.FencingToken != "" || r.Lease != nil || r.RequestedLease != nil || r.AttemptOwner != "" {
+		if r.NativeItemID == "" || r.BodyBytes == nil || r.BodySHA256 == "" || r.ReplyStatus == "" || r.FencingToken != "" || r.Lease != nil || r.RequestedLease != nil || r.AttemptOwner != "" {
 			return fmt.Errorf("%w: observe requires native item evidence without dispatch authority", ErrControlValidation)
 		}
 	}

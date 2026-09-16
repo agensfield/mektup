@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -105,6 +106,9 @@ func TestControlObserveIsTokenlessNativeEvidence(t *testing.T) {
 		value any
 	}{
 		"missing nativeItemId": {field: "nativeItemId"},
+		"missing bodyBytes":    {field: "bodyBytes"},
+		"missing bodySha256":   {field: "bodySha256"},
+		"missing replyStatus":  {field: "replyStatus"},
 		"empty nativeItemId":   {field: "nativeItemId", value: ""},
 		"wrong nativeItemId":   {field: "nativeItemId", value: 42},
 		"fencingToken":         {field: "fencingToken", value: "fence-01"},
@@ -117,7 +121,7 @@ func TestControlObserveIsTokenlessNativeEvidence(t *testing.T) {
 			if err := json.Unmarshal(valid, &raw); err != nil {
 				t.Fatal(err)
 			}
-			if name == "missing nativeItemId" {
+			if strings.HasPrefix(name, "missing ") {
 				delete(raw, mutation.field)
 			} else {
 				raw[mutation.field] = mutation.value
@@ -128,6 +132,28 @@ func TestControlObserveIsTokenlessNativeEvidence(t *testing.T) {
 			}
 			if _, err := ValidateControlRequest(data); !errors.Is(err, ErrControlValidation) {
 				t.Fatalf("invalid observe shape accepted: %v", err)
+			}
+		})
+	}
+	observeResult := []byte(`{"schema":"mektup/control/v1","kind":"result","operation":"observe","operationId":"op_0198f0e0-0000-7000-8000-000000000026","replyMessageId":"msg_0198f0e0-0000-7000-8000-000000000007","originalMessageId":"msg_0198f0e0-0000-7000-8000-000000000003","custody":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","storeId":"store_0198f0e0-0000-7000-8000-000000000002"},"replyDestination":{"endpointId":"ep_0198f0e0-0000-7000-8000-000000000001","threadId":"thread-local-001","uri":"codex://local/thread/thread-local-001"},"result":{"state":"reply_observed","status":"observed","winner":{"nativeItemId":"item-reply-001"}}}`)
+	for name, value := range map[string]any{"null status": nil, "empty status": "", "null winner": nil, "array winner": []any{}} {
+		t.Run(name, func(t *testing.T) {
+			var raw map[string]any
+			if err := json.Unmarshal(observeResult, &raw); err != nil {
+				t.Fatal(err)
+			}
+			result := raw["result"].(map[string]any)
+			if strings.Contains(name, "status") {
+				result["status"] = value
+			} else {
+				result["winner"] = value
+			}
+			data, err := json.Marshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ValidateControlRequest(data); !errors.Is(err, ErrControlValidation) {
+				t.Fatalf("invalid observe result shape accepted: %v", err)
 			}
 		})
 	}

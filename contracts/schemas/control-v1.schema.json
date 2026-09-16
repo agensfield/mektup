@@ -104,7 +104,7 @@
         }
       },
       "then": {
-        "required": ["nativeItemId"],
+        "required": ["nativeItemId", "bodyBytes", "bodySha256", "replyStatus"],
         "not": {
           "anyOf": [
             { "required": ["fencingToken"] },
@@ -112,7 +112,13 @@
             { "required": ["requestedLease"] },
             { "required": ["attemptOwner"] }
           ]
-        }
+        },
+        "allOf": [
+          {
+            "if": { "required": ["replyErrorCode"] },
+            "then": { "properties": { "replyStatus": { "const": "error" } } }
+          }
+        ]
       }
     },
     {
@@ -211,7 +217,11 @@
         "properties": {
           "result": {
             "required": ["state"],
-            "not": { "anyOf": [{ "required": ["fencingToken"] }, { "required": ["lease"] }] }
+            "not": { "anyOf": [{ "required": ["fencingToken"] }, { "required": ["lease"] }] },
+            "properties": {
+              "status": { "type": "string", "minLength": 1 },
+              "winner": { "type": "object" }
+            }
           }
         }
       }

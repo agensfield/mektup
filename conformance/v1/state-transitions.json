@@ -27,6 +27,7 @@
     { "from": "reply_dispatch_claimed", "event": "reply.accepted", "to": "reply_accepted", "observable": "reply body acceptance and authoritative wake metadata commit atomically" },
     { "from": "reply_dispatch_claimed", "event": "claim.expired", "to": "reply_outcome_unknown", "observable": "waiter wakes unknown and no redispatch is authorized" },
     { "from": "reply_accepted", "event": "native.item.observed", "to": "reply_observed", "observable": "history item/client ID and digest prove later observation" },
+    { "from": "reply_outcome_unknown", "event": "native.item.observed", "to": "reply_observed", "observable": "exact native evidence strengthens unknown without reviving an expired dispatch claim" },
     { "from": "outcome_unknown", "event": "reconcile.accepted", "to": "accepted", "observable": "new positive evidence upgrades the original uncertainty" },
     { "from": "reply_outcome_unknown", "event": "reconcile.reply_accepted", "to": "reply_accepted", "observable": "a later positive commit may upgrade but never replays the body" },
     { "from": "outcome_unknown", "event": "operator.resolve", "to": "manually_resolved", "observable": "assertion records actor, reason, timestamp, reference, and presentation" },

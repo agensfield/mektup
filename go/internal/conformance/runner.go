@@ -743,6 +743,16 @@ func validateControlFixture(data []byte) error {
 					return fmt.Errorf("observe result forbids %s", field)
 				}
 			}
+			if status, present := result["status"]; present {
+				if text, ok := status.(string); !ok || text == "" {
+					return errors.New("observe result status must be a nonempty string")
+				}
+			}
+			if winner, present := result["winner"]; present {
+				if _, ok := winner.(map[string]any); !ok {
+					return errors.New("observe result winner must be an object")
+				}
+			}
 		}
 	}
 	if kind == "request" && (op == "claim" || op == "heartbeat" || op == "commit" || op == "abandon" || op == "observe") {
@@ -751,7 +761,7 @@ func validateControlFixture(data []byte) error {
 			if n, ok := value["bodyBytes"].(float64); !ok || n < 0 || n != float64(uint64(n)) {
 				return errors.New("bodyBytes must be a nonnegative integer")
 			}
-		} else if op != "observe" {
+		} else {
 			return errors.New("bodyBytes is required")
 		}
 		if body, present := value["bodySha256"]; present {
@@ -759,7 +769,7 @@ func validateControlFixture(data []byte) error {
 			if !ok || !validDigest(text) {
 				return errors.New("bodySha256 is invalid")
 			}
-		} else if op != "observe" {
+		} else {
 			return errors.New("bodySha256 is required")
 		}
 		if status, present := value["replyStatus"]; present {
@@ -767,7 +777,7 @@ func validateControlFixture(data []byte) error {
 			if !ok || (text != "success" && text != "error") {
 				return errors.New("replyStatus is invalid")
 			}
-		} else if op != "observe" {
+		} else {
 			return errors.New("replyStatus is required")
 		}
 		if owner, present := value["attemptOwner"]; present && op != "observe" {
@@ -780,6 +790,9 @@ func validateControlFixture(data []byte) error {
 		if errorCode, present := value["replyErrorCode"]; present {
 			if text, ok := errorCode.(string); !ok || text == "" {
 				return errors.New("replyErrorCode is invalid")
+			}
+			if status, ok := value["replyStatus"].(string); !ok || status != "error" {
+				return errors.New("replyErrorCode requires error replyStatus")
 			}
 		}
 	}

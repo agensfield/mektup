@@ -16,6 +16,10 @@
       "transitions": ["intent.persisted", "dispatch.started", "delivery.accepted", "reply.claimed", "reply.accepted", "native.item.observed"],
       "terminal": { "event": "reply.observed", "exit": 0, "state": "reply_observed" }
     },
+    "reply_observed_from_unknown": {
+      "transitions": ["intent.persisted", "dispatch.started", "delivery.accepted", "reply.claimed", "claim.expired", "native.item.observed"],
+      "terminal": { "event": "reply.observed", "exit": 0, "state": "reply_observed" }
+    },
     "rejected": {
       "transitions": ["intent.persisted", "dispatch.started", "delivery.rejected"],
       "terminal": { "event": "operation.rejected", "exit": 3, "state": "rejected" }
@@ -83,7 +87,7 @@
     { "id": "reply.observe-idempotent-same-evidence", "matrix": "reply", "profile": "reply_observed_success", "observable": ["same nativeItemId and digest are idempotent", "custody reaches reply_observed once"] },
     { "id": "reply.observe-conflicting-native-item", "matrix": "reply", "profile": "rejected", "observable": ["different nativeItemId conflicts", "no dispatch authority is created"] },
     { "id": "reply.observe-conflicting-digest", "matrix": "reply", "profile": "rejected", "observable": ["different digest conflicts", "no dispatch authority is created"] },
-    { "id": "reply.observe-unknown-to-observed", "matrix": "reply", "profile": "reply_observed_success", "observable": ["exact native evidence strengthens reply_outcome_unknown to reply_observed", "expired fencing is never revived"] },
+    { "id": "reply.observe-unknown-to-observed", "matrix": "reply", "profile": "reply_observed_from_unknown", "observable": ["exact native evidence strengthens reply_outcome_unknown to reply_observed", "expired fencing is never revived", "existing winner is not replaced and provenance is retained"] },
     { "id": "reply.observe-accepted-to-observed", "matrix": "reply", "profile": "reply_observed_success", "observable": ["exact native evidence strengthens reply_accepted to reply_observed", "body is not resubmitted"] },
     { "id": "reply.observe-winner-never-replaced", "matrix": "reply", "profile": "reply_observed_success", "observable": ["first observation selects a winner only when none exists", "earlier winner remains stable"] },
     { "id": "reply.observe-no-dispatch-authority", "matrix": "reply", "profile": "usage_rejected", "observable": ["fencingToken, lease, requestedLease, and attemptOwner are forbidden", "summary/search/receipt claims cannot substitute native evidence"] },
