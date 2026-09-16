@@ -78,6 +78,10 @@ type Options struct {
 type Journal struct {
 	db            *sql.DB
 	stateDir      string
+	stateDirFile  *os.File
+	databaseFile  *os.File
+	stateIdentity fileIdentity
+	dbIdentity    fileIdentity
 	storeID       string
 	busyTimeout   time.Duration
 	leaseDuration time.Duration
@@ -102,20 +106,32 @@ func open(ctx context.Context, opts Options, existing bool) (*Journal, error) {
 		return nil, err
 	}
 	dbPath := filepath.Join(dir, "journal.sqlite3")
+	stateDirFile, stateIdentity, err := acquireStateDirectory(dir, !existing)
+	if err != nil {
+		return nil, err
+	}
+	databaseFile, dbIdentity, err := acquireDatabase(stateDirFile, dbPath, !existing)
+	if err != nil {
+		_ = stateDirFile.Close()
+		return nil, err
+	}
+	closeFiles := func() {
+		_ = databaseFile.Close()
+		_ = stateDirFile.Close()
+	}
 	if existing {
-		info, statErr := os.Stat(dir)
-		if statErr != nil || !info.IsDir() {
-			return nil, fmt.Errorf("journal: existing state directory unavailable")
-		}
-		dbInfo, statErr := os.Stat(dbPath)
-		if statErr != nil || !dbInfo.Mode().IsRegular() {
-			return nil, fmt.Errorf("journal: existing database unavailable")
-		}
 		if err := preflightExistingDatabase(ctx, dbPath); err != nil {
+			closeFiles()
 			return nil, err
 		}
-	} else if err := secureDir(dir); err != nil {
-		return nil, err
+	}
+	if err := verifyPathIdentity(dir, stateIdentity, true); err != nil {
+		closeFiles()
+		return nil, fmt.Errorf("journal: state directory replaced before SQLite open: %w", err)
+	}
+	if err := verifyPathIdentity(dbPath, dbIdentity, false); err != nil {
+		closeFiles()
+		return nil, fmt.Errorf("journal: database replaced before SQLite open: %w", err)
 	}
 	timeout := opts.BusyTimeout
 	if timeout <= 0 {
@@ -128,30 +144,37 @@ func open(ctx context.Context, opts Options, existing bool) (*Journal, error) {
 	// URI pragmas apply to every connection in database/sql's pool. WAL is
 	// required for concurrent swarm processes; FK and busy handling are not
 	// optional safety settings.
-	mode := ""
-	if existing {
-		mode = "mode=rw&"
-	}
-	dsn := "file:" + escapedSQLitePath(dbPath) + "?" + mode + "_pragma=busy_timeout(" + fmt.Sprint(timeout.Milliseconds()) + ")&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
+	dsn := "file:" + escapedSQLitePath(dbPath) + "?mode=rw&_pragma=busy_timeout(" + fmt.Sprint(timeout.Milliseconds()) + ")&_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(FULL)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
+		closeFiles()
 		return nil, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
 	db.SetMaxOpenConns(8)
 	db.SetMaxIdleConns(8)
-	j := &Journal{db: db, stateDir: dir, busyTimeout: timeout, leaseDuration: lease, now: opts.Now}
+	j := &Journal{db: db, stateDir: dir, stateDirFile: stateDirFile, databaseFile: databaseFile, stateIdentity: stateIdentity, dbIdentity: dbIdentity, busyTimeout: timeout, leaseDuration: lease, now: opts.Now}
 	if j.now == nil {
 		j.now = time.Now
 	}
 	if err := j.init(ctx); err != nil {
 		_ = db.Close()
+		_ = databaseFile.Close()
+		_ = stateDirFile.Close()
 		return nil, err
+	}
+	if err := verifyPathIdentity(dir, stateIdentity, true); err != nil {
+		_ = j.Close()
+		return nil, fmt.Errorf("journal: state directory replaced during open: %w", err)
+	}
+	if err := verifyPathIdentity(dbPath, dbIdentity, false); err != nil {
+		_ = j.Close()
+		return nil, fmt.Errorf("journal: database replaced during open: %w", err)
 	}
 	return j, nil
 }
 
 func preflightExistingDatabase(ctx context.Context, path string) error {
-	db, err := sql.Open("sqlite", "file:"+escapedSQLitePath(path)+"?mode=rw")
+	db, err := sql.Open("sqlite", "file:"+escapedSQLitePath(path)+"?mode=ro")
 	if err != nil {
 		return fmt.Errorf("journal: existing database preflight: %w", ErrCorrupt)
 	}
@@ -194,16 +217,6 @@ func statePath(requested string) (string, error) {
 		return "", err
 	}
 	return requested, nil
-}
-
-func secureDir(dir string) error {
-	if err := os.MkdirAll(dir, 0700); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0700); err != nil {
-		return err
-	}
-	return nil
 }
 
 func (j *Journal) init(ctx context.Context) error {
@@ -370,17 +383,7 @@ func atLeastSQLite(got string, wantMajor, wantMinor, wantPatch int) bool {
 }
 
 func (j *Journal) secureFiles() error {
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		p := filepath.Join(j.stateDir, "journal.sqlite3"+suffix)
-		if _, err := os.Stat(p); err == nil {
-			if err := os.Chmod(p, 0600); err != nil {
-				return err
-			}
-		} else if !os.IsNotExist(err) {
-			return err
-		}
-	}
-	return nil
+	return secureDatabaseFiles(j.stateDirFile, j.databaseFile)
 }
 
 const schemaV1 = `
@@ -1190,7 +1193,16 @@ func validStoreID(id string) bool {
 	return err == nil && len(b) == 16 && b[6]>>4 == 7 && b[8]>>6 == 2
 }
 
-func (j *Journal) Close() error     { return j.db.Close() }
+func (j *Journal) Close() error {
+	err := j.db.Close()
+	if closeErr := j.databaseFile.Close(); err == nil {
+		err = closeErr
+	}
+	if closeErr := j.stateDirFile.Close(); err == nil {
+		err = closeErr
+	}
+	return err
+}
 func (j *Journal) StateDir() string { return j.stateDir }
 func (j *Journal) StoreID() string  { j.mu.RLock(); defer j.mu.RUnlock(); return j.storeID }
 func (j *Journal) nowUnix() int64   { return j.now().UTC().UnixNano() }
