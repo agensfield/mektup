@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -79,7 +81,7 @@ func runLocalHerdr(ctx context.Context, runner ExecRunner, argv []string) ([]byt
 			return nil, fmt.Errorf("%w: %v", ErrResolverUnavailable, err)
 		}
 		argv = append([]string{path}, argv[1:]...)
-		factory = sshproxy.DefaultProcessFactory()
+		factory = localHerdrProcessFactory{}
 	}
 	process, err := factory.New(append([]string(nil), argv...))
 	if err != nil {
@@ -101,6 +103,46 @@ func runLocalHerdr(ctx context.Context, runner ExecRunner, argv []string) ([]byt
 		return cleanupHerdrProcess(process, stdin, stdout, nil, cfg.CleanupTimeout, &HerdrRunnerFailure{Kind: HerdrRunnerSpawnFailure, Err: err})
 	}
 	return runHerdrProcess(ctx, process, stdin, stdout, stderr, cfg)
+}
+
+// localHerdrProcessFactory preserves the caller's ordinary environment while
+// removing pane/session hints that could redirect an endpoint-scoped lookup to
+// a different Herdr server or falsely describe the invoking Codex thread.
+// Official integrations and herdr-codex-bridge are both discovered from the
+// canonical server's native agent_session records instead.
+type localHerdrProcessFactory struct{}
+
+func (localHerdrProcessFactory) New(argv []string) (sshproxy.Process, error) {
+	if len(argv) == 0 || argv[0] == "" {
+		return nil, ErrHerdrRunnerInvalidCommand
+	}
+	command := exec.Command(argv[0], argv[1:]...)
+	command.Env = sanitizedHerdrEnvironment(os.Environ())
+	return &localHerdrProcess{command: command}, nil
+}
+
+type localHerdrProcess struct{ command *exec.Cmd }
+
+func (p *localHerdrProcess) StdinPipe() (io.WriteCloser, error) { return p.command.StdinPipe() }
+func (p *localHerdrProcess) StdoutPipe() (io.ReadCloser, error) { return p.command.StdoutPipe() }
+func (p *localHerdrProcess) StderrPipe() (io.ReadCloser, error) { return p.command.StderrPipe() }
+func (p *localHerdrProcess) Start() error                       { return p.command.Start() }
+func (p *localHerdrProcess) Wait() error                        { return p.command.Wait() }
+func (p *localHerdrProcess) Kill() error                        { return p.command.Process.Kill() }
+
+func sanitizedHerdrEnvironment(environment []string) []string {
+	forbidden := map[string]struct{}{
+		"HERDR_ENV": {}, "HERDR_WORKSPACE_ID": {}, "HERDR_TAB_ID": {},
+		"HERDR_PANE_ID": {}, "HERDR_SOCKET_PATH": {},
+	}
+	clean := make([]string, 0, len(environment))
+	for _, entry := range environment {
+		name, _, _ := strings.Cut(entry, "=")
+		if _, drop := forbidden[name]; !drop {
+			clean = append(clean, entry)
+		}
+	}
+	return clean
 }
 
 type HerdrResolver struct {

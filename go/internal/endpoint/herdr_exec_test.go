@@ -5,7 +5,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,6 +40,33 @@ func TestExecRunnerUsesOnlyFixedHerdrArgv(t *testing.T) {
 	}
 	if _, err := runner.Run(context.Background(), []string{"sh", "-c", "touch /tmp/pwned"}); !errors.Is(err, ErrHerdrRunnerInvalidCommand) {
 		t.Fatalf("arbitrary argv error = %v", err)
+	}
+}
+
+func TestExecRunnerSanitizesAmbientHerdrIdentity(t *testing.T) {
+	dir := t.TempDir()
+	herdr := filepath.Join(dir, "herdr")
+	if err := os.WriteFile(herdr, []byte("#!/bin/sh\nenv\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	for _, name := range []string{"HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"} {
+		t.Setenv(name, "poisoned")
+	}
+	t.Setenv("MEKTUP_ENV_CONTROL", "preserved")
+
+	output, err := (ExecRunner{}).Run(context.Background(), []string{"herdr", "agent", "list"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(output)
+	if !strings.Contains(text, "MEKTUP_ENV_CONTROL=preserved") {
+		t.Fatalf("ordinary environment was not preserved: %q", text)
+	}
+	for _, name := range []string{"HERDR_ENV", "HERDR_WORKSPACE_ID", "HERDR_TAB_ID", "HERDR_PANE_ID", "HERDR_SOCKET_PATH"} {
+		if strings.Contains(text, name+"=") {
+			t.Fatalf("ambient %s reached Herdr: %q", name, text)
+		}
 	}
 }
 
