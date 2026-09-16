@@ -2,6 +2,7 @@ package controlreceiver
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -265,7 +266,7 @@ func TestReceiverOriginalStatusRejectsReplyIDPresenceAndOperationMismatch(t *tes
 
 func TestOriginalStatusResultRejectsAuthorityAndBodyKeysIncludingNull(t *testing.T) {
 	base := map[string]any{"schema": "mektup/control/v1", "kind": "result", "operation": "originalStatus", "operationId": operationID, "originalMessageId": originalID, "custody": map[string]any{"endpointId": receiverEndpoint, "storeId": "store_0198f0e0-0000-7000-8000-000000000002"}, "replyDestination": map[string]any{"endpointId": receiverEndpoint, "threadId": "source", "uri": "codex://local/thread/source"}, "result": map[string]any{"selection": "pending"}}
-	for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner", "replyMessageId", "bodyBytes", "bodySha256", "replyStatus", "state"} {
+	for _, field := range []string{"fencingToken", "lease", "requestedLease", "attemptOwner", "replyMessageId", "body", "bodyText", "bodyContent", "replyBody", "bodyBytes", "bodySha256", "replyStatus", "state"} {
 		document := map[string]any{}
 		for k, v := range base {
 			document[k] = v
@@ -291,6 +292,20 @@ func TestReceiverOriginalStatusFailsBeforeEmittingCorruptWinner(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := j.CommitReply(context.Background(), c.ReplyID, c.Owner, c.Token); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(j.StateDir(), "journal.sqlite3")+"?mode=rw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("PRAGMA foreign_keys=OFF"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE reply_claims SET reply_id='malformed-reply-id' WHERE reply_id=?", c.ReplyID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec("UPDATE reply_winners SET reply_id='malformed-reply-id' WHERE reply_id=?", c.ReplyID); err != nil {
 		t.Fatal(err)
 	}
 	receiver := Receiver{Registry: staticResolver{store: Store{Journal: j, StoreID: j.StoreID(), EndpointID: receiverEndpoint, CloseFunc: func() error { return nil }}}, LocalEndpointID: receiverEndpoint, Destination: localDestination()}

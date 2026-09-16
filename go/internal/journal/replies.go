@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	mektup "github.com/agensfield/mektup/go"
 	"strings"
 	"time"
 )
@@ -143,7 +144,7 @@ func (j *Journal) OriginalStatus(ctx context.Context, originalID string) (Origin
 }
 
 func validateOriginalSelectedClaim(claim ReplyClaim, seq int64, native string, winner bool) error {
-	if claim.ReplyID == "" || claim.OriginalID == "" || !validDigest(claim.Digest) || claim.BodySize < 0 || (claim.Status != "success" && claim.Status != "error") || (claim.Status == "success" && claim.ReplyErrorCode != "") || seq <= 0 {
+	if mektup.ValidateID(claim.ReplyID, mektup.MessageIDPrefix) != nil || !validDigest(claim.Digest) || claim.BodySize < 0 || (claim.Status != "success" && claim.Status != "error") || (claim.Status == "success" && claim.ReplyErrorCode != "") || seq <= 0 {
 		return fmt.Errorf("%w: corrupt selected reply metadata", ErrCorrupt)
 	}
 	if winner {

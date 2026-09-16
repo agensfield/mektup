@@ -11,6 +11,7 @@ import (
 
 func originalStatusClaimInput() ClaimInput {
 	in := claimInput()
+	in.ReplyID = "msg_0198f0e0-0000-7000-8000-000000000007"
 	in.Digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	return in
 }
@@ -29,7 +30,7 @@ func TestOriginalStatusPendingAndUnknownOrder(t *testing.T) {
 		t.Fatalf("pending selection %q", pending.Selection)
 	}
 	a := originalStatusClaimInput()
-	a.ReplyID = "unknown-a"
+	a.ReplyID = "msg_0198f0e0-0000-7000-8000-000000000008"
 	ca, err := j.ClaimReply(context.Background(), a)
 	if err != nil {
 		t.Fatal(err)
@@ -38,7 +39,7 @@ func TestOriginalStatusPendingAndUnknownOrder(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := originalStatusClaimInput()
-	b.ReplyID = "unknown-b"
+	b.ReplyID = "msg_0198f0e0-0000-7000-8000-000000000009"
 	cb, err := j.ClaimReply(context.Background(), b)
 	if err != nil {
 		t.Fatal(err)
@@ -62,7 +63,7 @@ func TestOriginalStatusWinnerPrecedesUnknown(t *testing.T) {
 	j := testJournal(t, dir, &now)
 	prepared(t, j)
 	a := originalStatusClaimInput()
-	a.ReplyID = "winner"
+	a.ReplyID = "msg_0198f0e0-0000-7000-8000-000000000008"
 	ca, err := j.ClaimReply(context.Background(), a)
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +72,7 @@ func TestOriginalStatusWinnerPrecedesUnknown(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := originalStatusClaimInput()
-	b.ReplyID = "unknown"
+	b.ReplyID = "msg_0198f0e0-0000-7000-8000-000000000009"
 	cb, err := j.ClaimReply(context.Background(), b)
 	if err != nil {
 		t.Fatal(err)
@@ -212,5 +213,12 @@ func TestOriginalStatusFailsClosedOnCorruptWinnerMetadata(t *testing.T) {
 	}
 	if _, err := j.OriginalStatus(context.Background(), "msg-1"); !errors.Is(err, ErrCorrupt) {
 		t.Fatalf("uppercase winner digest accepted: %v", err)
+	}
+}
+
+func TestOriginalStatusRejectsMalformedWinnerMessageID(t *testing.T) {
+	claim := ReplyClaim{ReplyID: "not-a-message-id", OriginalID: "msg_0198f0e0-0000-7000-8000-000000000003", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", BodySize: 1, Status: "success", State: StateReplyAccepted, CommitSeq: 1}
+	if err := validateOriginalSelectedClaim(claim, 1, "", true); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("malformed winner ID accepted: %v", err)
 	}
 }
