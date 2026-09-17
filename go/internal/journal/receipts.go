@@ -28,6 +28,10 @@ type ReceiptQuery struct {
 	Since      time.Time
 	EndpointID string
 	ThreadID   string
+	AnchorAt   time.Time
+	AnchorID   string
+	BeforeAt   time.Time
+	BeforeID   string
 	Limit      int
 }
 
@@ -239,28 +243,9 @@ func (j *Journal) ListReceipts(ctx context.Context, query ReceiptQuery) ([]mektu
 	if err != nil {
 		return nil, err
 	}
-	where := []string{"1=1"}
-	args := make([]any, 0, 3)
-	if query.State != "" {
-		if !query.State.Valid() {
-			return nil, fmt.Errorf("journal: invalid receipt state %q", query.State)
-		}
-		where = append(where, "state=?")
-		args = append(args, string(query.State))
-	}
-	if !query.Since.IsZero() {
-		where = append(where, "created_at>=?")
-		args = append(args, query.Since.UTC().UnixNano())
-	}
-	if query.EndpointID != "" && query.ThreadID != "" {
-		where = append(where, "((source_endpoint_id=? AND source_thread_id=?) OR (target_endpoint_id=? AND target_thread_id=?))")
-		args = append(args, query.EndpointID, query.ThreadID, query.EndpointID, query.ThreadID)
-	} else if query.EndpointID != "" {
-		where = append(where, "(source_endpoint_id=? OR target_endpoint_id=?)")
-		args = append(args, query.EndpointID, query.EndpointID)
-	} else if query.ThreadID != "" {
-		where = append(where, "(source_thread_id=? OR target_thread_id=?)")
-		args = append(args, query.ThreadID, query.ThreadID)
+	where, args, err := receiptPredicates(query)
+	if err != nil {
+		return nil, err
 	}
 	args = append(args, limit)
 	rows, err := j.db.QueryContext(ctx, `SELECT document FROM receipts WHERE `+strings.Join(where, " AND ")+` ORDER BY created_at DESC, receipt_id DESC LIMIT ?`, args...)
@@ -281,6 +266,55 @@ func (j *Journal) ListReceipts(ctx context.Context, query ReceiptQuery) ([]mektu
 		out = append(out, receipt)
 	}
 	return out, rows.Err()
+}
+
+// HasReceiptAfter checks continuation without fetching and discarding a row
+// beyond the caller's exact page limit.
+func (j *Journal) HasReceiptAfter(ctx context.Context, query ReceiptQuery) (bool, error) {
+	where, args, err := receiptPredicates(query)
+	if err != nil {
+		return false, err
+	}
+	var exists int
+	err = j.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM receipts WHERE `+strings.Join(where, " AND ")+`)`, args...).Scan(&exists)
+	return exists != 0, err
+}
+
+func receiptPredicates(query ReceiptQuery) ([]string, []any, error) {
+	where := []string{"1=1"}
+	args := make([]any, 0, 12)
+	if query.State != "" {
+		if !query.State.Valid() {
+			return nil, nil, fmt.Errorf("journal: invalid receipt state %q", query.State)
+		}
+		where = append(where, "state=?")
+		args = append(args, string(query.State))
+	}
+	if !query.Since.IsZero() {
+		where = append(where, "created_at>=?")
+		args = append(args, query.Since.UTC().UnixNano())
+	}
+	if query.EndpointID != "" && query.ThreadID != "" {
+		where = append(where, "((source_endpoint_id=? AND source_thread_id=?) OR (target_endpoint_id=? AND target_thread_id=?))")
+		args = append(args, query.EndpointID, query.ThreadID, query.EndpointID, query.ThreadID)
+	} else if query.EndpointID != "" {
+		where = append(where, "(source_endpoint_id=? OR target_endpoint_id=?)")
+		args = append(args, query.EndpointID, query.EndpointID)
+	} else if query.ThreadID != "" {
+		where = append(where, "(source_thread_id=? OR target_thread_id=?)")
+		args = append(args, query.ThreadID, query.ThreadID)
+	}
+	if !query.AnchorAt.IsZero() {
+		where = append(where, "(created_at<? OR (created_at=? AND receipt_id<=?))")
+		anchor := query.AnchorAt.UTC().UnixNano()
+		args = append(args, anchor, anchor, query.AnchorID)
+	}
+	if !query.BeforeAt.IsZero() {
+		where = append(where, "(created_at<? OR (created_at=? AND receipt_id<?))")
+		before := query.BeforeAt.UTC().UnixNano()
+		args = append(args, before, before, query.BeforeID)
+	}
+	return where, args, nil
 }
 
 func parseReceiptTime(value string) (time.Time, error) {

@@ -58,6 +58,7 @@ const (
 	ErrEndpointUnavailable            ErrorCode = "endpoint_unavailable"
 	ErrUnsupportedServerVersion       ErrorCode = "unsupported_server_version"
 	ErrInputTooLarge                  ErrorCode = "input_too_large"
+	ErrInvalidUTF8                    ErrorCode = "invalid_utf8"
 	ErrMessageNotFound                ErrorCode = "message_not_found"
 	ErrMessageIdentityConflict        ErrorCode = "message_identity_conflict"
 	ErrReplyRouteRequired             ErrorCode = "reply_route_required"
@@ -76,6 +77,7 @@ const (
 	ErrEffectAcknowledgmentRequired   ErrorCode = "effect_acknowledgment_required"
 	ErrExperimentalMethodUnavailable  ErrorCode = "experimental_method_unavailable"
 	ErrOutputTooLarge                 ErrorCode = "output_too_large"
+	ErrCompactOutputTooLarge          ErrorCode = "compact_output_too_large"
 	ErrStorageBusy                    ErrorCode = "storage_busy"
 	ErrStorageCorrupt                 ErrorCode = "storage_corrupt"
 	ErrStorageMigrationRequired       ErrorCode = "storage_migration_required"
@@ -91,12 +93,12 @@ const (
 func (c ErrorCode) Valid() bool {
 	switch c {
 	case ErrInvalidArguments, ErrInvalidTarget, ErrResolverUnavailable, ErrTargetAmbiguous,
-		ErrRouteUnavailable, ErrEndpointUnavailable, ErrUnsupportedServerVersion, ErrInputTooLarge,
+		ErrRouteUnavailable, ErrEndpointUnavailable, ErrUnsupportedServerVersion, ErrInputTooLarge, ErrInvalidUTF8,
 		ErrMessageNotFound, ErrMessageIdentityConflict, ErrReplyRouteRequired, ErrReplyRouteUnavailable,
 		ErrReplyNotRequested, ErrInvalidRawWait, ErrInvalidRawReplyRequest, ErrReplyOutcomeUnknown,
 		ErrMessageNotAddressedThread, ErrContentUnavailable, ErrDeliveryRejected,
 		ErrDeliveryTemporarilyUnavailable, ErrOutcomeUnknown, ErrWaitIncomplete, ErrWaitInterrupted,
-		ErrEffectAcknowledgmentRequired, ErrExperimentalMethodUnavailable, ErrOutputTooLarge,
+		ErrEffectAcknowledgmentRequired, ErrExperimentalMethodUnavailable, ErrOutputTooLarge, ErrCompactOutputTooLarge,
 		ErrStorageBusy, ErrStorageCorrupt, ErrStorageMigrationRequired, ErrRepairRequired, ErrInternal:
 		return true
 	default:

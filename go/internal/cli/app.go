@@ -5,8 +5,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,16 +16,19 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mattn/go-isatty"
 	"golang.org/x/mod/semver"
 )
 
 const (
-	ContractVersion = "1.0.7"
+	ContractVersion = "1.0.8"
 	EventSchema     = "mektup/event/v1"
 	CommandSchema   = "mektup/command-contract/v1"
 )
@@ -158,6 +163,20 @@ type StreamingExecutor interface {
 	ExecuteStream(context.Context, Invocation, func(ExecutionResult) error) error
 }
 
+// CompactArtifact is a truthful owner-private retention receipt for a compact
+// record that could not fit the terminal output bound.
+type CompactArtifact struct {
+	Path   string `json:"path"`
+	Bytes  int64  `json:"bytes"`
+	SHA256 string `json:"sha256"`
+}
+
+// CompactRetainer is optional. Production implements it so a complete record
+// remains reachable when the bounded compact terminal cannot carry it.
+type CompactRetainer interface {
+	RetainCompact(context.Context, Invocation, []byte) (CompactArtifact, error)
+}
+
 type defaultExecutor struct{}
 
 func (defaultExecutor) Execute(context.Context, Invocation) (ExecutionResult, error) {
@@ -213,6 +232,7 @@ type Invocation struct {
 type Globals struct {
 	JSON     bool
 	Human    bool
+	Compact  bool
 	Endpoint string
 	Config   string
 	StateDir string
@@ -226,18 +246,21 @@ type Globals struct {
 // config/state files. Flags win over dedicated environment variables, then
 // built-in defaults are used.
 type ResolvedGlobals struct {
-	Output          Presentation
-	Endpoint        string
-	EndpointSource  PathSource
-	Config          string
-	StateDir        string
-	ConfigSource    PathSource
-	StateSource     PathSource
-	CodexHome       string
-	CurrentThreadID string
-	AgentMode       bool
-	Color           bool
-	ErrorColor      bool
+	Output                   Presentation
+	Endpoint                 string
+	EndpointSource           PathSource
+	Config                   string
+	StateDir                 string
+	ConfigSource             PathSource
+	StateSource              PathSource
+	CodexHome                string
+	CurrentThreadID          string
+	AgentMode                bool
+	Compact                  bool
+	CompactRequestedLimit    *int
+	CompactRequestedReceipts *int
+	Color                    bool
+	ErrorColor               bool
 }
 
 // PathSource records which input won path precedence. It is intentionally
@@ -323,7 +346,7 @@ func resolveGlobals(inv Invocation, env map[string]string, outputTerminal, error
 		state = value
 		stateSource = PathEnv
 	}
-	output, err := resolvePresentation(inv.Global.JSON, inv.Global.Human, env)
+	output, err := resolvePresentation(inv.Global.JSON || inv.Global.Compact, inv.Global.Human, env)
 	if err != nil {
 		return inv, normalizeError(err)
 	}
@@ -335,7 +358,11 @@ func resolveGlobals(inv Invocation, env map[string]string, outputTerminal, error
 	if colorErr != nil {
 		return inv, colorErr
 	}
-	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, EndpointSource: endpointSource, Config: config, StateDir: state, ConfigSource: configSource, StateSource: stateSource, CodexHome: strings.TrimSpace(env["CODEX_HOME"]), CurrentThreadID: strings.TrimSpace(env["CODEX_THREAD_ID"]), AgentMode: env["MEKTUP_AGENT"] == "1", Color: color, ErrorColor: errorColor}
+	outputSetting := strings.ToLower(strings.TrimSpace(env["MEKTUP_OUTPUT"]))
+	implicitAgentJSON := !inv.Global.JSON && !inv.Global.Human && !inv.Global.Compact &&
+		(outputSetting == "" || outputSetting == "auto") &&
+		(env["MEKTUP_AGENT"] == "1" || strings.TrimSpace(env["CODEX_THREAD_ID"]) != "")
+	inv.Resolved = ResolvedGlobals{Output: output, Endpoint: endpoint, EndpointSource: endpointSource, Config: config, StateDir: state, ConfigSource: configSource, StateSource: stateSource, CodexHome: strings.TrimSpace(env["CODEX_HOME"]), CurrentThreadID: strings.TrimSpace(env["CODEX_THREAD_ID"]), AgentMode: env["MEKTUP_AGENT"] == "1", Compact: inv.Global.Compact || implicitAgentJSON, Color: color, ErrorColor: errorColor}
 	return inv, nil
 }
 
@@ -436,20 +463,24 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 	}
 
 	env := a.env()
-	preJSON, preHuman := scanPresentation(args)
+	preJSON, preHuman, preCompact := scanPresentation(args)
 	parsed, parseErr := Parse(args)
-	presentation, presentationErr := resolvePresentation(preJSON, preHuman, env)
+	presentation, presentationErr := resolvePresentation(preJSON || preCompact, preHuman, env)
 	if presentationErr != nil {
 		return a.finish(presentation, Invocation{}, presentationErr)
 	}
+	outputSetting := strings.ToLower(strings.TrimSpace(env["MEKTUP_OUTPUT"]))
+	parsed.Resolved.Compact = preCompact && !preJSON && !preHuman ||
+		!preJSON && !preHuman && !preCompact && (outputSetting == "" || outputSetting == "auto") &&
+			(env["MEKTUP_AGENT"] == "1" || strings.TrimSpace(env["CODEX_THREAD_ID"]) != "")
 	if parseErr != nil {
 		return a.finish(presentation, parsed, parseErr)
 	}
 	if globalErr := validateGlobals(parsed); globalErr != nil {
 		return a.finish(presentation, parsed, globalErr)
 	}
-	if parsed.Global.JSON || parsed.Global.Human {
-		presentation, presentationErr = resolvePresentation(parsed.Global.JSON, parsed.Global.Human, env)
+	if parsed.Global.JSON || parsed.Global.Human || parsed.Global.Compact {
+		presentation, presentationErr = resolvePresentation(parsed.Global.JSON || parsed.Global.Compact, parsed.Global.Human, env)
 		if presentationErr != nil {
 			return a.finish(presentation, parsed, presentationErr)
 		}
@@ -459,6 +490,10 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 		return a.finish(presentation, parsed, resolveErr)
 	}
 	parsed = resolved
+	if compactErr := resolveCompactInvocation(&parsed); compactErr != nil {
+		return a.finish(presentation, parsed, compactErr)
+	}
+	applyCompactDefaults(&parsed)
 
 	if has(parsed, "skill") {
 		if parsed.Command != "--skill" || len(parsed.Position) != 0 || !onlyOptions(parsed, "skill", "json", "human", "color") {
@@ -478,7 +513,7 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 	}
 	switch parsed.Command {
 	case "version":
-		if len(parsed.Position) != 0 || !onlyOptions(parsed, "json", "human", "color") {
+		if len(parsed.Position) != 0 || !onlyOptions(parsed, "json", "human", "compact", "color") {
 			return a.finish(presentation, parsed, usageError("usage: mektup version [--json]"))
 		}
 		return a.version(presentation, parsed.Resolved.Color)
@@ -571,13 +606,16 @@ func (a *App) completion(p Presentation, shell string) int {
 
 func (a *App) docs(p Presentation, inv Invocation) int {
 	if len(inv.Position) != 1 {
-		return a.finish(p, inv, usageError("usage: mektup docs agents|commands|envelopes|receipts [--json]"))
+		return a.finish(p, inv, usageError("usage: mektup docs agents|commands|envelopes|receipts [--json|--compact]"))
 	}
-	if !onlyOptions(inv, "json", "human", "color") {
+	if !onlyOptions(inv, "json", "human", "compact", "color") {
 		return a.finish(p, inv, usageError("docs accepts only a documentation topic and presentation options"))
 	}
 	switch inv.Position[0] {
 	case "agents":
+		if p == PresentationJSON {
+			return a.writeJSON(map[string]any{"schema": "mektup/docs/v1", "ok": true, "topic": "agents", "text": agentGuide})
+		}
 		return a.writeGuide(inv.Resolved.Color)
 	case "commands":
 		if p == PresentationJSON {
@@ -591,8 +629,14 @@ func (a *App) docs(p Presentation, inv Invocation) int {
 		_, _ = io.WriteString(a.Out, ensureFinalNewline(StyleHuman(commandContractHuman(commandContract()), inv.Resolved.Color)))
 		return int(ExitSuccess)
 	case "envelopes":
+		if p == PresentationJSON {
+			return a.writeJSON(map[string]any{"schema": "mektup/docs/v1", "ok": true, "topic": "envelopes", "text": envelopeDocs})
+		}
 		return a.writeAsset(envelopeDocs, inv.Resolved.Color)
 	case "receipts":
+		if p == PresentationJSON {
+			return a.writeJSON(map[string]any{"schema": "mektup/docs/v1", "ok": true, "topic": "receipts", "text": receiptDocs})
+		}
 		return a.writeAsset(receiptDocs, inv.Resolved.Color)
 	default:
 		return a.finish(p, inv, usageError("unknown docs topic: "+inv.Position[0]))
@@ -643,12 +687,32 @@ func (a *App) writeExecutionResultState(p Presentation, inv Invocation, result E
 		return int(result.Exit)
 	}
 	if p == PresentationJSON {
+		invalidUTF8 := false
+		if inv.Resolved.Compact {
+			invalidUTF8 = containsInvalidUTF8(result.Receipt)
+			for _, output := range result.Events {
+				invalidUTF8 = invalidUTF8 || containsInvalidUTF8(output.Machine)
+			}
+		}
 		events, err := a.lifecycleEventsState(inv, result, state)
 		if err != nil {
 			return a.internalFailure(err.Error())
 		}
+		recoveryReceipt := compactResultReceiptLocator(events)
+		if len(recoveryReceipt) == 0 && state != nil {
+			recoveryReceipt = compactReceiptValueLocator(state.lastReceipt)
+		}
 		for _, event := range events {
-			if status := a.writeJSON(event); status != int(ExitSuccess) {
+			invalidUTF8 = invalidUTF8 || containsInvalidUTF8(event)
+			fullEvent := compactEventWithReceiptLocator(cloneEvent(event), recoveryReceipt)
+			event = compactLifecycleEvent(inv, event)
+			if inv.Resolved.Compact && invalidUTF8 {
+				if status := a.writeJSON(compactDecodeFailureEvent(fullEvent)); status != int(ExitSuccess) {
+					return status
+				}
+				return compactOverflowExit(fullEvent)
+			}
+			if status := a.writeProjectedEvent(inv, event, fullEvent); status != int(ExitSuccess) {
 				return status
 			}
 		}
@@ -742,8 +806,8 @@ func (a *App) lifecycleEventsState(inv Invocation, result ExecutionResult, state
 		if err != nil {
 			return nil, fmt.Errorf("invalid executor lifecycle event: %w", err)
 		}
-		var event map[string]any
-		if err := json.Unmarshal(encoded, &event); err != nil {
+		event, err := decodeExactObject(encoded)
+		if err != nil {
 			return nil, fmt.Errorf("invalid executor lifecycle event: %w", err)
 		}
 		events = append(events, event)
@@ -959,10 +1023,396 @@ func (a *App) writeEvent(inv Invocation, e *Error) int {
 			"code": e.Code, "message": e.Message, "retryable": e.Retryable, "effectState": e.Effect, "details": e.Details,
 		}},
 	}
-	if status := a.writeJSON(eventWithCommand(event, inv)); status != int(ExitSuccess) {
+	event = eventWithCommand(event, inv)
+	invalidUTF8 := containsInvalidUTF8(event)
+	fullEvent := cloneEvent(event)
+	if inv.Resolved.Compact {
+		if invalidUTF8 {
+			if status := a.writeJSON(compactDecodeFailureEvent(fullEvent)); status != int(ExitSuccess) {
+				return status
+			}
+			return compactOverflowExit(fullEvent)
+		}
+		event["presentation"] = "compact"
+		data := objectMap(event["data"])
+		errorData := objectMap(data["error"])
+		messagePreview := previewValue(errorData["message"])
+		errorData["messagePreview"] = messagePreview
+		errorData["message"] = objectMap(messagePreview)["text"]
+		if details := objectMap(errorData["details"]); len(details) != 0 {
+			errorData["details"] = compactErrorDetails(details)
+		}
+		data["error"] = errorData
+		event["data"] = data
+	}
+	if status := a.writeProjectedEvent(inv, event, fullEvent); status != int(ExitSuccess) {
 		return status
 	}
 	return int(e.Exit)
+}
+
+func containsInvalidUTF8(value any) bool {
+	return containsInvalidUTF8Value(reflect.ValueOf(value), make(map[uintptr]bool), 0)
+}
+
+func containsInvalidUTF8Value(value reflect.Value, seen map[uintptr]bool, depth int) bool {
+	if !value.IsValid() || depth > 64 {
+		return false
+	}
+	if value.Kind() == reflect.Interface {
+		if value.IsNil() {
+			return false
+		}
+		return containsInvalidUTF8Value(value.Elem(), seen, depth+1)
+	}
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return false
+		}
+		ptr := value.Pointer()
+		if seen[ptr] {
+			return false
+		}
+		seen[ptr] = true
+		return containsInvalidUTF8Value(value.Elem(), seen, depth+1)
+	}
+	if value.Type() == reflect.TypeOf(json.RawMessage{}) {
+		return !utf8.Valid(value.Bytes())
+	}
+	switch value.Kind() {
+	case reflect.String:
+		return !utf8.ValidString(value.String())
+	case reflect.Map:
+		iter := value.MapRange()
+		for iter.Next() {
+			if containsInvalidUTF8Value(iter.Key(), seen, depth+1) || containsInvalidUTF8Value(iter.Value(), seen, depth+1) {
+				return true
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		if value.Type().Elem().Kind() == reflect.Uint8 {
+			return false // Byte blobs are not textual previews; RawMessage was handled above.
+		}
+		for i := 0; i < value.Len(); i++ {
+			if containsInvalidUTF8Value(value.Index(i), seen, depth+1) {
+				return true
+			}
+		}
+	case reflect.Struct:
+		for i := 0; i < value.NumField(); i++ {
+			field := value.Field(i)
+			if field.CanInterface() && containsInvalidUTF8Value(field, seen, depth+1) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func decodeExactObject(document []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(document))
+	decoder.UseNumber()
+	var value map[string]any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func compactDecodeFailureEvent(original map[string]any) map[string]any {
+	event := pick(original, "schema", "eventId", "sequence", "operationId", "timestamp")
+	event["event"] = "compact.decode_failed"
+	event["terminal"] = true
+	event["ok"] = false
+	event["presentation"] = "compact"
+	event["warnings"] = []any{}
+	details := map[string]any{"guidance": []string{"use --json for exact machine diagnostics"}}
+	if receipt := compactReceiptLocator(original); len(receipt) != 0 {
+		details["receipt"] = receipt
+	}
+	event["data"] = map[string]any{"error": map[string]any{
+		"code": "invalid_utf8", "message": "compact textual input contains invalid UTF-8", "messagePreview": previewValue("compact textual input contains invalid UTF-8"), "retryable": false,
+		"effectState": compactEffectState(original), "details": details,
+	}}
+	return event
+}
+
+func compactResultReceiptLocator(events []map[string]any) map[string]any {
+	for index := len(events) - 1; index >= 0; index-- {
+		if receipt := compactReceiptLocator(events[index]); len(receipt) != 0 {
+			return receipt
+		}
+	}
+	return nil
+}
+
+func compactReceiptValueLocator(value any) map[string]any {
+	return pick(objectMap(value), "receiptId", "operationId", "state")
+}
+
+func compactEventWithReceiptLocator(event, receipt map[string]any) map[string]any {
+	if len(receipt) == 0 || len(compactReceiptLocator(event)) != 0 {
+		return event
+	}
+	recovered := cloneEvent(event)
+	data := objectMap(recovered["data"])
+	data["receipt"] = receipt
+	recovered["data"] = data
+	return recovered
+}
+
+func compactErrorDetails(details map[string]any) map[string]any {
+	return compactDetailMap(details)
+}
+
+func compactDetailMap(details map[string]any) map[string]any {
+	keys := make([]string, 0, len(details))
+	for key := range details {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	truncated := len(keys) > CompactMaxLimit
+	if truncated {
+		keys = keys[:CompactMaxLimit]
+	}
+	out := make(map[string]any, len(keys)+2)
+	for _, key := range keys {
+		out[key] = compactDetailValue(details[key])
+	}
+	if truncated {
+		out["projection"] = "bounded-details"
+		out["sourceCount"] = len(details)
+		out["truncated"] = true
+	}
+	return out
+}
+
+func compactDetailValue(value any) any {
+	switch typed := value.(type) {
+	case string:
+		return previewValue(typed)
+	case map[string]any:
+		return compactDetailMap(typed)
+	case []any:
+		limit := len(typed)
+		if limit > CompactMaxLimit {
+			limit = CompactMaxLimit
+		}
+		items := make([]any, 0, limit)
+		for _, child := range typed[:limit] {
+			items = append(items, compactDetailValue(child))
+		}
+		if limit != len(typed) {
+			return map[string]any{"items": items, "sourceCount": len(typed), "truncated": true}
+		}
+		return items
+	default:
+		return typed
+	}
+}
+
+func cloneEvent(event map[string]any) map[string]any {
+	document, err := json.Marshal(event)
+	if err != nil {
+		return event
+	}
+	cloned, decodeErr := decodeExactObject(document)
+	if decodeErr != nil {
+		return event
+	}
+	return cloned
+}
+
+func (a *App) writeProjectedEvent(inv Invocation, event, fullEvent map[string]any) int {
+	if !inv.Resolved.Compact {
+		return a.writeJSON(event)
+	}
+	fullDocument, marshalErr := json.Marshal(fullEvent)
+	recoveryEvent := compactEventWithReceiptLocator(event, compactReceiptLocator(fullEvent))
+	var retained *CompactArtifact
+	var retainErr error
+	retain := func() {
+		if retained != nil || retainErr != nil || marshalErr != nil {
+			return
+		}
+		if retainer, ok := a.Executor.(CompactRetainer); ok {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			artifact, err := retainer.RetainCompact(ctx, inv, append(fullDocument, '\n'))
+			cancel()
+			if err == nil && validCompactArtifact(artifact, append(fullDocument, '\n')) {
+				retained = &artifact
+			} else {
+				if err != nil {
+					retainErr = err
+				} else {
+					retainErr = errors.New("compact artifact retention returned an invalid receipt")
+				}
+			}
+		} else {
+			retainErr = errors.New("compact artifact retention is unavailable")
+		}
+	}
+	if compactDetailsNeedRetention(event) {
+		retain()
+		if retained == nil {
+			fallback := compactOverflowEvent(recoveryEvent, nil, marshalErr, retainErr)
+			if status := a.writeJSON(fallback); status != int(ExitSuccess) {
+				return status
+			}
+			return compactOverflowExit(recoveryEvent)
+		}
+		data := objectMap(event["data"])
+		data["retainedDetails"] = retained
+		event["data"] = data
+	}
+	if compactEncodedSize(event) <= CompactMaxOutputBytes {
+		return a.writeJSON(event)
+	}
+	retain()
+	fallback := compactOverflowEvent(recoveryEvent, retained, marshalErr, retainErr)
+	if compactEncodedSize(fallback) > CompactMaxOutputBytes {
+		fallback = minimalCompactOverflowEvent(recoveryEvent, retained)
+	}
+	if status := a.writeJSON(fallback); status != int(ExitSuccess) {
+		return status
+	}
+	return compactOverflowExit(recoveryEvent)
+}
+
+func validCompactArtifact(artifact CompactArtifact, document []byte) bool {
+	if strings.TrimSpace(artifact.Path) == "" || artifact.Bytes != int64(len(document)) {
+		return false
+	}
+	digest := sha256.Sum256(document)
+	return artifact.SHA256 == "sha256:"+hex.EncodeToString(digest[:])
+}
+
+func compactOverflowExit(event map[string]any) int {
+	switch compactEffectState(event) {
+	case "not_sent", "rejected":
+		return int(ExitRejected)
+	case "unknown", "outcome_unknown", "reply_outcome_unknown":
+		return int(ExitUnknown)
+	default:
+		return int(ExitIncomplete)
+	}
+}
+
+func compactDetailsNeedRetention(event map[string]any) bool {
+	if event["warningsTruncated"] == true {
+		return true
+	}
+	for _, warning := range anySlice(event["warnings"]) {
+		if preview, ok := objectMap(warning)["messagePreview"]; ok && objectMap(preview)["truncated"] == true {
+			return true
+		}
+	}
+	data := objectMap(event["data"])
+	errorData := objectMap(data["error"])
+	if objectMap(errorData["messagePreview"])["truncated"] == true {
+		return true
+	}
+	return containsTruncatedPreview(errorData["details"])
+}
+
+func containsTruncatedPreview(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		if typed["truncated"] == true {
+			return true
+		}
+		for _, child := range typed {
+			if containsTruncatedPreview(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsTruncatedPreview(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func compactOverflowEvent(original map[string]any, artifact *CompactArtifact, marshalErr, retainErr error) map[string]any {
+	fallback := pick(original, "schema", "eventId", "sequence", "operationId", "timestamp")
+	fallback["event"] = "compact_output_too_large"
+	fallback["terminal"] = true
+	fallback["ok"] = false
+	fallback["presentation"] = "compact"
+	fallback["warnings"] = []any{}
+	effect := compactEffectState(original)
+	receipt := compactReceiptLocator(original)
+	guidance := []string{"rerun this read with --json or a smaller limit", "use the exact content or artifact command"}
+	if len(receipt) != 0 {
+		guidance = []string{"retrieve the accepted operation with receipt show --json", "use the retained artifact or exact content command; do not rerun the mutation"}
+	}
+	details := map[string]any{"guidance": guidance}
+	if len(receipt) != 0 {
+		details["receipt"] = receipt
+	}
+	if artifact != nil {
+		details["artifact"] = artifact
+	} else {
+		failure := "compact artifact retention is unavailable"
+		if marshalErr != nil {
+			failure = "complete output could not be encoded for retention"
+		} else if retainErr != nil {
+			failure = "compact artifact retention failed"
+		}
+		details["retentionFailure"] = map[string]any{"message": failure}
+	}
+	fallback["data"] = map[string]any{"error": map[string]any{
+		"code": "compact_output_too_large", "message": "compact output exceeded 131072 bytes", "messagePreview": previewValue("compact output exceeded 131072 bytes"), "retryable": false, "effectState": effect, "details": details,
+	}}
+	return fallback
+}
+
+func minimalCompactOverflowEvent(original map[string]any, artifact *CompactArtifact) map[string]any {
+	fallback := pick(original, "schema", "eventId", "sequence", "operationId", "timestamp")
+	fallback["event"] = "compact_output_too_large"
+	fallback["terminal"] = true
+	fallback["ok"] = false
+	fallback["presentation"] = "compact"
+	fallback["warnings"] = []any{}
+	details := map[string]any{}
+	if artifact != nil {
+		details["artifact"] = artifact
+	} else {
+		details["retentionFailure"] = map[string]any{"message": "compact artifact retention failed"}
+	}
+	if receipt := compactReceiptLocator(original); len(receipt) != 0 {
+		details["receipt"] = receipt
+	}
+	fallback["data"] = map[string]any{"error": map[string]any{
+		"code": "compact_output_too_large", "message": "compact output exceeded 131072 bytes", "messagePreview": previewValue("compact output exceeded 131072 bytes"), "retryable": false,
+		"effectState": compactEffectState(original), "details": details,
+	}}
+	return fallback
+}
+
+func compactEffectState(event map[string]any) string {
+	if data := objectMap(event["data"]); len(data) != 0 {
+		if failure := objectMap(data["error"]); len(failure) != 0 {
+			if effect, ok := failure["effectState"].(string); ok && effect != "" {
+				return effect
+			}
+		}
+		if receipt := objectMap(data["receipt"]); len(receipt) != 0 {
+			if state, ok := receipt["state"].(string); ok && state != "" {
+				return state
+			}
+		}
+	}
+	return "accepted"
+}
+
+func compactReceiptLocator(event map[string]any) map[string]any {
+	data := objectMap(event["data"])
+	receipt := objectMap(data["receipt"])
+	return pick(receipt, "receiptId", "operationId", "state")
 }
 
 func eventWithCommand(event map[string]any, inv Invocation) map[string]any {
@@ -1012,7 +1462,7 @@ func exitForError(code string) ExitCode {
 	switch code {
 	case "invalid_arguments", "invalid_target", "reply_route_required", "invalid_raw_wait", "invalid_raw_reply_request", "effect_acknowledgment_required":
 		return ExitUsage
-	case "target_ambiguous", "message_not_found", "message_identity_conflict", "message_not_addressed_to_thread", "delivery_rejected", "delivery_temporarily_unavailable", "resolver_unavailable", "route_unavailable", "reply_route_unavailable", "endpoint_unavailable", "unsupported_server_version", "input_too_large", "reply_not_requested", "content_unavailable", "output_too_large", "experimental_method_unavailable":
+	case "target_ambiguous", "message_not_found", "message_identity_conflict", "message_not_addressed_to_thread", "delivery_rejected", "delivery_temporarily_unavailable", "resolver_unavailable", "route_unavailable", "reply_route_unavailable", "endpoint_unavailable", "unsupported_server_version", "input_too_large", "invalid_utf8", "reply_not_requested", "content_unavailable", "output_too_large", "experimental_method_unavailable":
 		return ExitRejected
 	case "outcome_unknown", "reply_outcome_unknown", "storage_busy":
 		return ExitUnknown
@@ -1050,7 +1500,7 @@ func ensureFinalNewline(s string) string {
 	return strings.TrimRight(s, "\n") + "\n"
 }
 
-func scanPresentation(args []string) (jsonMode, humanMode bool) {
+func scanPresentation(args []string) (jsonMode, humanMode, compactMode bool) {
 	for _, arg := range args {
 		if arg == "--" {
 			break
@@ -1060,6 +1510,8 @@ func scanPresentation(args []string) (jsonMode, humanMode bool) {
 			jsonMode = true
 		case "--human":
 			humanMode = true
+		case "--compact":
+			compactMode = true
 		}
 	}
 	return

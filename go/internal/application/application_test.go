@@ -248,6 +248,30 @@ func TestArtifactSpillWriterReusesRepeatedContentAddressedReceipt(t *testing.T) 
 	}
 }
 
+func TestEnvironmentRetainsCompactRecordPrivately(t *testing.T) {
+	root := t.TempDir()
+	env := New(Options{StateDir: filepath.Join(root, "state"), ConfigPath: filepath.Join(root, "endpoints.json")})
+	document := []byte("{\"complete\":true}\n")
+	receipt, err := env.RetainCompact(context.Background(), cli.Invocation{Resolved: cli.ResolvedGlobals{StateDir: filepath.Join(root, "state")}}, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Bytes != int64(len(document)) || !strings.HasPrefix(receipt.SHA256, "sha256:") {
+		t.Fatalf("receipt=%+v", receipt)
+	}
+	info, err := os.Stat(receipt.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("mode=%#o", info.Mode().Perm())
+	}
+	got, err := os.ReadFile(receipt.Path)
+	if err != nil || !bytes.Equal(got, document) {
+		t.Fatalf("artifact=%q err=%v", got, err)
+	}
+}
+
 func (d *recordingDialer) DialClient(_ context.Context, route endpoint.Route, options appserver.Options) (*appserver.Client, error) {
 	d.mu.Lock()
 	d.routes = append(d.routes, route)
@@ -1004,7 +1028,9 @@ func TestMessagingReceiptPersistsBeforeOutputAndWaitResolvesReceiptID(t *testing
 	}
 	var event struct {
 		Data struct {
-			Receipt mektup.Receipt `json:"receipt"`
+			Receipt struct {
+				ReceiptID string `json:"receiptId"`
+			} `json:"receipt"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &event); err != nil {
@@ -1172,7 +1198,9 @@ func TestMessagingPoolCleanupWarningIsDurable(t *testing.T) {
 	}
 	var event struct {
 		Data struct {
-			Receipt mektup.Receipt `json:"receipt"`
+			Receipt struct {
+				ReceiptID string `json:"receiptId"`
+			} `json:"receipt"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(bytes.TrimSpace(out.Bytes()), &event); err != nil {

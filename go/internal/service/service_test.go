@@ -128,6 +128,25 @@ func (j *fakeJournal) RecordResult(_ context.Context, opID string, state mektup.
 }
 func (j *fakeJournal) ExpireClaims(context.Context) error { return nil }
 func (j *fakeJournal) markedCount() int                   { j.mu.Lock(); defer j.mu.Unlock(); return len(j.marked) }
+
+type deadlineExpiryJournal struct{ *fakeJournal }
+
+func (j deadlineExpiryJournal) ExpireClaims(ctx context.Context) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestWaitDeadlineDuringExpiryIsIncomplete(t *testing.T) {
+	journal := deadlineExpiryJournal{fakeJournal: newFakeJournal()}
+	resolver := baseResolver()
+	service := &Service{Resolver: &resolver, Delivery: &fakeDelivery{}, Journal: journal}
+	result, err := service.Wait(context.Background(), WaitRequest{Reference: "receipt", Timeout: time.Millisecond})
+	var semanticErr *Error
+	if !errors.As(err, &semanticErr) || semanticErr.Code != mektup.ErrWaitIncomplete || !result.Incomplete {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+}
+
 func (j *fakeJournal) Lookup(_ context.Context, ref string) (OperationStatus, error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()

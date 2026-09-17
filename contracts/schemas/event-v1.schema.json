@@ -30,6 +30,9 @@
         "operation.rejected",
         "operation.unknown",
         "operation.failed",
+        "operation.completed",
+        "operation.progress",
+        "operation.cleanup_warning",
         "artifact.spilled",
         "doctor.completed",
         "storage.completed",
@@ -38,7 +41,24 @@
         "thread.read.completed",
         "thread.turns.completed",
         "thread.items.completed",
-        "search.completed"
+        "search.completed",
+        "inspect.completed",
+        "receipt.list",
+        "receipt.show",
+        "receipt.content",
+        "receipt.reconciled",
+        "receipt.resolved",
+        "endpoint.list.completed",
+        "endpoint.show.completed",
+        "endpoint.add.completed",
+        "endpoint.remove.completed",
+        "endpoint.check.completed",
+        "thread.start.completed",
+        "thread.resume.completed",
+        "thread.fork.completed",
+        "reply.unknown",
+        "compact_output_too_large",
+        "compact.decode_failed"
       ]
     },
     "eventId": { "$ref": "common-v1.schema.json#/$defs/eventId" },
@@ -51,7 +71,36 @@
       "type": "array",
       "items": { "$ref": "warning-v1.schema.json" }
     },
+    "presentation": { "const": "compact" },
+    "warningCount": { "type": "integer", "minimum": 0 },
     "data": { "type": "object" }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "presentation": { "const": "compact" },
+          "event": { "enum": ["thread.list.completed", "thread.turns.completed", "thread.items.completed", "search.completed", "receipt.list"] }
+        },
+        "required": ["presentation", "event"]
+      },
+      "then": { "properties": { "data": { "$ref": "compact-v1.schema.json#/$defs/page" } } }
+    },
+    {
+      "if": {
+        "properties": { "presentation": { "const": "compact" }, "event": { "const": "inspect.completed" } },
+        "required": ["presentation", "event"]
+      },
+      "then": {
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": ["receiptsPage"],
+            "properties": { "receiptsPage": { "$ref": "compact-v1.schema.json#/$defs/page" } }
+          }
+        }
+      }
+    }
+  ],
   "additionalProperties": true
 }

@@ -1,6 +1,6 @@
-# Mektup v1 language-neutral contracts (spec revision 1.0.7)
+# Mektup v1 language-neutral contracts (spec revision 1.0.8)
 
-The locked product specification revision is 1.0.7. The wire schema identifiers
+The locked product specification revision is 1.0.8. The wire schema identifiers
 remain versioned as `.../v1`; the revision is contract metadata, not a new wire
 schema family.
 
@@ -33,6 +33,12 @@ returns tokenless state/status/winner metadata. `receiptId` is optional on
 control documents, including status/reconcile, because custody authority is the
 operation plus original/reply message identity rather than a local receipt
 handle.
+
+Compact JSONL is a presentation contract, not a second authority format.
+`compact-v1.schema.json` defines bounded text-preview and page metadata shapes;
+`receipt-summary-v1.schema.json` deliberately identifies compact summaries as
+non-canonical. A summary cannot be imported or used as dispatch authority, but
+retains exact local locators for retrieving the canonical receipt.
 
 Portable reply recovery uses the tokenless `originalStatus` control operation.
 It requires the exact original custody and reply-destination tuple, never reads

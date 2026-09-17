@@ -97,6 +97,44 @@ func TestListShowAndContentAreBoundedAndMetadataOnly(t *testing.T) {
 	}
 }
 
+func TestReceiptCursorBindsStoreQueryAndInitialAnchor(t *testing.T) {
+	store, _ := openStore(t)
+	base := time.Date(2026, 9, 17, 8, 0, 0, 0, time.UTC)
+	put := func(offset time.Duration, state mektup.EvidenceState) mektup.Receipt {
+		receipt := testReceipt(t, state)
+		stamp := base.Add(offset).Format(time.RFC3339Nano)
+		receipt.CreatedAt, receipt.UpdatedAt = stamp, stamp
+		receipt.Evidence[0].At = stamp
+		if err := store.Save(context.Background(), receipt); err != nil {
+			t.Fatal(err)
+		}
+		return receipt
+	}
+	oldest := put(time.Second, mektup.StateAccepted)
+	second := put(2*time.Second, mektup.StateAccepted)
+	newest := put(3*time.Second, mektup.StateAccepted)
+
+	first, err := store.ListPage(context.Background(), ListOptions{State: mektup.StateAccepted, Limit: 2})
+	if err != nil || len(first.Receipts) != 2 || first.NextCursor == "" {
+		t.Fatalf("first page = %#v, %v", first, err)
+	}
+	if first.Receipts[0].ReceiptID != newest.ReceiptID || first.Receipts[1].ReceiptID != second.ReceiptID {
+		t.Fatalf("unexpected first page order: %#v", first.Receipts)
+	}
+	put(4*time.Second, mektup.StateAccepted) // Above the initial anchor: must not enter the traversal.
+	secondPage, err := store.ListPage(context.Background(), ListOptions{State: mektup.StateAccepted, Limit: 2, Cursor: first.NextCursor})
+	if err != nil || len(secondPage.Receipts) != 1 || secondPage.Receipts[0].ReceiptID != oldest.ReceiptID || secondPage.NextCursor != "" {
+		t.Fatalf("second page = %#v, %v", secondPage, err)
+	}
+	if _, err := store.ListPage(context.Background(), ListOptions{State: mektup.StateOutcomeUnknown, Limit: 2, Cursor: first.NextCursor}); !errors.Is(err, ErrInvalidArguments) {
+		t.Fatalf("cross-filter cursor error = %v", err)
+	}
+	other, _ := openStore(t)
+	if _, err := other.ListPage(context.Background(), ListOptions{State: mektup.StateAccepted, Limit: 2, Cursor: first.NextCursor}); !errors.Is(err, ErrInvalidArguments) {
+		t.Fatalf("cross-store cursor error = %v", err)
+	}
+}
+
 func TestResolveRequiresGateAndPreservesObservedEvidence(t *testing.T) {
 	store, j := openStore(t)
 	receipt := testReceipt(t, mektup.StateOutcomeUnknown)

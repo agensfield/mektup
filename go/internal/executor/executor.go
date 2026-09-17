@@ -393,7 +393,11 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		return cli.ExecutionResult{}, usage("unsupported thread subcommand: " + sub)
 	}
 	if collection {
-		return e.collectionResult(ctx, kind, resultKind, data, cursor, warnings, mutating, endpointID)
+		output, outputErr := e.collectionResult(ctx, kind, resultKind, data, cursor, warnings, mutating, endpointID)
+		if outputErr == nil && threadID != "" {
+			addResultData(&output, "threadId", threadID)
+		}
+		return output, outputErr
 	}
 	return e.result(ctx, kind, data, cursor, warnings, mutating, endpointID)
 }
@@ -401,7 +405,11 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 func (e *Executor) resolveThreadTarget(ctx context.Context, inv cli.Invocation) (string, string, string, endpoint.Endpoint, error) {
 	sub := inv.Position[0]
 	if sub == "list" || sub == "start" {
-		return inv.Resolved.Endpoint, inv.Resolved.Endpoint, "", endpoint.Endpoint{}, nil
+		resolved, err := e.resolveEndpointIdentity(inv.Resolved.Endpoint)
+		if err != nil {
+			return "", "", "", endpoint.Endpoint{}, err
+		}
+		return inv.Resolved.Endpoint, resolved.ID, "", resolved, nil
 	}
 	if len(inv.Position) < 2 {
 		return "", "", "", endpoint.Endpoint{}, usage("thread target is required")
@@ -428,6 +436,20 @@ func (e *Executor) resolveThreadTarget(ctx context.Context, inv cli.Invocation) 
 		return "", "", "", endpoint.Endpoint{}, &cli.Error{Code: "invalid_target", Message: "thread target resolver is required for URI targets", Effect: "not_sent", Exit: cli.ExitUsage}
 	}
 	return inv.Resolved.Endpoint, inv.Resolved.Endpoint, selector, endpoint.Endpoint{}, nil
+}
+
+func (e *Executor) resolveEndpointIdentity(selector string) (endpoint.Endpoint, error) {
+	if e.ports.Endpoints == nil {
+		return endpoint.Endpoint{ID: selector, Alias: selector}, nil
+	}
+	resolved, err := e.ports.Endpoints.Show(selector)
+	if err != nil {
+		return endpoint.Endpoint{}, mapError(err, "not_sent")
+	}
+	if resolved.ID == "" {
+		return endpoint.Endpoint{}, &cli.Error{Code: "endpoint_unavailable", Message: "resolved endpoint has no stable ID", Effect: "not_sent", Exit: cli.ExitRejected}
+	}
+	return resolved, nil
 }
 
 func (e *Executor) search(ctx context.Context, inv cli.Invocation) (result cli.ExecutionResult, execErr error) {
@@ -476,7 +498,11 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (result cli.E
 		if receiptErr != nil {
 			return cli.ExecutionResult{}, receiptErr
 		}
-		return e.collectionResultWithReceipt(ctx, "search", "message", data, cursor, warnings, inv.Resolved.Endpoint, receipt)
+		output, outputErr := e.collectionResultWithReceipt(ctx, "search", "message", data, cursor, warnings, inv.Resolved.Endpoint, receipt)
+		if outputErr == nil {
+			addResultData(&output, "threadId", thread)
+		}
+		return output, outputErr
 	}
 	r, callErr := api.Search(ctx, options)
 	if callErr != nil {
@@ -711,6 +737,9 @@ func (e *Executor) rpc(ctx context.Context, inv cli.Invocation) (result cli.Exec
 			return cli.ExecutionResult{}, mapError(err, "not_sent")
 		}
 	}
+	if inv.Resolved.Compact {
+		output.InlineLimit = cli.CompactRPCInlineBytes
+	}
 	grants := make([]rpcmeta.EffectClass, 0, len(inv.Options["allow-effect"]))
 	for _, value := range inv.Options["allow-effect"] {
 		grants = append(grants, rpcmeta.EffectClass(value))
@@ -810,6 +839,11 @@ func (e *Executor) storageResult(ctx context.Context, subcommand string, data an
 
 func (e *Executor) resultEnvelope(ctx context.Context, eventKind, resultKind, field string, data any, cursor string, warnings []string, mutation bool, endpointID, subcommand string, providedReceipt, receiptInput any) (cli.ExecutionResult, error) {
 	payload := map[string]any{"resultKind": resultKind, field: data}
+	if stable := receiptEndpointID(providedReceipt); stable != "" {
+		payload["endpointId"] = stable
+	} else if endpointID != "" {
+		payload["endpointId"] = endpointID
+	}
 	if subcommand != "" {
 		payload["subcommand"] = subcommand
 	}
@@ -856,6 +890,41 @@ func (e *Executor) resultEnvelope(ctx context.Context, eventKind, resultKind, fi
 		result.Receipt = receipt
 	}
 	return result, nil
+}
+
+func addResultData(result *cli.ExecutionResult, key string, value any) {
+	if result == nil || len(result.Events) == 0 || value == nil {
+		return
+	}
+	event, ok := result.Events[0].Machine.(map[string]any)
+	if !ok {
+		return
+	}
+	data, ok := event["data"].(map[string]any)
+	if ok {
+		data[key] = value
+	}
+}
+
+func receiptEndpointID(receipt any) string {
+	if receipt == nil {
+		return ""
+	}
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		return ""
+	}
+	var object map[string]any
+	if json.Unmarshal(encoded, &object) != nil {
+		return ""
+	}
+	for _, side := range []string{"target", "source"} {
+		identity, _ := object[side].(map[string]any)
+		if value, _ := identity["endpointId"].(string); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func responseDataArray(raw json.RawMessage) any {

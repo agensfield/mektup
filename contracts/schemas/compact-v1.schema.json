@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agensfield.dev/mektup/contracts/compact-v1.schema.json",
+  "title": "Mektup v1 compact presentation shapes",
+  "$defs": {
+    "textPreview": {
+      "type": "object",
+      "required": ["text", "sourceChars", "sourceBytes", "chars", "bytes", "truncated"],
+      "properties": {
+        "text": { "type": "string" },
+        "sourceChars": { "type": "integer", "minimum": 0 },
+        "sourceBytes": { "type": "integer", "minimum": 0 },
+        "chars": { "type": "integer", "minimum": 0, "maximum": 512 },
+        "bytes": { "type": "integer", "minimum": 0, "maximum": 2048 },
+        "truncated": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    },
+    "page": {
+      "type": "object",
+      "required": ["count", "requestedLimit", "effectiveLimit", "hasMore", "nextCursor"],
+      "properties": {
+        "count": { "type": "integer", "minimum": 0, "maximum": 25 },
+        "requestedLimit": { "type": ["integer", "null"], "minimum": 0, "maximum": 25 },
+        "effectiveLimit": { "type": "integer", "minimum": 0, "maximum": 25 },
+        "hasMore": { "type": "boolean" },
+        "nextCursor": { "type": ["string", "null"], "minLength": 1 }
+      },
+      "additionalProperties": true
+    }
+  }
+}

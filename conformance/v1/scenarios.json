@@ -1,7 +1,7 @@
 {
   "schema": "mektup/conformance/v1/scenarios",
   "version": "1.0.0",
-  "specVersion": "1.0.7",
+  "specVersion": "1.0.8",
   "source": "acceptance-v1.md",
   "profiles": {
     "plain_accept": {
@@ -131,6 +131,10 @@
     { "id": "read.experimental-search-unavailable", "matrix": "read-search", "profile": "rejected", "observable": ["capability negotiation is explicit", "backend unavailability has precise failure"] },
     { "id": "read.no-title-fallback", "matrix": "read-search", "profile": "read_complete", "observable": ["thread/list.searchTerm is never substituted", "search miss is not identity or delivery evidence"] },
     { "id": "read.exact-reconciliation", "matrix": "read-search", "profile": "read_complete", "observable": ["direct IDs/full items/envelope validation/digest checks", "fuzzy search is not authoritative"] },
+    { "id": "read.compact-implicit-agent-page", "matrix": "read-search", "profile": "read_complete", "observable": ["implicit agent output is compact JSONL", "default page is 10 and maximum is 25", "explicit json preserves the compatible full page"] },
+    { "id": "read.compact-cursor-binding", "matrix": "read-search", "profile": "read_complete", "observable": ["receipt cursors bind store, filters, anchor, and last tuple", "cross-store and cross-query reuse reject before row access", "empty continuable pages retain nextCursor"] },
+    { "id": "read.compact-actionable-preview", "matrix": "read-search", "profile": "read_complete", "observable": ["text preview obeys scalar and UTF-8 byte bounds", "thread, turn, item, receipt, and history locators remain exact", "search offsets retain original basis or are omitted"] },
+    { "id": "read.compact-hard-record-bound", "matrix": "read-search", "profile": "read_complete", "observable": ["every compact record including LF is at most 131072 bytes", "overflow retains complete private artifact or durable receipt locator", "terminal preserves actual effect state and never retries presentation"] },
 
     { "id": "endpoint.built-in-local", "matrix": "endpoint", "profile": "read_complete", "observable": ["no config required", "current Codex home/socket identity selects stable endpoint ID"] },
     { "id": "endpoint.custom-owner-private-config", "matrix": "endpoint", "profile": "read_complete", "observable": ["stable endpoint ID created", "config is owner-private"] },

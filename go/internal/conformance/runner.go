@@ -270,15 +270,18 @@ func validateManifestFixture(f manifestFixture) error {
 		return fmt.Errorf("manifest: fixture %q has unknown expected value %q", f.Path, f.Expect)
 	}
 	want, ok := map[string]string{
-		"envelope-metadata": "Mektup/1",
-		"envelope-rendered": "Mektup/1",
-		"envelope-negative": "Mektup/1",
-		"receipt":           "mektup/receipt/v1",
-		"event":             "mektup/event/v1",
-		"warning":           "mektup/warning/v1",
-		"error":             "mektup/error/v1",
-		"control":           "mektup/control/v1",
-		"control-negative":  "mektup/control/v1",
+		"envelope-metadata":        "Mektup/1",
+		"envelope-rendered":        "Mektup/1",
+		"envelope-negative":        "Mektup/1",
+		"receipt":                  "mektup/receipt/v1",
+		"receipt-summary":          "mektup/receipt-summary/v1",
+		"receipt-summary-negative": "mektup/receipt-summary/v1",
+		"event":                    "mektup/event/v1",
+		"event-negative":           "mektup/event/v1",
+		"warning":                  "mektup/warning/v1",
+		"error":                    "mektup/error/v1",
+		"control":                  "mektup/control/v1",
+		"control-negative":         "mektup/control/v1",
 	}[f.Kind]
 	if !ok {
 		return fmt.Errorf("manifest: fixture %q has unknown kind %q", f.Path, f.Kind)
@@ -311,7 +314,13 @@ func validateFixture(f manifestFixture, data []byte, root string) error {
 		return validateEnvelopeMetadata(data, root)
 	case "receipt":
 		return validateReceiptFixture(data)
+	case "receipt-summary":
+		return validateReceiptSummaryFixture(data)
+	case "receipt-summary-negative":
+		return validateReceiptSummaryFixture(data)
 	case "event":
+		return validateEventFixture(data)
+	case "event-negative":
 		return validateEventFixture(data)
 	case "warning":
 		var warning mektup.Warning
@@ -328,6 +337,33 @@ func validateFixture(f manifestFixture, data []byte, root string) error {
 	default:
 		return fmt.Errorf("unsupported manifest kind %q", f.Kind)
 	}
+}
+
+func validateReceiptSummaryFixture(data []byte) error {
+	var summary struct {
+		Schema            string `json:"schema"`
+		Projection        string `json:"projection"`
+		Canonical         bool   `json:"canonical"`
+		ReceiptID         string `json:"receiptId"`
+		OperationID       string `json:"operationId"`
+		EvidenceCount     int    `json:"evidenceCount"`
+		Evidence          []any  `json:"evidence"`
+		WarningCount      int    `json:"warningCount"`
+		Warnings          []any  `json:"warnings"`
+		EvidenceTruncated bool   `json:"evidenceTruncated"`
+		WarningsTruncated bool   `json:"warningsTruncated"`
+	}
+	if err := json.Unmarshal(data, &summary); err != nil {
+		return err
+	}
+	if summary.Schema != "mektup/receipt-summary/v1" || summary.Projection != "receipt-summary" || summary.Canonical || !strings.HasPrefix(summary.ReceiptID, "rcpt_") || !strings.HasPrefix(summary.OperationID, "op_") {
+		return errors.New("invalid compact receipt summary identity")
+	}
+	if (!summary.EvidenceTruncated && summary.EvidenceCount != len(summary.Evidence)) || summary.EvidenceCount < len(summary.Evidence) ||
+		(!summary.WarningsTruncated && summary.WarningCount != len(summary.Warnings)) || summary.WarningCount < len(summary.Warnings) {
+		return errors.New("compact receipt summary counts do not match projected rows")
+	}
+	return nil
 }
 
 func validateRenderedEnvelope(data []byte) error {
@@ -584,6 +620,57 @@ func validateEventFixture(data []byte) error {
 	}
 	if e.OperationID == "" || e.Sequence == 0 {
 		return errors.New("event identity is incomplete")
+	}
+	var raw struct {
+		Presentation string         `json:"presentation"`
+		Event        string         `json:"event"`
+		Data         map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	if raw.Presentation == "compact" && compactCollectionEvent(raw.Event) {
+		if err := validateCompactPage(raw.Data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func compactCollectionEvent(event string) bool {
+	switch event {
+	case "thread.list.completed", "thread.turns.completed", "thread.items.completed", "search.completed", "receipt.list":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateCompactPage(data map[string]any) error {
+	count, countOK := data["count"].(float64)
+	effective, effectiveOK := data["effectiveLimit"].(float64)
+	hasMore, moreOK := data["hasMore"].(bool)
+	next, nextPresent := data["nextCursor"]
+	if !countOK || count < 0 || count > 25 || count != float64(int(count)) || !effectiveOK || effective < 0 || effective > 25 || effective != float64(int(effective)) || !moreOK || !nextPresent {
+		return errors.New("compact page metadata is incomplete or out of bounds")
+	}
+	if requested, present := data["requestedLimit"]; !present {
+		return errors.New("compact requestedLimit is required")
+	} else if requested != nil {
+		value, ok := requested.(float64)
+		if !ok || value < 0 || value > 25 || value != float64(int(value)) {
+			return errors.New("compact requestedLimit is invalid")
+		}
+	}
+	if next == nil {
+		if hasMore {
+			return errors.New("compact hasMore requires nextCursor")
+		}
+		return nil
+	}
+	cursor, ok := next.(string)
+	if !ok || cursor == "" || !hasMore {
+		return errors.New("compact nextCursor and hasMore disagree")
 	}
 	return nil
 }
@@ -963,11 +1050,11 @@ func validateOriginalStatusResultRunner(result map[string]any) error {
 }
 
 func validateScenarioDocuments(s scenariosDocument, t transitionsDocument) error {
-	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.7" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
+	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.8" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
 		return errors.New("scenarios document metadata is incomplete")
 	}
-	if t.SpecVersion != "1.0.7" {
-		return errors.New("transitions document spec revision is not 1.0.7")
+	if t.SpecVersion != "1.0.8" {
+		return errors.New("transitions document spec revision is not 1.0.8")
 	}
 	states := map[string]bool{"none": true}
 	for _, state := range t.States {

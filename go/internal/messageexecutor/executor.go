@@ -61,6 +61,10 @@ type ReceiptStore interface {
 	Inspect(context.Context, string, receipts.TargetInspector, receipts.InspectOptions) (receipts.InspectResult, error)
 }
 
+type PagedReceiptStore interface {
+	ListPage(context.Context, receipts.ListOptions) (receipts.ListPage, error)
+}
+
 type Ports struct {
 	Service        ServiceFactory
 	Original       OriginalResolverFactory
@@ -477,9 +481,13 @@ func (e *Executor) inspect(ctx context.Context, inv cli.Invocation) (cli.Executi
 	if has(inv, "receipts") {
 		receiptLimit = optionInt(inv, "receipts")
 	}
-	result, err := e.ports.Receipts.Inspect(ctx, inv.Position[0], inspector, receipts.InspectOptions{ReceiptLimit: receiptLimit, Blockers: has(inv, "blockers")})
+	result, err := e.ports.Receipts.Inspect(ctx, inv.Position[0], inspector, receipts.InspectOptions{ReceiptLimit: receiptLimit, ReceiptCursor: inv.Option("receipts-cursor"), Blockers: has(inv, "blockers")})
 	if err != nil {
 		return cli.ExecutionResult{}, mapError(err)
+	}
+	data := map[string]any{"target": result.Target, "receipts": result.Receipts, "blockers": result.Blockers}
+	if result.ReceiptsNextCursor != "" {
+		data["receiptsNextCursor"] = result.ReceiptsNextCursor
 	}
 	return cli.ExecutionResult{Events: []cli.OutputEvent{{
 		Machine: map[string]any{
@@ -487,7 +495,7 @@ func (e *Executor) inspect(ctx context.Context, inv cli.Invocation) (cli.Executi
 			"event":    "inspect.completed",
 			"terminal": true,
 			"ok":       true,
-			"data":     map[string]any{"target": result.Target, "receipts": result.Receipts, "blockers": result.Blockers},
+			"data":     data,
 		},
 		Human: humanInspect(result),
 	}}}, nil
@@ -504,9 +512,25 @@ func (e *Executor) receipt(ctx context.Context, inv cli.Invocation) (cli.Executi
 		if sinceErr != nil {
 			return cli.ExecutionResult{}, sinceErr
 		}
-		items, err := e.ports.Receipts.List(ctx, receipts.ListOptions{State: mektup.EvidenceState(inv.Option("state")), Since: since, Limit: optionInt(inv, "limit")})
+		options := receipts.ListOptions{State: mektup.EvidenceState(inv.Option("state")), Since: since, Limit: optionInt(inv, "limit"), Cursor: inv.Option("cursor")}
+		var items []mektup.Receipt
+		var nextCursor string
+		var err error
+		if paged, ok := e.ports.Receipts.(PagedReceiptStore); ok {
+			page, pageErr := paged.ListPage(ctx, options)
+			items, nextCursor, err = page.Receipts, page.NextCursor, pageErr
+		} else {
+			if options.Cursor != "" {
+				return cli.ExecutionResult{}, cliErr("invalid_arguments", "receipt cursor is not supported by this receipt store", "not_sent", cli.ExitUsage)
+			}
+			items, err = e.ports.Receipts.List(ctx, options)
+		}
 		if err != nil {
 			return cli.ExecutionResult{}, mapError(err)
+		}
+		data := map[string]any{"receipts": items}
+		if nextCursor != "" {
+			data["nextCursor"] = nextCursor
 		}
 		return cli.ExecutionResult{Events: []cli.OutputEvent{{
 			Machine: map[string]any{
@@ -514,7 +538,7 @@ func (e *Executor) receipt(ctx context.Context, inv cli.Invocation) (cli.Executi
 				"event":    "receipt.list",
 				"terminal": true,
 				"ok":       true,
-				"data":     map[string]any{"receipts": items},
+				"data":     data,
 			},
 			Human: humanReceiptList(items),
 		}}}, nil

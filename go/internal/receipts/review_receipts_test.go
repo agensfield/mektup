@@ -150,6 +150,34 @@ func TestInspectZeroReceiptLimitIsIdentityOnly(t *testing.T) {
 	}
 }
 
+func TestInspectReceiptCursorIsBoundToResolvedTarget(t *testing.T) {
+	store, _ := openStore(t)
+	identity := TargetIdentity{EndpointID: mektup.NewEndpointID(), ThreadID: "target-thread"}
+	base := time.Date(2026, 9, 17, 9, 0, 0, 0, time.UTC)
+	for i := 0; i < 3; i++ {
+		receipt := testReceipt(t, mektup.StateAccepted)
+		receipt.Target.EndpointID, receipt.Target.ThreadID = identity.EndpointID, identity.ThreadID
+		stamp := base.Add(time.Duration(i) * time.Second).Format(time.RFC3339Nano)
+		receipt.CreatedAt, receipt.UpdatedAt, receipt.Evidence[0].At = stamp, stamp, stamp
+		if err := store.Save(context.Background(), receipt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inspector := reviewInspector{identity: identity}
+	first, err := store.Inspect(context.Background(), "target", inspector, InspectOptions{ReceiptLimit: 1})
+	if err != nil || len(first.Receipts) != 1 || first.ReceiptsNextCursor == "" {
+		t.Fatalf("first inspect page=%#v err=%v", first, err)
+	}
+	second, err := store.Inspect(context.Background(), "target", inspector, InspectOptions{ReceiptLimit: 1, ReceiptCursor: first.ReceiptsNextCursor})
+	if err != nil || len(second.Receipts) != 1 || second.Receipts[0].ReceiptID == first.Receipts[0].ReceiptID {
+		t.Fatalf("second inspect page=%#v err=%v", second, err)
+	}
+	other := reviewInspector{identity: TargetIdentity{EndpointID: mektup.NewEndpointID(), ThreadID: "other"}}
+	if _, err := store.Inspect(context.Background(), "other", other, InspectOptions{ReceiptLimit: 1, ReceiptCursor: first.ReceiptsNextCursor}); !errors.Is(err, ErrInvalidArguments) {
+		t.Fatalf("cross-target inspect cursor error=%v", err)
+	}
+}
+
 func TestReceiptRetentionPreservesUnansweredFamily(t *testing.T) {
 	store, j := openStore(t)
 	receipt := testReceipt(t, mektup.StateAccepted)
