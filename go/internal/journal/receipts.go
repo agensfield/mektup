@@ -33,15 +33,10 @@ type ReceiptQuery struct {
 	BeforeAt   time.Time
 	BeforeID   string
 	Limit      int
-	FetchExtra bool
 }
 
 func (q ReceiptQuery) limit() (int, error) {
-	max := MaxReceiptQueryLimit
-	if q.FetchExtra {
-		max++
-	}
-	if q.Limit < 0 || q.Limit > max {
+	if q.Limit < 0 || q.Limit > MaxReceiptQueryLimit {
 		return 0, fmt.Errorf("journal: receipt limit must be between 0 and %d", MaxReceiptQueryLimit)
 	}
 	if q.Limit == 0 {
@@ -248,11 +243,49 @@ func (j *Journal) ListReceipts(ctx context.Context, query ReceiptQuery) ([]mektu
 	if err != nil {
 		return nil, err
 	}
+	where, args, err := receiptPredicates(query)
+	if err != nil {
+		return nil, err
+	}
+	args = append(args, limit)
+	rows, err := j.db.QueryContext(ctx, `SELECT document FROM receipts WHERE `+strings.Join(where, " AND ")+` ORDER BY created_at DESC, receipt_id DESC LIMIT ?`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []mektup.Receipt
+	for rows.Next() {
+		var document string
+		if err := rows.Scan(&document); err != nil {
+			return nil, err
+		}
+		receipt, err := parseStoredReceipt(document)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, receipt)
+	}
+	return out, rows.Err()
+}
+
+// HasReceiptAfter checks continuation without fetching and discarding a row
+// beyond the caller's exact page limit.
+func (j *Journal) HasReceiptAfter(ctx context.Context, query ReceiptQuery) (bool, error) {
+	where, args, err := receiptPredicates(query)
+	if err != nil {
+		return false, err
+	}
+	var exists int
+	err = j.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM receipts WHERE `+strings.Join(where, " AND ")+`)`, args...).Scan(&exists)
+	return exists != 0, err
+}
+
+func receiptPredicates(query ReceiptQuery) ([]string, []any, error) {
 	where := []string{"1=1"}
-	args := make([]any, 0, 3)
+	args := make([]any, 0, 12)
 	if query.State != "" {
 		if !query.State.Valid() {
-			return nil, fmt.Errorf("journal: invalid receipt state %q", query.State)
+			return nil, nil, fmt.Errorf("journal: invalid receipt state %q", query.State)
 		}
 		where = append(where, "state=?")
 		args = append(args, string(query.State))
@@ -281,25 +314,7 @@ func (j *Journal) ListReceipts(ctx context.Context, query ReceiptQuery) ([]mektu
 		before := query.BeforeAt.UTC().UnixNano()
 		args = append(args, before, before, query.BeforeID)
 	}
-	args = append(args, limit)
-	rows, err := j.db.QueryContext(ctx, `SELECT document FROM receipts WHERE `+strings.Join(where, " AND ")+` ORDER BY created_at DESC, receipt_id DESC LIMIT ?`, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []mektup.Receipt
-	for rows.Next() {
-		var document string
-		if err := rows.Scan(&document); err != nil {
-			return nil, err
-		}
-		receipt, err := parseStoredReceipt(document)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, receipt)
-	}
-	return out, rows.Err()
+	return where, args, nil
 }
 
 func parseReceiptTime(value string) (time.Time, error) {

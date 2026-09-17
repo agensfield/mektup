@@ -3,9 +3,13 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/agensfield/mektup/go/internal/journal"
 )
 
 type compactTestExecutor struct {
@@ -14,6 +18,23 @@ type compactTestExecutor struct {
 	retained  []byte
 	retainErr error
 	seen      Invocation
+	artifact  *CompactArtifact
+}
+
+type compactStreamExecutor struct {
+	compactTestExecutor
+	chunks  []ExecutionResult
+	emitted int
+}
+
+func (e *compactStreamExecutor) ExecuteStream(_ context.Context, _ Invocation, emit func(ExecutionResult) error) error {
+	for _, chunk := range e.chunks {
+		e.emitted++
+		if err := emit(chunk); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (e *compactTestExecutor) Execute(_ context.Context, inv Invocation) (ExecutionResult, error) {
@@ -26,7 +47,11 @@ func (e *compactTestExecutor) RetainCompact(_ context.Context, _ Invocation, doc
 	if e.retainErr != nil {
 		return CompactArtifact{}, e.retainErr
 	}
-	return CompactArtifact{Path: "compact-output-test.jsonl", Bytes: int64(len(document)), SHA256: "sha256:" + strings.Repeat("a", 64)}, nil
+	if e.artifact != nil {
+		return *e.artifact, nil
+	}
+	digest := sha256.Sum256(document)
+	return CompactArtifact{Path: "compact-output-test.jsonl", Bytes: int64(len(document)), SHA256: "sha256:" + hex.EncodeToString(digest[:])}, nil
 }
 
 func TestImplicitAgentCompactUsesBoundedActionablePage(t *testing.T) {
@@ -96,6 +121,26 @@ func TestCompactOverflowRetainsCompleteRecordAndEmitsBoundedTruth(t *testing.T) 
 	}
 }
 
+func TestCompactOverflowRejectsFalseArtifactReceipt(t *testing.T) {
+	huge := strings.Repeat("x", CompactMaxOutputBytes+4096)
+	invalid := CompactArtifact{Path: "claimed.jsonl", Bytes: 1, SHA256: "sha256:" + strings.Repeat("0", 64)}
+	executor := &compactTestExecutor{artifact: &invalid, result: ExecutionResult{Events: []OutputEvent{{Machine: map[string]any{
+		"event": "endpoint.list.completed", "terminal": true, "ok": true,
+		"data": map[string]any{"resultKind": "endpoint", "data": []any{map[string]any{"id": "ep_test", "unbounded": huge}}},
+	}}}}}
+	var out bytes.Buffer
+	app := &App{Out: &out, Err: &bytes.Buffer{}, Env: []string{"MEKTUP_AGENT=1"}, Executor: executor}
+	if code := app.Run([]string{"endpoint", "list"}); code != int(ExitIncomplete) {
+		t.Fatalf("code=%d", code)
+	}
+	if bytes.Contains(out.Bytes(), []byte("claimed.jsonl")) {
+		t.Fatalf("false artifact was advertised: %s", out.String())
+	}
+	if !bytes.Contains(out.Bytes(), []byte("retentionFailure")) {
+		t.Fatalf("retention failure missing: %s", out.String())
+	}
+}
+
 func TestExplicitJSONPreservesFullPageAndNoCompactMarker(t *testing.T) {
 	executor := &compactTestExecutor{result: ExecutionResult{Events: []OutputEvent{{Machine: map[string]any{
 		"event": "thread.list.completed", "terminal": true, "ok": true,
@@ -116,6 +161,21 @@ func TestExplicitJSONPreservesFullPageAndNoCompactMarker(t *testing.T) {
 	row := event["data"].(map[string]any)["data"].([]any)[0].(map[string]any)
 	if row["name"] != "full" {
 		t.Fatalf("full row=%#v", row)
+	}
+}
+
+func TestExplicitJSONMayExceedCompactBoundWithoutProjection(t *testing.T) {
+	huge := strings.Repeat("x", CompactMaxOutputBytes+4096)
+	executor := &compactTestExecutor{result: ExecutionResult{Events: []OutputEvent{{Machine: map[string]any{
+		"event": "rpc.completed", "terminal": true, "ok": true, "data": map[string]any{"result": huge},
+	}}}}}
+	var out bytes.Buffer
+	app := &App{Out: &out, Err: &bytes.Buffer{}, Env: []string{"CODEX_THREAD_ID=source"}, Executor: executor}
+	if code := app.Run([]string{"--json", "rpc", "thread/read"}); code != int(ExitSuccess) {
+		t.Fatalf("code=%d", code)
+	}
+	if out.Len() <= CompactMaxOutputBytes || !bytes.Contains(out.Bytes(), []byte(huge)) || len(executor.retained) != 0 {
+		t.Fatalf("explicit full output was projected or retained: bytes=%d retained=%d", out.Len(), len(executor.retained))
 	}
 }
 
@@ -219,7 +279,7 @@ func TestCompactPreviewAndScopedSearchLocatorPreserveOriginalBasis(t *testing.T)
 	})
 	row := event["data"].(map[string]any)["data"].([]any)[0].(map[string]any)
 	locator := row["historyLocator"].(map[string]any)
-	if locator["endpointId"] != "ep_stable" || locator["threadId"] != "thread-1" || locator["turnId"] != "turn-1" || locator["itemId"] != "item-1" || row["rangeBasis"] != "original-utf16" || row["snippetMatchRangeOriginal"] == nil {
+	if locator["endpointId"] != "ep_stable" || locator["threadId"] != "thread-1" || locator["turnId"] != "turn-1" || locator["itemId"] != "item-1" || row["rangeBasis"] != "original-utf16" || row["snippetMatchRange"] == nil {
 		t.Fatalf("scoped row=%#v", row)
 	}
 }
@@ -247,5 +307,111 @@ func TestCompactErrorRetainsTruncatedDetailsWithoutChangingUsageExit(t *testing.
 	preview := details["cause"].(map[string]any)
 	if preview["truncated"] != true || preview["sourceChars"].(float64) <= preview["chars"].(float64) {
 		t.Fatalf("detail preview=%#v", preview)
+	}
+}
+
+func TestCompactLongPrimaryErrorIsRetained(t *testing.T) {
+	huge := strings.Repeat("x", 3000) + "IMPORTANT END"
+	executor := &compactTestExecutor{err: &Error{Code: "endpoint_unavailable", Message: huge, Effect: "not_sent", Exit: ExitRejected}}
+	var out bytes.Buffer
+	app := &App{Out: &out, Err: &bytes.Buffer{}, Env: []string{"MEKTUP_AGENT=1"}, Executor: executor}
+	if code := app.Run([]string{"thread", "list"}); code != int(ExitRejected) {
+		t.Fatalf("code=%d", code)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("IMPORTANT END")) && !bytes.Contains(executor.retained, []byte("IMPORTANT END")) {
+		t.Fatalf("primary error evidence lost: %s", out.String())
+	}
+}
+
+func TestCompactRetainedRecordKeepsExactJSONNumbers(t *testing.T) {
+	executor := &compactTestExecutor{result: ExecutionResult{Events: []OutputEvent{{Machine: map[string]any{
+		"event": "rpc.completed", "ok": true, "terminal": true,
+		"data": map[string]any{"result": map[string]any{"n": json.Number("9007199254740993"), "text": strings.Repeat("x", CompactMaxOutputBytes)}},
+	}}}}}
+	app := &App{Out: &bytes.Buffer{}, Err: &bytes.Buffer{}, Env: []string{"MEKTUP_AGENT=1"}, Executor: executor}
+	_ = app.Run([]string{"rpc", "thread/read"})
+	if !bytes.Contains(executor.retained, []byte("9007199254740993")) || bytes.Contains(executor.retained, []byte("9007199254740992")) {
+		t.Fatalf("retained exact JSON number changed: %s", executor.retained)
+	}
+}
+
+func TestCompactDecodeFailureKeepsAcceptedReceiptLocator(t *testing.T) {
+	executor := &compactTestExecutor{result: ExecutionResult{
+		Receipt: map[string]any{"receiptId": "rcpt_01999999-9999-7999-8999-999999999999", "operationId": "op_01999999-9999-7999-8999-999999999999", "state": "accepted"},
+		Events:  []OutputEvent{{Machine: map[string]any{"event": "send.accepted", "ok": true, "terminal": true, "data": map[string]any{"bad": "\xff"}}}},
+	}}
+	var out bytes.Buffer
+	app := &App{Out: &out, Err: &bytes.Buffer{}, Env: []string{"MEKTUP_AGENT=1"}, Executor: executor}
+	if code := app.Run([]string{"send", "target", "hello"}); code != int(ExitIncomplete) {
+		t.Fatalf("code=%d", code)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("rcpt_01999999")) {
+		t.Fatalf("receipt locator missing: %s", out.String())
+	}
+}
+
+func TestCompactRawInvalidUTF8IsRejectedBeforeJSONReplacement(t *testing.T) {
+	executor := &compactTestExecutor{result: ExecutionResult{Events: []OutputEvent{{Machine: map[string]any{
+		"event": "thread.list.completed", "ok": true, "terminal": true,
+		"data": map[string]any{"data": json.RawMessage("[{\"id\":\"thr\",\"name\":\"\xff\"}]")},
+	}}}}}
+	var out bytes.Buffer
+	app := &App{Out: &out, Err: &bytes.Buffer{}, Env: []string{"MEKTUP_AGENT=1"}, Executor: executor}
+	if code := app.Run([]string{"thread", "list"}); code != int(ExitIncomplete) || !bytes.Contains(out.Bytes(), []byte("invalid_utf8")) || bytes.Contains(out.Bytes(), []byte("\\ufffd")) {
+		t.Fatalf("code=%d output=%s", code, out.String())
+	}
+}
+
+func TestCompactTypedInvalidUTF8IsRejectedBeforeJSONReplacement(t *testing.T) {
+	type typedRow struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}
+	executor := &compactTestExecutor{result: ExecutionResult{Events: []OutputEvent{{Machine: map[string]any{
+		"event": "thread.list.completed", "ok": true, "terminal": true,
+		"data": map[string]any{"data": []typedRow{{ID: "thr", Name: string([]byte{0xff})}}},
+	}}}}}
+	var out bytes.Buffer
+	app := &App{Out: &out, Err: &bytes.Buffer{}, Env: []string{"MEKTUP_AGENT=1"}, Executor: executor}
+	if code := app.Run([]string{"thread", "list"}); code != int(ExitIncomplete) || !bytes.Contains(out.Bytes(), []byte("invalid_utf8")) || bytes.Contains(out.Bytes(), []byte("\\ufffd")) {
+		t.Fatalf("code=%d output=%s", code, out.String())
+	}
+}
+
+func TestCompactLoadedIDAndTypedBlockerRemainActionable(t *testing.T) {
+	thread := objectMap(compactThreadAt("01999999-9999-7999-8999-999999999999", "ep_known"))
+	if thread["id"] != "01999999-9999-7999-8999-999999999999" || thread["uri"] != "codex://ep_known/thread/01999999-9999-7999-8999-999999999999" {
+		t.Fatalf("loaded thread=%#v", thread)
+	}
+	blocker := objectMap(compactBlocker(journal.Blocker{Method: "item/tool/requestUserInput", CorrelationID: "42", ThreadID: "thr", Generation: "gen"}))
+	if blocker["method"] != "item/tool/requestUserInput" || blocker["correlationId"] != "42" || blocker["threadId"] != "thr" || blocker["generation"] != "gen" {
+		t.Fatalf("blocker=%#v", blocker)
+	}
+}
+
+func TestCompactStreamingOverflowEmitsOneTerminalAfterPriorAcceptance(t *testing.T) {
+	stream := &compactStreamExecutor{chunks: []ExecutionResult{
+		{Events: []OutputEvent{{Machine: map[string]any{"event": "send.accepted", "terminal": false, "ok": true, "data": map[string]any{}}}}, Streaming: true},
+		{Events: []OutputEvent{{Machine: map[string]any{"event": "reply.accepted", "terminal": true, "ok": true, "data": map[string]any{"unbounded": strings.Repeat("x", CompactMaxOutputBytes+4096)}}}}, Streaming: true},
+		{Events: []OutputEvent{{Machine: map[string]any{"event": "late", "terminal": true, "ok": true}}}, Streaming: true},
+	}}
+	var out bytes.Buffer
+	app := &App{Out: &out, Err: &bytes.Buffer{}, Env: []string{"MEKTUP_AGENT=1"}, Executor: stream}
+	if code := app.Run([]string{"send", "target", "hello", "--wait"}); code != int(ExitIncomplete) {
+		t.Fatalf("code=%d output=%s", code, out.String())
+	}
+	if stream.emitted != 2 {
+		t.Fatalf("stream continued after fallback terminal: emitted=%d", stream.emitted)
+	}
+	lines := bytes.Split(bytes.TrimSpace(out.Bytes()), []byte{'\n'})
+	if len(lines) != 2 {
+		t.Fatalf("lines=%d output=%s", len(lines), out.String())
+	}
+	var first, second map[string]any
+	if json.Unmarshal(lines[0], &first) != nil || json.Unmarshal(lines[1], &second) != nil {
+		t.Fatal("invalid JSONL")
+	}
+	if first["terminal"] != false || second["terminal"] != true || second["event"] != "compact_output_too_large" || first["operationId"] != second["operationId"] || first["sequence"] != float64(1) || second["sequence"] != float64(2) {
+		t.Fatalf("stream events=%#v %#v", first, second)
 	}
 }

@@ -83,6 +83,8 @@ for data in "$fixture_dir"/*.invalid.json; do
 	case "$(basename "$data")" in
 		control-*.invalid.json) schema="$schema_dir/control-v1.schema.json" ;;
 		envelope-*.invalid.json) schema="$schema_dir/mektup-envelope-v1.schema.json" ;;
+		event-*.invalid.json) schema="$schema_dir/event-v1.schema.json" ;;
+		receipt-summary-*.invalid.json) schema="$schema_dir/receipt-summary-v1.schema.json" ;;
 		receipt-*.json) schema="$schema_dir/receipt-v1.schema.json" ;;
 		*)
 			printf 'no schema mapping for negative fixture: %s\n' "$data" >&2

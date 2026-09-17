@@ -220,6 +220,11 @@ func compactThread(value any) any {
 }
 
 func compactThreadAt(value any, endpointID string) any {
+	if id, ok := value.(string); ok {
+		out := map[string]any{"id": id}
+		addThreadLocator(out, endpointID, id)
+		return out
+	}
 	in := objectMap(value)
 	out := pick(in, "id", "status", "model", "createdAt", "updatedAt", "cwd", "source", "projectId", "parentThreadId", "ancestorThreadId", "ephemeral", "archived")
 	addThreadLocator(out, endpointID, stringValue(in["id"]))
@@ -287,7 +292,7 @@ func compactOccurrenceAt(value any, endpointID, threadID string) any {
 	out := pick(in, "turnId", "itemId", "turnCursor")
 	out["snippet"] = previewValue(in["snippet"])
 	if matchRange, ok := in["snippetMatchRange"]; ok && matchRange != nil {
-		out["snippetMatchRangeOriginal"] = matchRange
+		out["snippetMatchRange"] = matchRange
 		out["rangeBasis"] = "original-utf16"
 	}
 	addHistoryLocator(out, endpointID, threadID, stringValue(in["turnId"]), stringValue(in["itemId"]))
@@ -425,7 +430,18 @@ func compactIdentity(value any) any {
 
 func compactBlocker(value any) any {
 	in := objectMap(value)
-	return pick(in, "method", "correlationId", "generation", "firstSeen", "lastSeen", "resolvedAt", "endpointId", "threadId", "turnId", "itemId", "operationId", "messageId")
+	out := map[string]any{}
+	for _, pair := range [][2]string{
+		{"method", "Method"}, {"correlationId", "CorrelationID"}, {"generation", "Generation"},
+		{"firstSeen", "FirstSeen"}, {"lastSeen", "LastSeen"}, {"resolvedAt", "ResolvedAt"},
+		{"endpointId", "EndpointID"}, {"threadId", "ThreadID"}, {"turnId", "TurnID"},
+		{"itemId", "ItemID"}, {"operationId", "OperationID"}, {"messageId", "MessageID"},
+	} {
+		if raw := firstPresent(in, pair[0], pair[1]); raw != nil {
+			out[pair[0]] = raw
+		}
+	}
+	return out
 }
 
 func compactWarning(value any) any {
@@ -523,8 +539,8 @@ func objectMap(value any) map[string]any {
 	if err != nil {
 		return map[string]any{}
 	}
-	var out map[string]any
-	if json.Unmarshal(encoded, &out) != nil {
+	out, err := decodeExactObject(encoded)
+	if err != nil {
 		return map[string]any{}
 	}
 	return out
@@ -538,8 +554,10 @@ func anySlice(value any) []any {
 	if err != nil {
 		return nil
 	}
+	decoder := json.NewDecoder(strings.NewReader(string(encoded)))
+	decoder.UseNumber()
 	var out []any
-	if json.Unmarshal(encoded, &out) != nil {
+	if decoder.Decode(&out) != nil {
 		return nil
 	}
 	return out

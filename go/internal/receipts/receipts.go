@@ -106,6 +106,9 @@ type receiptCursor struct {
 }
 
 type storeIdentity interface{ StoreID() string }
+type receiptContinuation interface {
+	HasReceiptAfter(context.Context, journal.ReceiptQuery) (bool, error)
+}
 
 func (s Store) List(ctx context.Context, options ListOptions) ([]mektup.Receipt, error) {
 	if err := s.valid(); err != nil {
@@ -140,8 +143,7 @@ func (s Store) ListPage(ctx context.Context, options ListOptions) (ListPage, err
 	if !ok || identity.StoreID() == "" {
 		return ListPage{}, fmt.Errorf("%w: receipt store identity is unavailable", ErrInvalidArguments)
 	}
-	queryLimit := limit + 1
-	query := journal.ReceiptQuery{State: options.State, Since: options.Since, EndpointID: options.EndpointID, ThreadID: options.ThreadID, Limit: queryLimit, FetchExtra: true}
+	query := journal.ReceiptQuery{State: options.State, Since: options.Since, EndpointID: options.EndpointID, ThreadID: options.ThreadID, Limit: limit}
 	var cursor receiptCursor
 	if options.Cursor != "" {
 		cursor, err = decodeReceiptCursor(options.Cursor)
@@ -155,9 +157,22 @@ func (s Store) ListPage(ctx context.Context, options ListOptions) (ListPage, err
 	if err != nil {
 		return ListPage{}, err
 	}
-	hasMore := len(items) > limit
-	if hasMore {
-		items = items[:limit]
+	hasMore := false
+	if len(items) == limit && len(items) != 0 {
+		lastAt, parseErr := receiptCreatedAt(items[len(items)-1].CreatedAt)
+		if parseErr != nil {
+			return ListPage{}, parseErr
+		}
+		continuation, ok := s.Journal.(receiptContinuation)
+		if !ok {
+			return ListPage{}, fmt.Errorf("%w: receipt continuation query is unavailable", ErrInvalidArguments)
+		}
+		probe := query
+		probe.BeforeAt, probe.BeforeID = lastAt, items[len(items)-1].ReceiptID
+		hasMore, err = continuation.HasReceiptAfter(ctx, probe)
+		if err != nil {
+			return ListPage{}, err
+		}
 	}
 	page := ListPage{Receipts: items}
 	if !hasMore || len(items) == 0 {

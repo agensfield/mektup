@@ -17,7 +17,7 @@ func TestRunFromRepositoryAndEmitDeterministicEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(summary.Fixtures) != 83 || len(summary.Scenarios) != 130 {
+	if len(summary.Fixtures) != 85 || len(summary.Scenarios) != 130 {
 		t.Fatalf("unexpected coverage: fixtures=%d scenarios=%d", len(summary.Fixtures), len(summary.Scenarios))
 	}
 	seen := make(map[string]bool, len(summary.Scenarios))

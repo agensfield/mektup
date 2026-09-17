@@ -16,9 +16,11 @@
     "target": { "type": "object" },
     "message": { "type": "object" },
     "evidenceCount": { "type": "integer", "minimum": 0 },
-    "evidence": { "type": "array" },
+    "evidence": { "type": "array", "maxItems": 25 },
+    "evidenceTruncated": { "type": "boolean" },
     "warningCount": { "type": "integer", "minimum": 0 },
-    "warnings": { "type": "array" }
+    "warnings": { "type": "array", "maxItems": 25 },
+    "warningsTruncated": { "type": "boolean" }
   },
   "additionalProperties": true
 }

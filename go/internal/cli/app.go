@@ -5,8 +5,10 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +16,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -799,8 +802,8 @@ func (a *App) lifecycleEventsState(inv Invocation, result ExecutionResult, state
 		if err != nil {
 			return nil, fmt.Errorf("invalid executor lifecycle event: %w", err)
 		}
-		var event map[string]any
-		if err := json.Unmarshal(encoded, &event); err != nil {
+		event, err := decodeExactObject(encoded)
+		if err != nil {
 			return nil, fmt.Errorf("invalid executor lifecycle event: %w", err)
 		}
 		events = append(events, event)
@@ -1045,23 +1048,71 @@ func (a *App) writeEvent(inv Invocation, e *Error) int {
 }
 
 func containsInvalidUTF8(value any) bool {
-	switch typed := value.(type) {
-	case string:
-		return !utf8.ValidString(typed)
-	case map[string]any:
-		for key, child := range typed {
-			if !utf8.ValidString(key) || containsInvalidUTF8(child) {
+	return containsInvalidUTF8Value(reflect.ValueOf(value), make(map[uintptr]bool), 0)
+}
+
+func containsInvalidUTF8Value(value reflect.Value, seen map[uintptr]bool, depth int) bool {
+	if !value.IsValid() || depth > 64 {
+		return false
+	}
+	if value.Kind() == reflect.Interface {
+		if value.IsNil() {
+			return false
+		}
+		return containsInvalidUTF8Value(value.Elem(), seen, depth+1)
+	}
+	if value.Kind() == reflect.Pointer {
+		if value.IsNil() {
+			return false
+		}
+		ptr := value.Pointer()
+		if seen[ptr] {
+			return false
+		}
+		seen[ptr] = true
+		return containsInvalidUTF8Value(value.Elem(), seen, depth+1)
+	}
+	if value.Type() == reflect.TypeOf(json.RawMessage{}) {
+		return !utf8.Valid(value.Bytes())
+	}
+	switch value.Kind() {
+	case reflect.String:
+		return !utf8.ValidString(value.String())
+	case reflect.Map:
+		iter := value.MapRange()
+		for iter.Next() {
+			if containsInvalidUTF8Value(iter.Key(), seen, depth+1) || containsInvalidUTF8Value(iter.Value(), seen, depth+1) {
 				return true
 			}
 		}
-	case []any:
-		for _, child := range typed {
-			if containsInvalidUTF8(child) {
+	case reflect.Slice, reflect.Array:
+		if value.Type().Elem().Kind() == reflect.Uint8 {
+			return false // Byte blobs are not textual previews; RawMessage was handled above.
+		}
+		for i := 0; i < value.Len(); i++ {
+			if containsInvalidUTF8Value(value.Index(i), seen, depth+1) {
+				return true
+			}
+		}
+	case reflect.Struct:
+		for i := 0; i < value.NumField(); i++ {
+			field := value.Field(i)
+			if field.CanInterface() && containsInvalidUTF8Value(field, seen, depth+1) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func decodeExactObject(document []byte) (map[string]any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(document))
+	decoder.UseNumber()
+	var value map[string]any
+	if err := decoder.Decode(&value); err != nil {
+		return nil, err
+	}
+	return value, nil
 }
 
 func compactDecodeFailureEvent(original map[string]any) map[string]any {
@@ -1071,9 +1122,13 @@ func compactDecodeFailureEvent(original map[string]any) map[string]any {
 	event["ok"] = false
 	event["presentation"] = "compact"
 	event["warnings"] = []any{}
+	details := map[string]any{"guidance": []string{"use --json for exact machine diagnostics"}}
+	if receipt := compactReceiptLocator(original); len(receipt) != 0 {
+		details["receipt"] = receipt
+	}
 	event["data"] = map[string]any{"error": map[string]any{
 		"code": "invalid_utf8", "message": "compact textual input contains invalid UTF-8", "messagePreview": previewValue("compact textual input contains invalid UTF-8"), "retryable": false,
-		"effectState": compactEffectState(original), "details": map[string]any{"guidance": []string{"use --json for exact machine diagnostics"}},
+		"effectState": compactEffectState(original), "details": details,
 	}}
 	return event
 }
@@ -1133,8 +1188,8 @@ func cloneEvent(event map[string]any) map[string]any {
 	if err != nil {
 		return event
 	}
-	var cloned map[string]any
-	if json.Unmarshal(document, &cloned) != nil {
+	cloned, decodeErr := decodeExactObject(document)
+	if decodeErr != nil {
 		return event
 	}
 	return cloned
@@ -1155,10 +1210,14 @@ func (a *App) writeProjectedEvent(inv Invocation, event, fullEvent map[string]an
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			artifact, err := retainer.RetainCompact(ctx, inv, append(fullDocument, '\n'))
 			cancel()
-			if err == nil {
+			if err == nil && validCompactArtifact(artifact, append(fullDocument, '\n')) {
 				retained = &artifact
 			} else {
-				retainErr = err
+				if err != nil {
+					retainErr = err
+				} else {
+					retainErr = errors.New("compact artifact retention returned an invalid receipt")
+				}
 			}
 		} else {
 			retainErr = errors.New("compact artifact retention is unavailable")
@@ -1183,12 +1242,20 @@ func (a *App) writeProjectedEvent(inv Invocation, event, fullEvent map[string]an
 	retain()
 	fallback := compactOverflowEvent(event, retained, marshalErr, retainErr)
 	if compactEncodedSize(fallback) > CompactMaxOutputBytes {
-		fallback = minimalCompactOverflowEvent(event, retained != nil)
+		fallback = minimalCompactOverflowEvent(event, retained)
 	}
 	if status := a.writeJSON(fallback); status != int(ExitSuccess) {
 		return status
 	}
 	return compactOverflowExit(event)
+}
+
+func validCompactArtifact(artifact CompactArtifact, document []byte) bool {
+	if strings.TrimSpace(artifact.Path) == "" || artifact.Bytes != int64(len(document)) {
+		return false
+	}
+	digest := sha256.Sum256(document)
+	return artifact.SHA256 == "sha256:"+hex.EncodeToString(digest[:])
 }
 
 func compactOverflowExit(event map[string]any) int {
@@ -1213,6 +1280,9 @@ func compactDetailsNeedRetention(event map[string]any) bool {
 	}
 	data := objectMap(event["data"])
 	errorData := objectMap(data["error"])
+	if objectMap(errorData["messagePreview"])["truncated"] == true {
+		return true
+	}
 	return containsTruncatedPreview(errorData["details"])
 }
 
@@ -1245,10 +1315,13 @@ func compactOverflowEvent(original map[string]any, artifact *CompactArtifact, ma
 	fallback["presentation"] = "compact"
 	fallback["warnings"] = []any{}
 	effect := compactEffectState(original)
-	details := map[string]any{
-		"guidance": []string{"rerun with --json", "use a smaller limit", "use the exact content or artifact command"},
+	receipt := compactReceiptLocator(original)
+	guidance := []string{"rerun this read with --json or a smaller limit", "use the exact content or artifact command"}
+	if len(receipt) != 0 {
+		guidance = []string{"retrieve the accepted operation with receipt show --json", "use the retained artifact or exact content command; do not rerun the mutation"}
 	}
-	if receipt := compactReceiptLocator(original); len(receipt) != 0 {
+	details := map[string]any{"guidance": guidance}
+	if len(receipt) != 0 {
 		details["receipt"] = receipt
 	}
 	if artifact != nil {
@@ -1268,16 +1341,25 @@ func compactOverflowEvent(original map[string]any, artifact *CompactArtifact, ma
 	return fallback
 }
 
-func minimalCompactOverflowEvent(original map[string]any, artifactRetained bool) map[string]any {
+func minimalCompactOverflowEvent(original map[string]any, artifact *CompactArtifact) map[string]any {
 	fallback := pick(original, "schema", "eventId", "sequence", "operationId", "timestamp")
 	fallback["event"] = "compact_output_too_large"
 	fallback["terminal"] = true
 	fallback["ok"] = false
 	fallback["presentation"] = "compact"
 	fallback["warnings"] = []any{}
+	details := map[string]any{}
+	if artifact != nil {
+		details["artifact"] = artifact
+	} else {
+		details["retentionFailure"] = map[string]any{"message": "compact artifact retention failed"}
+	}
+	if receipt := compactReceiptLocator(original); len(receipt) != 0 {
+		details["receipt"] = receipt
+	}
 	fallback["data"] = map[string]any{"error": map[string]any{
 		"code": "compact_output_too_large", "message": "compact output exceeded 131072 bytes", "messagePreview": previewValue("compact output exceeded 131072 bytes"), "retryable": false,
-		"effectState": compactEffectState(original), "details": map[string]any{"artifactRetained": artifactRetained},
+		"effectState": compactEffectState(original), "details": details,
 	}}
 	return fallback
 }
@@ -1351,7 +1433,7 @@ func exitForError(code string) ExitCode {
 	switch code {
 	case "invalid_arguments", "invalid_target", "reply_route_required", "invalid_raw_wait", "invalid_raw_reply_request", "effect_acknowledgment_required":
 		return ExitUsage
-	case "target_ambiguous", "message_not_found", "message_identity_conflict", "message_not_addressed_to_thread", "delivery_rejected", "delivery_temporarily_unavailable", "resolver_unavailable", "route_unavailable", "reply_route_unavailable", "endpoint_unavailable", "unsupported_server_version", "input_too_large", "reply_not_requested", "content_unavailable", "output_too_large", "experimental_method_unavailable":
+	case "target_ambiguous", "message_not_found", "message_identity_conflict", "message_not_addressed_to_thread", "delivery_rejected", "delivery_temporarily_unavailable", "resolver_unavailable", "route_unavailable", "reply_route_unavailable", "endpoint_unavailable", "unsupported_server_version", "input_too_large", "invalid_utf8", "reply_not_requested", "content_unavailable", "output_too_large", "experimental_method_unavailable":
 		return ExitRejected
 	case "outcome_unknown", "reply_outcome_unknown", "storage_busy":
 		return ExitUnknown

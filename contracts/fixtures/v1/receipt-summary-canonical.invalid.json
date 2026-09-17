@@ -1,0 +1,16 @@
+{
+  "schema": "mektup/receipt-summary/v1",
+  "projection": "receipt-summary",
+  "canonical": true,
+  "receiptId": "rcpt_0198f0e0-0000-7000-8000-000000000531",
+  "operationId": "op_0198f0e0-0000-7000-8000-000000000532",
+  "operation": "send",
+  "state": "accepted",
+  "source": {},
+  "target": {},
+  "message": {},
+  "evidenceCount": 0,
+  "evidence": [],
+  "warningCount": 0,
+  "warnings": []
+}
