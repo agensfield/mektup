@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -384,6 +385,24 @@ func TestCompactEventOnlyWarningRetainedEvenWithReceipt(t *testing.T) {
 	}
 	if !bytes.Contains(executor.retained, []byte("ONLY IN EVENT")) {
 		t.Fatalf("event-only warning was not retained: retained=%d output=%s", len(executor.retained), out.String())
+	}
+}
+
+func TestCompactBatchOverflowKeepsKnownReceipt(t *testing.T) {
+	executor := &compactTestExecutor{retainErr: errors.New("disk full"), result: ExecutionResult{
+		Receipt: map[string]any{"receiptId": "rcpt_01999999-9999-7999-8999-999999999999", "operationId": "op_01999999-9999-7999-8999-999999999999", "state": "reply_outcome_unknown"},
+		Events: []OutputEvent{
+			{Machine: map[string]any{"event": "operation.progress", "ok": true, "terminal": false, "data": map[string]any{"large": strings.Repeat("x", CompactMaxOutputBytes+1)}}},
+			{Machine: map[string]any{"event": "reply.unknown", "ok": false, "terminal": true, "data": map[string]any{}}},
+		},
+	}}
+	var out bytes.Buffer
+	app := &App{Out: &out, Err: &bytes.Buffer{}, Env: []string{"MEKTUP_AGENT=1"}, Executor: executor}
+	if code := app.Run([]string{"reply", "msg_01999999-9999-7999-8999-999999999999", "hello"}); code != int(ExitUnknown) {
+		t.Fatalf("code=%d output=%s", code, out.String())
+	}
+	if !bytes.Contains(out.Bytes(), []byte("rcpt_01999999-9999-7999-8999-999999999999")) || !bytes.Contains(out.Bytes(), []byte("reply_outcome_unknown")) {
+		t.Fatalf("known result recovery missing: %s", out.String())
 	}
 }
 

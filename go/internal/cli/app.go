@@ -704,10 +704,9 @@ func (a *App) writeExecutionResultState(p Presentation, inv Invocation, result E
 		}
 		for _, event := range events {
 			invalidUTF8 = invalidUTF8 || containsInvalidUTF8(event)
-			fullEvent := cloneEvent(event)
+			fullEvent := compactEventWithReceiptLocator(cloneEvent(event), recoveryReceipt)
 			event = compactLifecycleEvent(inv, event)
 			if inv.Resolved.Compact && invalidUTF8 {
-				fullEvent = compactEventWithReceiptLocator(fullEvent, recoveryReceipt)
 				if status := a.writeJSON(compactDecodeFailureEvent(fullEvent)); status != int(ExitSuccess) {
 					return status
 				}
@@ -1229,6 +1228,7 @@ func (a *App) writeProjectedEvent(inv Invocation, event, fullEvent map[string]an
 		return a.writeJSON(event)
 	}
 	fullDocument, marshalErr := json.Marshal(fullEvent)
+	recoveryEvent := compactEventWithReceiptLocator(event, compactReceiptLocator(fullEvent))
 	var retained *CompactArtifact
 	var retainErr error
 	retain := func() {
@@ -1255,11 +1255,11 @@ func (a *App) writeProjectedEvent(inv Invocation, event, fullEvent map[string]an
 	if compactDetailsNeedRetention(event) {
 		retain()
 		if retained == nil {
-			fallback := compactOverflowEvent(event, nil, marshalErr, retainErr)
+			fallback := compactOverflowEvent(recoveryEvent, nil, marshalErr, retainErr)
 			if status := a.writeJSON(fallback); status != int(ExitSuccess) {
 				return status
 			}
-			return compactOverflowExit(event)
+			return compactOverflowExit(recoveryEvent)
 		}
 		data := objectMap(event["data"])
 		data["retainedDetails"] = retained
@@ -1269,14 +1269,14 @@ func (a *App) writeProjectedEvent(inv Invocation, event, fullEvent map[string]an
 		return a.writeJSON(event)
 	}
 	retain()
-	fallback := compactOverflowEvent(event, retained, marshalErr, retainErr)
+	fallback := compactOverflowEvent(recoveryEvent, retained, marshalErr, retainErr)
 	if compactEncodedSize(fallback) > CompactMaxOutputBytes {
-		fallback = minimalCompactOverflowEvent(event, retained)
+		fallback = minimalCompactOverflowEvent(recoveryEvent, retained)
 	}
 	if status := a.writeJSON(fallback); status != int(ExitSuccess) {
 		return status
 	}
-	return compactOverflowExit(event)
+	return compactOverflowExit(recoveryEvent)
 }
 
 func validCompactArtifact(artifact CompactArtifact, document []byte) bool {
