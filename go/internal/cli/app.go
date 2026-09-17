@@ -698,11 +698,16 @@ func (a *App) writeExecutionResultState(p Presentation, inv Invocation, result E
 		if err != nil {
 			return a.internalFailure(err.Error())
 		}
+		recoveryReceipt := compactResultReceiptLocator(events)
+		if len(recoveryReceipt) == 0 && state != nil {
+			recoveryReceipt = compactReceiptValueLocator(state.lastReceipt)
+		}
 		for _, event := range events {
 			invalidUTF8 = invalidUTF8 || containsInvalidUTF8(event)
 			fullEvent := cloneEvent(event)
 			event = compactLifecycleEvent(inv, event)
 			if inv.Resolved.Compact && invalidUTF8 {
+				fullEvent = compactEventWithReceiptLocator(fullEvent, recoveryReceipt)
 				if status := a.writeJSON(compactDecodeFailureEvent(fullEvent)); status != int(ExitSuccess) {
 					return status
 				}
@@ -1133,6 +1138,30 @@ func compactDecodeFailureEvent(original map[string]any) map[string]any {
 	return event
 }
 
+func compactResultReceiptLocator(events []map[string]any) map[string]any {
+	for index := len(events) - 1; index >= 0; index-- {
+		if receipt := compactReceiptLocator(events[index]); len(receipt) != 0 {
+			return receipt
+		}
+	}
+	return nil
+}
+
+func compactReceiptValueLocator(value any) map[string]any {
+	return pick(objectMap(value), "receiptId", "operationId", "state")
+}
+
+func compactEventWithReceiptLocator(event, receipt map[string]any) map[string]any {
+	if len(receipt) == 0 || len(compactReceiptLocator(event)) != 0 {
+		return event
+	}
+	recovered := cloneEvent(event)
+	data := objectMap(recovered["data"])
+	data["receipt"] = receipt
+	recovered["data"] = data
+	return recovered
+}
+
 func compactErrorDetails(details map[string]any) map[string]any {
 	return compactDetailMap(details)
 }
@@ -1223,7 +1252,7 @@ func (a *App) writeProjectedEvent(inv Invocation, event, fullEvent map[string]an
 			retainErr = errors.New("compact artifact retention is unavailable")
 		}
 	}
-	if compactDetailsNeedRetention(event) && len(compactReceiptLocator(event)) == 0 {
+	if compactDetailsNeedRetention(event) {
 		retain()
 		if retained == nil {
 			fallback := compactOverflowEvent(event, nil, marshalErr, retainErr)

@@ -350,6 +350,43 @@ func TestCompactDecodeFailureKeepsAcceptedReceiptLocator(t *testing.T) {
 	}
 }
 
+func TestCompactBatchDecodeFailureKeepsKnownReceipt(t *testing.T) {
+	executor := &compactTestExecutor{result: ExecutionResult{
+		Receipt: map[string]any{"receiptId": "rcpt_01999999-9999-7999-8999-999999999999", "operationId": "op_01999999-9999-7999-8999-999999999999", "state": "accepted"},
+		Events: []OutputEvent{
+			{Machine: map[string]any{"event": "operation.progress", "ok": true, "terminal": false, "data": map[string]any{"bad": "\xff"}}},
+			{Machine: map[string]any{"event": "send.accepted", "ok": true, "terminal": true, "data": map[string]any{}}},
+		},
+	}}
+	var out bytes.Buffer
+	app := &App{Out: &out, Err: &bytes.Buffer{}, Env: []string{"MEKTUP_AGENT=1"}, Executor: executor}
+	if code := app.Run([]string{"send", "target", "hello"}); code != int(ExitIncomplete) {
+		t.Fatalf("code=%d output=%s", code, out.String())
+	}
+	if !bytes.Contains(out.Bytes(), []byte("rcpt_01999999-9999-7999-8999-999999999999")) || !bytes.Contains(out.Bytes(), []byte(`"effectState":"accepted"`)) {
+		t.Fatalf("known result receipt missing: %s", out.String())
+	}
+}
+
+func TestCompactEventOnlyWarningRetainedEvenWithReceipt(t *testing.T) {
+	message := strings.Repeat("warning", 500) + "ONLY IN EVENT"
+	executor := &compactTestExecutor{result: ExecutionResult{
+		Receipt: map[string]any{"receiptId": "rcpt_01999999-9999-7999-8999-999999999999", "operationId": "op_01999999-9999-7999-8999-999999999999", "state": "accepted", "warnings": []any{}},
+		Events: []OutputEvent{{Machine: map[string]any{
+			"event": "send.accepted", "ok": true, "terminal": true,
+			"warnings": []any{map[string]any{"code": "cleanup_incomplete", "message": message}}, "data": map[string]any{},
+		}}},
+	}}
+	var out bytes.Buffer
+	app := &App{Out: &out, Err: &bytes.Buffer{}, Env: []string{"MEKTUP_AGENT=1"}, Executor: executor}
+	if code := app.Run([]string{"send", "target", "hello"}); code != int(ExitSuccess) {
+		t.Fatalf("code=%d output=%s", code, out.String())
+	}
+	if !bytes.Contains(executor.retained, []byte("ONLY IN EVENT")) {
+		t.Fatalf("event-only warning was not retained: retained=%d output=%s", len(executor.retained), out.String())
+	}
+}
+
 func TestCompactRawInvalidUTF8IsRejectedBeforeJSONReplacement(t *testing.T) {
 	executor := &compactTestExecutor{result: ExecutionResult{Events: []OutputEvent{{Machine: map[string]any{
 		"event": "thread.list.completed", "ok": true, "terminal": true,
@@ -413,5 +450,24 @@ func TestCompactStreamingOverflowEmitsOneTerminalAfterPriorAcceptance(t *testing
 	}
 	if first["terminal"] != false || second["terminal"] != true || second["event"] != "compact_output_too_large" || first["operationId"] != second["operationId"] || first["sequence"] != float64(1) || second["sequence"] != float64(2) {
 		t.Fatalf("stream events=%#v %#v", first, second)
+	}
+}
+
+func TestCompactStreamingDecodeFailureKeepsPriorReceipt(t *testing.T) {
+	stream := &compactStreamExecutor{chunks: []ExecutionResult{
+		{
+			Receipt:   map[string]any{"receiptId": "rcpt_01999999-9999-7999-8999-999999999999", "operationId": "op_01999999-9999-7999-8999-999999999999", "state": "accepted"},
+			Events:    []OutputEvent{{Machine: map[string]any{"event": "send.accepted", "terminal": false, "ok": true, "data": map[string]any{}}}},
+			Streaming: true,
+		},
+		{Events: []OutputEvent{{Machine: map[string]any{"event": "wait.progress", "terminal": false, "ok": true, "data": map[string]any{"bad": "\xff"}}}}, Streaming: true},
+	}}
+	var out bytes.Buffer
+	app := &App{Out: &out, Err: &bytes.Buffer{}, Env: []string{"MEKTUP_AGENT=1"}, Executor: stream}
+	if code := app.Run([]string{"send", "target", "hello", "--wait"}); code != int(ExitIncomplete) {
+		t.Fatalf("code=%d output=%s", code, out.String())
+	}
+	if !bytes.Contains(out.Bytes(), []byte("rcpt_01999999-9999-7999-8999-999999999999")) {
+		t.Fatalf("prior receipt missing from streaming failure: %s", out.String())
 	}
 }
