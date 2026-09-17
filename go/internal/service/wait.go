@@ -36,6 +36,9 @@ func (s *Service) Wait(ctx context.Context, req WaitRequest) (WaitResult, error)
 		defer cancel()
 	}
 	if err := s.Journal.ExpireClaims(ctx); err != nil {
+		if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return WaitResult{Incomplete: true}, semantic(mektup.ErrWaitIncomplete, "wait ended before custody expiry completed", nil, err)
+		}
 		return WaitResult{}, semantic(mektup.ErrInternal, "custody expiry could not be processed", nil, err)
 	}
 	status, err := s.Journal.Lookup(ctx, req.Reference)
