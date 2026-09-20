@@ -84,7 +84,8 @@ stream_max_retries = 0
 		"clientInfo":   map[string]any{"name": "mektup-official-acceptance-admin", "version": "1.0.0"},
 		"capabilities": map[string]any{"experimentalApi": true},
 	})
-	if !strings.Contains(string(initialize), `/0.154.0 `) {
+	expectedVersion := os.Getenv("MEKTUP_ACCEPT_CODEX_VERSION")
+	if expectedVersion != "" && !strings.Contains(string(initialize), `/`+expectedVersion+` `) {
 		t.Fatalf("unexpected daemon initialize result: %s", initialize)
 	}
 	admin.notify(t, "initialized", nil)

@@ -16,6 +16,8 @@ func TestClassify(t *testing.T) {
 	}{
 		{"tested", "codex_cli_rs/0.154.0 (Mac OS; arm64)", "0.154.0", Tested, ""},
 		{"tested build metadata", "codex_app_server/0.154.0+managed", "0.154.0+managed", Tested, ""},
+		{"latest tested", "codex_cli_rs/0.155.1 (Mac OS; arm64)", "0.155.1", Tested, ""},
+		{"latest tested build metadata", "codex_app_server/0.155.1+managed", "0.155.1+managed", Tested, ""},
 		{"newer", "codex_cli_rs/0.155.0", "0.155.0", Untested, WarningUntested},
 		{"between floor and tested", "codex_cli_rs/0.142.1", "0.142.1", Untested, WarningUntested},
 		{"floor", "codex_cli_rs/0.142.0", "0.142.0", Unsupported, ""},

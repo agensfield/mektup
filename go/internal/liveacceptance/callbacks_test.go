@@ -32,8 +32,8 @@ const callbackPayloadSentinel = "mektup-secret-callback-payload"
 
 // TestIsolatedMultiClientServerRequest exercises the pinned Codex binary with
 // a scratch CODEX_HOME, daemon, and Responses backend. It never connects to the
-// user's central daemon. The test is opt-in because release hosts need a Codex
-// 0.154.0 binary in addition to the Go toolchain.
+// user's central daemon. The test is opt-in because release hosts need an
+// explicitly selected tested Codex binary in addition to the Go toolchain.
 func TestIsolatedMultiClientServerRequest(t *testing.T) {
 	if os.Getenv("MEKTUP_ACCEPT_CALLBACKS") != "1" {
 		t.Skip("set MEKTUP_ACCEPT_CALLBACKS=1 to run isolated real app-server callback acceptance")
@@ -79,7 +79,7 @@ stream_max_retries = 0
 	daemonCtx, stopDaemon := context.WithCancel(context.Background())
 	defer stopDaemon()
 	command := exec.CommandContext(daemonCtx, codexBinary, "app-server", "--listen", "unix://"+socket)
-	command.Env = append(os.Environ(), "CODEX_HOME="+codexHome)
+	command.Env = replaceEnvironment(os.Environ(), "CODEX_HOME", codexHome)
 	var daemonLog lockedBuffer
 	command.Stdout = &daemonLog
 	command.Stderr = &daemonLog
@@ -103,10 +103,15 @@ stream_max_retries = 0
 	defer cancel()
 	tui := dialRawTUI(t, ctx, socket)
 	defer tui.Close()
-	tui.request(t, ctx, "init", "initialize", map[string]any{
+	initialize := tui.request(t, ctx, "init", "initialize", map[string]any{
 		"clientInfo":   map[string]any{"name": "mektup-callback-tui", "version": "1.0.0"},
 		"capabilities": map[string]any{"experimentalApi": true},
 	})
+	expectedVersion := os.Getenv("MEKTUP_ACCEPT_CODEX_VERSION")
+	if expectedVersion != "" && !strings.Contains(string(initialize), `/`+expectedVersion+` `) {
+		t.Fatalf("unexpected daemon initialize result: %s", initialize)
+	}
+	t.Logf("codex=%s version=%s sha256=%s expected=%s initialize=%s", codexBinary, executableVersion(t, codexBinary), fileSHA256(t, codexBinary), expectedVersion, initialize)
 	tui.notify(t, "initialized", nil)
 	threadResult := tui.request(t, ctx, "thread", "thread/start", map[string]any{
 		"model": "mock-model",

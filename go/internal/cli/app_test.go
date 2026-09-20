@@ -119,7 +119,8 @@ func TestVersionReportsLockedContractRevision(t *testing.T) {
 		t.Fatalf("code=%d stderr=%q", code, stderr)
 	}
 	var version struct {
-		ContractVersion string `json:"contract_version"`
+		ContractVersion    string   `json:"contract_version"`
+		TestedCodexServers []string `json:"tested_codex_versions"`
 	}
 	if err := json.Unmarshal([]byte(stdout), &version); err != nil {
 		t.Fatal(err)
@@ -129,6 +130,9 @@ func TestVersionReportsLockedContractRevision(t *testing.T) {
 	}
 	if version.ContractVersion != "1.0.8" {
 		t.Fatalf("contract version=%q, want 1.0.8", version.ContractVersion)
+	}
+	if got := strings.Join(version.TestedCodexServers, ","); got != "0.154.0,0.155.1" {
+		t.Fatalf("tested Codex versions=%q", got)
 	}
 }
 

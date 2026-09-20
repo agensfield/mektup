@@ -53,9 +53,13 @@ func TestCentralDaemonReadOnlyTwoClients(t *testing.T) {
 
 	for i, client := range clients {
 		info := client.Info()
-		if info.Compatibility.Class != compat.Tested || info.Compatibility.Version != "0.154.0" {
+		if info.Compatibility.Class != compat.Tested {
 			t.Fatalf("client %d compatibility = %+v", i+1, info.Compatibility)
 		}
+		if expected := os.Getenv("MEKTUP_ACCEPT_CODEX_VERSION"); expected != "" && info.Compatibility.Version != expected {
+			t.Fatalf("client %d server version = %q, want %q", i+1, info.Compatibility.Version, expected)
+		}
+		t.Logf("socket=%s client=%d expected=%s userAgent=%s", socket, i+1, os.Getenv("MEKTUP_ACCEPT_CODEX_VERSION"), info.ServerUserAgent)
 		if info.Generation == 0 || info.ServerUserAgent == "" {
 			t.Fatalf("client %d missing handshake evidence: %+v", i+1, info)
 		}
