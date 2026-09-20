@@ -68,7 +68,7 @@ var (
 	buildVersion         = "dev"
 	buildCommit          = "unknown"
 	buildContractVersion = ContractVersion
-	buildTestedCodex     = "0.154.0"
+	buildTestedCodex     = "0.154.0,0.155.1"
 	buildInstallKind     = "source"
 )
 
@@ -77,7 +77,7 @@ var DefaultBuildInfo = BuildInfo{
 	Commit:             "unknown",
 	InstallKind:        "source",
 	ContractVersion:    ContractVersion,
-	TestedCodexServers: []string{"0.154.0"},
+	TestedCodexServers: []string{"0.154.0", "0.155.1"},
 }
 
 // BuildInfoFromBuildVars returns metadata after release ldflags have been

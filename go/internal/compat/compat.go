@@ -13,7 +13,10 @@ import (
 const (
 	MinimumExclusive = "v0.142.0"
 	InitialTested    = "v0.154.0"
+	LatestTested     = "v0.155.1"
 )
+
+var testedVersions = [...]string{InitialTested, LatestTested}
 
 // Class describes whether Mektup has conformance evidence for a server.
 type Class string
@@ -85,13 +88,22 @@ func Classify(userAgent string) (Result, error) {
 	switch {
 	case semver.Compare(rawVersion, MinimumExclusive) <= 0:
 		result.Class = Unsupported
-	case semver.Compare(rawVersion, InitialTested) == 0:
+	case isTested(rawVersion):
 		result.Class = Tested
 	default:
 		result.Class = Untested
 		result.Warning = WarningUntested
 	}
 	return result, nil
+}
+
+func isTested(version string) bool {
+	for _, tested := range testedVersions {
+		if semver.Compare(version, tested) == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // RequireSupported converts only the locked compatibility floor into an error.

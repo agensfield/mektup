@@ -17,7 +17,7 @@ the results of:
   inventory and license policy in [dependencies.md](dependencies.md);
 - the CI Darwin/Linux amd64/arm64 build matrix;
 - the supported app-server compatibility tests, including tested Codex
-  `0.154.0` evidence and the explicit untested/unsupported paths;
+  `0.154.0` and `0.155.1` evidence and the explicit untested/unsupported paths;
 - the scoped security review and any accepted residual risk.
 
 Do not describe source or CI evidence as physical app-server, SSH, published,
@@ -53,7 +53,7 @@ After the tags are approved and created by the release owner, the `v*.*.*` tag
 workflow runs GoReleaser. It is configured to produce deterministic,
 `-trimpath` Darwin/Linux amd64/arm64 `tar.gz` archives, a SHA-256 checksum
 manifest, and one SBOM document per archive. Release metadata is embedded with
-ldflags for version, commit, contract `1.0.8`, and tested Codex `0.154.0`.
+ldflags for version, commit, contract `1.0.8`, and tested Codex `0.154.0,0.155.1`.
 The workflow pins Syft `v1.51.1` for SBOM generation.
 The commit timestamp is used for archive metadata so rebuilding the same source
 does not acquire a wall-clock timestamp.
