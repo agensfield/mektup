@@ -103,10 +103,15 @@ stream_max_retries = 0
 	defer cancel()
 	tui := dialRawTUI(t, ctx, socket)
 	defer tui.Close()
-	tui.request(t, ctx, "init", "initialize", map[string]any{
+	initialize := tui.request(t, ctx, "init", "initialize", map[string]any{
 		"clientInfo":   map[string]any{"name": "mektup-callback-tui", "version": "1.0.0"},
 		"capabilities": map[string]any{"experimentalApi": true},
 	})
+	expectedVersion := os.Getenv("MEKTUP_ACCEPT_CODEX_VERSION")
+	if expectedVersion != "" && !strings.Contains(string(initialize), `/`+expectedVersion+` `) {
+		t.Fatalf("unexpected daemon initialize result: %s", initialize)
+	}
+	t.Logf("codex=%s version=%s sha256=%s expected=%s initialize=%s", codexBinary, executableVersion(t, codexBinary), fileSHA256(t, codexBinary), expectedVersion, initialize)
 	tui.notify(t, "initialized", nil)
 	threadResult := tui.request(t, ctx, "thread", "thread/start", map[string]any{
 		"model": "mock-model",

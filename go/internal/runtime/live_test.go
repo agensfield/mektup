@@ -40,6 +40,10 @@ func TestLiveBodyCarryAcceptance(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if expected := os.Getenv("MEKTUP_ACCEPT_CODEX_VERSION"); expected != "" && admin.Info().Compatibility.Version != expected {
+		t.Fatalf("server version = %q, want %q", admin.Info().Compatibility.Version, expected)
+	}
+	t.Logf("socket=%s expected=%s userAgent=%s", socket, os.Getenv("MEKTUP_ACCEPT_CODEX_VERSION"), admin.Info().ServerUserAgent)
 	defer func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		_ = admin.Detach(closeCtx)
