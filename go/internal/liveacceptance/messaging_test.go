@@ -67,9 +67,10 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	socket := filepath.Join(controlDir, "app-server-control.sock")
+	daemonSocket := filepath.Join(root, "app-server.sock")
 	daemonCtx, stopDaemon := context.WithCancel(context.Background())
 	defer stopDaemon()
-	command := exec.CommandContext(daemonCtx, codexBinary, "app-server", "--listen", "unix://"+socket)
+	command := exec.CommandContext(daemonCtx, codexBinary, "app-server", "--listen", "unix://"+daemonSocket)
 	command.Env = replaceEnvironment(os.Environ(), "CODEX_HOME", codexHome)
 	var daemonLog lockedBuffer
 	command.Stdout, command.Stderr = &daemonLog, &daemonLog
@@ -77,7 +78,10 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { stopProcess(command, stopDaemon) })
-	waitForUnixSocket(t, command, socket, &daemonLog)
+	waitForUnixSocket(t, command, daemonSocket, &daemonLog)
+	if err := os.Symlink(daemonSocket, socket); err != nil {
+		t.Fatalf("publish managed control socket link: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
