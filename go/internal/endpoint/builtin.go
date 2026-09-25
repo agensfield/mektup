@@ -80,6 +80,23 @@ func canonicalStoredPath(value string) (string, error) {
 	}
 }
 
+// builtinSocketPath binds the local endpoint to Codex's stable control path,
+// not to the current managed daemon socket behind that path. Codex may replace
+// the final component with a symlink when its daemon rotates. Its parent must
+// still be canonical so a redirected control directory cannot define routing
+// authority.
+func builtinSocketPath(home string) (string, error) {
+	parent := filepath.Join(home, filepath.Dir(localSocketRelative))
+	canonicalParent, err := canonicalStoredPath(parent)
+	if err != nil {
+		return "", err
+	}
+	if canonicalParent != parent {
+		return "", fmt.Errorf("%w: noncanonical daemon socket parent", ErrConfigCorrupt)
+	}
+	return filepath.Join(parent, filepath.Base(localSocketRelative)), nil
+}
+
 func (s EndpointStore) EnsureBuiltinLocal(codexHome string) (Endpoint, error) {
 	if s.StateHome == "" {
 		return Endpoint{}, errors.New("state home is required for built-in local identity")
@@ -116,7 +133,7 @@ func (s EndpointStore) ensureBuiltinLocal(codexHome string) (Endpoint, error) {
 	if err != nil {
 		return Endpoint{}, fmt.Errorf("canonicalize CODEX_HOME: %w", err)
 	}
-	socket, err := canonicalPath(filepath.Join(home, localSocketRelative))
+	socket, err := builtinSocketPath(home)
 	if err != nil {
 		return Endpoint{}, fmt.Errorf("derive daemon socket: %w", err)
 	}
@@ -185,7 +202,7 @@ func (s EndpointStore) ExistingBuiltinLocal(codexHome string) (Endpoint, error) 
 	if err != nil {
 		return Endpoint{}, fmt.Errorf("canonicalize CODEX_HOME: %w", err)
 	}
-	socket, err := canonicalPath(filepath.Join(home, localSocketRelative))
+	socket, err := builtinSocketPath(home)
 	if err != nil {
 		return Endpoint{}, fmt.Errorf("derive daemon socket: %w", err)
 	}
@@ -266,8 +283,8 @@ func (s EndpointStore) loadBuiltinIdentities() (builtinIdentities, error) {
 			return builtinIdentities{}, fmt.Errorf("%w: inconsistent built-in identity", ErrConfigCorrupt)
 		}
 		canonicalHome, homeErr := canonicalStoredPath(identity.Home)
-		canonicalSocket, socketErr := canonicalStoredPath(identity.Socket)
-		if homeErr != nil || socketErr != nil || canonicalHome != identity.Home || canonicalSocket != identity.Socket {
+		canonicalSocketParent, socketErr := canonicalStoredPath(filepath.Dir(identity.Socket))
+		if homeErr != nil || socketErr != nil || canonicalHome != identity.Home || canonicalSocketParent != filepath.Dir(identity.Socket) {
 			if _, statErr := os.Lstat(identity.Home); errors.Is(statErr, fs.ErrNotExist) {
 				// Older registries may retain identities for deleted temporary
 				// homes. Keep them unavailable rather than letting a now-visible

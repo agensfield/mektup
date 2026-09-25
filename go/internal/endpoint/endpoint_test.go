@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -196,6 +197,78 @@ func TestBuiltinIdentityDocumentRejectsLiveSymlinkAuthority(t *testing.T) {
 	store := NewStoreWithIdentityHome(filepath.Join(root, "config.json"), filepath.Join(root, "state"), identityHome)
 	if _, _, err := store.builtinByID(id); !errors.Is(err, ErrConfigCorrupt) {
 		t.Fatalf("live symlink identity error = %v", err)
+	}
+}
+
+func TestBuiltinIdentitySurvivesManagedDaemonSocketRotation(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "codex")
+	control := filepath.Join(home, "app-server-control")
+	if err := os.MkdirAll(control, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(control, "app-server-control.sock")
+	shortRoot, err := os.MkdirTemp("/tmp", "mektup-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortRoot) })
+	target := filepath.Join(shortRoot, "managed.sock")
+	listener, err := net.Listen("unix", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := os.Symlink(target, socket); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStoreWithIdentityHome(filepath.Join(root, "config", "endpoints.json"), filepath.Join(root, "state"), filepath.Join(root, "identity"))
+	first, err := store.EnsureBuiltinLocal(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canonicalHome, err := canonicalPath(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stableSocket := filepath.Join(canonicalHome, localSocketRelative)
+	if first.Route.UnixSocket != stableSocket {
+		t.Fatalf("route = %q, want stable control path %q", first.Route.UnixSocket, stableSocket)
+	}
+	if err := os.Remove(socket); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "next-managed.sock"), socket); err != nil {
+		t.Fatal(err)
+	}
+	for _, resolve := range []func() (Endpoint, error){
+		func() (Endpoint, error) { return store.ExistingBuiltinLocal(home) },
+		func() (Endpoint, error) { return store.EnsureBuiltinLocal(home) },
+		func() (Endpoint, error) { return store.ResolveExistingEndpoint(first.ID, home) },
+	} {
+		got, err := resolve()
+		if err != nil || got.ID != first.ID || got.Route.UnixSocket != stableSocket {
+			t.Fatalf("rotated socket identity = %#v, %v; want %#v", got, err, first)
+		}
+	}
+}
+
+func TestBuiltinIdentityRejectsRedirectedSocketDirectory(t *testing.T) {
+	root := t.TempDir()
+	home := filepath.Join(root, "codex")
+	realControl := filepath.Join(root, "other-control")
+	if err := os.MkdirAll(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(realControl, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(realControl, filepath.Join(home, "app-server-control")); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStoreWithIdentityHome(filepath.Join(root, "config", "endpoints.json"), filepath.Join(root, "state"), filepath.Join(root, "identity"))
+	if _, err := store.EnsureBuiltinLocal(home); !errors.Is(err, ErrConfigCorrupt) {
+		t.Fatalf("redirected control directory error = %v, want config corruption", err)
 	}
 }
 

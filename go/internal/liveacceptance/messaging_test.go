@@ -22,6 +22,7 @@ import (
 	"github.com/agensfield/mektup/go/appserver"
 	"github.com/agensfield/mektup/go/internal/codexapi"
 	"github.com/agensfield/mektup/go/internal/connection"
+	"github.com/agensfield/mektup/go/internal/doctor"
 	"github.com/agensfield/mektup/go/internal/endpoint"
 	"github.com/agensfield/mektup/go/internal/journal"
 	mekruntime "github.com/agensfield/mektup/go/internal/runtime"
@@ -61,10 +62,15 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(codexHome, "config.toml"), []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
-	socket := filepath.Join(root, "app-server.sock")
+	controlDir := filepath.Join(codexHome, "app-server-control")
+	if err := os.Mkdir(controlDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	socket := filepath.Join(controlDir, "app-server-control.sock")
+	daemonSocket := filepath.Join(root, "app-server.sock")
 	daemonCtx, stopDaemon := context.WithCancel(context.Background())
 	defer stopDaemon()
-	command := exec.CommandContext(daemonCtx, codexBinary, "app-server", "--listen", "unix://"+socket)
+	command := exec.CommandContext(daemonCtx, codexBinary, "app-server", "--listen", "unix://"+daemonSocket)
 	command.Env = replaceEnvironment(os.Environ(), "CODEX_HOME", codexHome)
 	var daemonLog lockedBuffer
 	command.Stdout, command.Stderr = &daemonLog, &daemonLog
@@ -72,14 +78,39 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { stopProcess(command, stopDaemon) })
-	waitForUnixSocket(t, command, socket, &daemonLog)
+	waitForUnixSocket(t, command, daemonSocket, &daemonLog)
+	if err := os.Symlink(daemonSocket, socket); err != nil {
+		t.Fatalf("publish managed control socket link: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	route, err := endpoint.UnixRoute(socket)
+	identityStore := endpoint.NewStoreWithIdentityHome(filepath.Join(root, "config", "endpoints.json"), filepath.Join(root, "identity-state"), filepath.Join(root, "identity-state"))
+	local, err := identityStore.EnsureBuiltinLocal(codexHome)
+	if err != nil {
+		t.Fatalf("built-in local identity: %v", err)
+	}
+	canonicalControlDir, err := filepath.EvalSymlinks(controlDir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	stableSocket := filepath.Join(canonicalControlDir, filepath.Base(socket))
+	if existing, err := identityStore.ExistingBuiltinLocal(codexHome); err != nil || existing.ID != local.ID || existing.Route.UnixSocket != stableSocket {
+		t.Fatalf("existing built-in local identity = %#v, %v; want %#v", existing, err, local)
+	}
+	if existing, err := identityStore.ResolveExistingEndpoint(local.ID, codexHome); err != nil || existing.ID != local.ID {
+		t.Fatalf("resolve built-in stable ID = %#v, %v; want %#v", existing, err, local)
+	}
+	report, err := doctor.Check(ctx, doctor.DefaultOptions(doctor.Paths{SocketPath: socket}))
+	if err != nil {
+		t.Fatalf("doctor socket check: %v", err)
+	}
+	for _, finding := range report.Findings {
+		if finding.ID == "socket.path" && finding.Severity != doctor.SeverityOK {
+			t.Fatalf("doctor socket finding: %#v", finding)
+		}
+	}
+	route := local.Route
 	var methodsMu sync.Mutex
 	methodsSeen := map[string]bool{}
 	methodObserver := func(direction appserver.FrameDirection, frame appserver.Frame) error {
@@ -149,8 +180,8 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 		t.Fatalf("proxy cleanup: %v", err)
 	}
 
-	endpointID := "ep_01999999-9999-7999-8999-999999999995"
-	ep := endpoint.Endpoint{ID: endpointID, Alias: "qualification", Route: route, Herdr: endpoint.HerdrDisabled}
+	endpointID := local.ID
+	ep := local
 	pool := mekruntime.NewConnectionPool(mekruntime.ConnectionFactory{Options: connection.Options{ClientName: "mektup-qualifier-body", ClientVersion: "1.0.0", HandshakeTimeout: 5 * time.Second, FrameObserver: methodObserver}}, func(id string) (endpoint.Endpoint, error) {
 		if id != endpointID {
 			return endpoint.Endpoint{}, endpoint.ErrEndpointNotFound

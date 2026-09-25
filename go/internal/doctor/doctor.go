@@ -261,6 +261,18 @@ func probeSocketWithOwner(_ context.Context, path string, owner func(os.FileInfo
 	if err != nil {
 		return nil, err
 	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		if !owner(info) {
+			return []Finding{{ID: "socket.path", Category: "socket", Severity: SeverityError, Message: "socket link is not owned by the current user", Path: path}}, nil
+		}
+		info, err = os.Stat(path)
+		if errors.Is(err, os.ErrNotExist) {
+			return []Finding{{ID: "socket.path", Category: "socket", Severity: SeverityNotice, Message: "socket target is absent", Path: path}}, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 	if info.Mode()&os.ModeSocket == 0 {
 		return []Finding{{ID: "socket.path", Category: "socket", Severity: SeverityError, Message: "path is not a Unix socket", Path: path}}, nil
 	}
