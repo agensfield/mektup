@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestCheckPathRejectsMalformedCurrentV8CustodyTables(t *testing.T) {
+func TestOpenAndCheckPathRejectMalformedCurrentCustodyTables(t *testing.T) {
 	for _, table := range []string{
 		"operations", "attempts", "reply_claims", "reply_winners", "observations", "events",
 		"manual_resolutions", "operation_acceptances", "reply_acceptances", "receipts", "blockers",
@@ -31,21 +31,35 @@ func TestCheckPathRejectsMalformedCurrentV8CustodyTables(t *testing.T) {
 			if _, err := db.Exec("PRAGMA foreign_keys=OFF"); err != nil {
 				t.Fatal(err)
 			}
-			legacy := table + "_manifest_legacy"
-			if _, err := db.Exec("ALTER TABLE " + table + " RENAME TO " + legacy); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := db.Exec("CREATE TABLE " + table + " AS SELECT * FROM " + legacy + " WHERE 0"); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := db.Exec("DROP TABLE " + legacy); err != nil {
-				t.Fatal(err)
+			if table == "receipts" {
+				if _, err := db.Exec("DROP TABLE receipts"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				legacy := table + "_manifest_legacy"
+				if _, err := db.Exec("ALTER TABLE " + table + " RENAME TO " + legacy); err != nil {
+					t.Fatal(err)
+				}
+				create := "CREATE TABLE " + table + " AS SELECT * FROM " + legacy + " WHERE 0"
+				if table == "blockers" {
+					create = "CREATE TABLE blockers(generation TEXT)"
+				}
+				if _, err := db.Exec(create); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.Exec("DROP TABLE " + legacy); err != nil {
+					t.Fatal(err)
+				}
 			}
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
 			if _, err := CheckPath(context.Background(), path); err == nil || !errors.Is(err, ErrStorageCorrupt) {
 				t.Fatalf("malformed %s was accepted: %v", table, err)
+			}
+			if reopened, err := Open(context.Background(), Options{StateDir: dir}); err == nil {
+				_ = reopened.Close()
+				t.Fatalf("malformed %s was reopened", table)
 			}
 		})
 	}

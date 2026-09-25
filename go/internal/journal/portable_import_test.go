@@ -125,7 +125,7 @@ func TestImportOriginalStatusWinnerIsIdempotentAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status.Selection != OriginalStatusWinner || status.Claim.ReplyID != in.ReplyID || status.Claim.CommitSeq != in.CommitSeq {
+	if status.Selection != OriginalStatusWinner || status.Claim.ReplyID != in.ReplyID || status.Claim.CommitSeq != in.CommitSeq || status.Claim.State != StateReplyAccepted {
 		t.Fatalf("winner lost across restart: %+v", status)
 	}
 }

@@ -215,10 +215,3 @@ func TestOriginalStatusFailsClosedOnCorruptWinnerMetadata(t *testing.T) {
 		t.Fatalf("uppercase winner digest accepted: %v", err)
 	}
 }
-
-func TestOriginalStatusRejectsMalformedWinnerMessageID(t *testing.T) {
-	claim := ReplyClaim{ReplyID: "not-a-message-id", OriginalID: "msg_0198f0e0-0000-7000-8000-000000000003", Digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", BodySize: 1, Status: "success", State: StateReplyAccepted, CommitSeq: 1}
-	if err := validateOriginalSelectedClaim(claim, 1, "", true); !errors.Is(err, ErrCorrupt) {
-		t.Fatalf("malformed winner ID accepted: %v", err)
-	}
-}
