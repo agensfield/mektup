@@ -26,7 +26,7 @@ builds:
         -X github.com/agensfield/mektup/go/internal/cli.buildVersion={{.Version}}
         -X github.com/agensfield/mektup/go/internal/cli.buildCommit={{.Commit}}
         -X github.com/agensfield/mektup/go/internal/cli.buildContractVersion=1.0.8
-        -X github.com/agensfield/mektup/go/internal/cli.buildTestedCodex=0.154.0,0.155.1
+        -X github.com/agensfield/mektup/go/internal/cli.buildTestedCodex=0.154.0,0.155.1,0.156.0,0.156.1,0.157.0
         -X github.com/agensfield/mektup/go/internal/cli.buildInstallKind=github-release
     mod_timestamp: '{{ .CommitTimestamp }}'
 

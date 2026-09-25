@@ -10,13 +10,9 @@ import (
 	"golang.org/x/mod/semver"
 )
 
-const (
-	MinimumExclusive = "v0.142.0"
-	InitialTested    = "v0.154.0"
-	LatestTested     = "v0.155.1"
-)
+const MinimumExclusive = "v0.142.0"
 
-var testedVersions = [...]string{InitialTested, LatestTested}
+var testedVersions = [...]string{"v0.154.0", "v0.155.1", "v0.156.0", "v0.156.1", "v0.157.0"}
 
 // Class describes whether Mektup has conformance evidence for a server.
 type Class string

@@ -53,7 +53,8 @@ After the tags are approved and created by the release owner, the `v*.*.*` tag
 workflow runs GoReleaser. It is configured to produce deterministic,
 `-trimpath` Darwin/Linux amd64/arm64 `tar.gz` archives, a SHA-256 checksum
 manifest, and one SBOM document per archive. Release metadata is embedded with
-ldflags for version, commit, contract `1.0.8`, and tested Codex `0.154.0,0.155.1`.
+ldflags for version, commit, contract `1.0.8`, and tested Codex
+`0.154.0,0.155.1,0.156.0,0.156.1,0.157.0`.
 The workflow pins Syft `v1.51.1` for SBOM generation.
 The commit timestamp is used for archive metadata so rebuilding the same source
 does not acquire a wall-clock timestamp.
