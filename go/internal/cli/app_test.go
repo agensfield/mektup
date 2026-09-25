@@ -131,7 +131,7 @@ func TestVersionReportsLockedContractRevision(t *testing.T) {
 	if version.ContractVersion != "1.0.8" {
 		t.Fatalf("contract version=%q, want 1.0.8", version.ContractVersion)
 	}
-	if got := strings.Join(version.TestedCodexServers, ","); got != "0.154.0,0.155.1" {
+	if got := strings.Join(version.TestedCodexServers, ","); got != "0.154.0,0.155.1,0.156.0,0.156.1,0.157.0" {
 		t.Fatalf("tested Codex versions=%q", got)
 	}
 }

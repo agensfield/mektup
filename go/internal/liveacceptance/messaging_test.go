@@ -204,19 +204,34 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 	if err != nil || waited.ReplyID != replied.Receipt.Message.MessageID || waited.Incomplete {
 		t.Fatalf("custody wait = %+v, %v", waited, err)
 	}
-	items, err := observation.FullHistory(ctx, service.ResolvedTarget{EndpointID: endpointID, URI: sourceURI, ThreadID: source.Thread.ID, Loaded: true, Persistent: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	matches := 0
-	for _, item := range items {
-		envelope, parseErr := mektup.ParseEnvelopeString(item.Text)
-		if parseErr == nil && item.NativeType == "userMessage" && item.ClientMessageID == replied.Receipt.Message.MessageID && envelope.InReplyTo == sent.Receipt.Message.MessageID && envelope.Body == "Mektup qualification reply" {
-			matches++
+	sourceTarget := service.ResolvedTarget{EndpointID: endpointID, URI: sourceURI, ThreadID: source.Thread.ID, Loaded: true, Persistent: true}
+	historyDeadline := time.NewTimer(5 * time.Second)
+	defer historyDeadline.Stop()
+	for {
+		items, historyErr := observation.FullHistory(ctx, sourceTarget)
+		if historyErr != nil {
+			t.Fatal(historyErr)
 		}
-	}
-	if matches != 1 {
-		t.Fatalf("native reply history has %d exact matches, want one", matches)
+		matches := 0
+		for _, item := range items {
+			envelope, parseErr := mektup.ParseEnvelopeString(item.Text)
+			if parseErr == nil && item.NativeType == "userMessage" && item.ClientMessageID == replied.Receipt.Message.MessageID && envelope.InReplyTo == sent.Receipt.Message.MessageID && envelope.Body == "Mektup qualification reply" {
+				matches++
+			}
+		}
+		if matches == 1 {
+			break
+		}
+		if matches > 1 {
+			t.Fatalf("native reply history has %d exact matches, want one", matches)
+		}
+		select {
+		case <-historyDeadline.C:
+			t.Fatal("native reply did not become visible after accepted custody wait")
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		case <-time.After(20 * time.Millisecond):
+		}
 	}
 	if _, err := api.ThreadTurns(ctx, codexapi.TurnsOptions{ThreadID: target.Thread.ID, Limit: 5, ItemsView: "full"}); err != nil {
 		t.Fatalf("thread/turns/list full: %v", err)
