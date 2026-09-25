@@ -16,8 +16,8 @@ the results of:
 - `make notices` and the pinned `make govulncheck` result, with the dependency
   inventory and license policy in [dependencies.md](dependencies.md);
 - the CI Darwin/Linux amd64/arm64 build matrix;
-- the supported app-server compatibility tests, including tested Codex
-  `0.154.0` and `0.155.1` evidence and the explicit untested/unsupported paths;
+- the [Codex qualification](codex-qualification.md) receipt for any newly
+  claimed app-server version and the untested/unsupported classifier tests;
 - the scoped security review and any accepted residual risk.
 
 Do not describe source or CI evidence as physical app-server, SSH, published,
@@ -57,6 +57,10 @@ ldflags for version, commit, contract `1.0.8`, and tested Codex `0.154.0,0.155.1
 The workflow pins Syft `v1.51.1` for SBOM generation.
 The commit timestamp is used for archive metadata so rebuilding the same source
 does not acquire a wall-clock timestamp.
+
+The tag workflow requires a successful main CI run on the exact tagged commit
+before packaging. It consumes those test results instead of rerunning the same
+Go, contract, and security checks during packaging.
 
 The workflow creates GitHub release metadata only. It does not update the
 Homebrew tap. After the GitHub artifacts exist, prepare a separate reviewed

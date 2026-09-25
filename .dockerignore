@@ -1,0 +1,10 @@
+*
+!go/
+!go/**
+!contracts/
+!contracts/**
+!conformance/
+!conformance/**
+!tests/
+!tests/compat/
+!tests/compat/Dockerfile

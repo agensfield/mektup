@@ -30,22 +30,14 @@ import (
 
 const callbackPayloadSentinel = "mektup-secret-callback-payload"
 
-// TestIsolatedMultiClientServerRequest exercises the pinned Codex binary with
-// a scratch CODEX_HOME, daemon, and Responses backend. It never connects to the
-// user's central daemon. The test is opt-in because release hosts need an
-// explicitly selected tested Codex binary in addition to the Go toolchain.
+// TestIsolatedMultiClientServerRequest exercises the selected public Codex
+// binary inside the disposable qualification container. Its daemon, home,
+// provider, and socket cannot reach the user's central app-server.
 func TestIsolatedMultiClientServerRequest(t *testing.T) {
-	if os.Getenv("MEKTUP_ACCEPT_CALLBACKS") != "1" {
-		t.Skip("set MEKTUP_ACCEPT_CALLBACKS=1 to run isolated real app-server callback acceptance")
+	if os.Getenv("MEKTUP_COMPAT_CONTAINER") != "1" || os.Getenv("MEKTUP_ACCEPT_CALLBACKS") != "1" {
+		t.Skip("run through scripts/qualify-codex-release.sh")
 	}
-	codexBinary := os.Getenv("MEKTUP_ACCEPT_CODEX_BINARY")
-	if codexBinary == "" {
-		var err error
-		codexBinary, err = exec.LookPath("codex")
-		if err != nil {
-			t.Fatal("codex binary is required for callback acceptance")
-		}
-	}
+	codexBinary := requiredExecutable(t, "MEKTUP_ACCEPT_CODEX_BINARY", "codex")
 
 	responses := newCallbackResponsesServer(t)
 	defer responses.Close()
@@ -108,7 +100,7 @@ stream_max_retries = 0
 		"capabilities": map[string]any{"experimentalApi": true},
 	})
 	expectedVersion := os.Getenv("MEKTUP_ACCEPT_CODEX_VERSION")
-	if expectedVersion != "" && !strings.Contains(string(initialize), `/`+expectedVersion+` `) {
+	if expectedVersion == "" || !strings.Contains(string(initialize), `/`+expectedVersion+` `) {
 		t.Fatalf("unexpected daemon initialize result: %s", initialize)
 	}
 	t.Logf("codex=%s version=%s sha256=%s expected=%s initialize=%s", codexBinary, executableVersion(t, codexBinary), fileSHA256(t, codexBinary), expectedVersion, initialize)
@@ -236,6 +228,30 @@ stream_max_retries = 0
 	}
 	if resolved != 1 {
 		t.Fatalf("resolved blocker generations = %d, want 1: %#v", resolved, rows)
+	}
+	approval, err := adapter.Subscribe(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approvalDone := drainObservedStream(approval)
+	tui.request(t, ctx, "approval-turn", "turn/start", map[string]any{
+		"threadId": threadID,
+		"input":    []map[string]any{{"type": "text", "text": "run the requested command"}},
+		"model":    "mock-model",
+	})
+	approvalRequest := tui.waitRequest(t, ctx, "item/commandExecution/requestApproval")
+	waitForBlockers(t, blockers, ep.ID, threadID, 3, 1)
+	tui.respond(t, approvalRequest.ID, map[string]any{"decision": "decline"})
+	tui.waitNotification(t, ctx, "serverRequest/resolved")
+	tui.waitNotification(t, ctx, "turn/completed")
+	waitForBlockers(t, blockers, ep.ID, threadID, 3, 2)
+	if err := approval.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-approvalDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("approval observer did not detach")
 	}
 	outboundMu.Lock()
 	frames := append([][]byte(nil), outbound...)
@@ -465,9 +481,12 @@ func (b *lockedBuffer) String() string {
 
 func waitForUnixSocket(t *testing.T, command *exec.Cmd, socket string, output *lockedBuffer) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
-		if info, err := os.Lstat(socket); err == nil && info.Mode()&os.ModeSocket != 0 {
+		// Newer daemons can publish a symlink to their private socket. A
+		// successful connection proves readiness for either layout.
+		if conn, err := net.DialTimeout("unix", socket, 100*time.Millisecond); err == nil {
+			_ = conn.Close()
 			return
 		}
 		if command.ProcessState != nil && command.ProcessState.Exited() {
