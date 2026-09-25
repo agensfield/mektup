@@ -83,7 +83,7 @@ receipt="$(jq -nc \
   --arg source "$(git -C "$repo_root" rev-parse HEAD)" \
   --argjson dirty "$source_dirty" \
   --argjson checksPassed "$(if [[ "$result" -eq 0 ]]; then printf true; else printf false; fi)" \
-  '{status:$status, qualified:($status == "PASS"), checksPassed:$checksPassed, schema:"mektup/codex-qualification/v1", codexVersion:$version, codexAssetSha256:$digest, platform:$platform, mektupSourceCommit:$source, sourceDirty:$dirty, checks:["all Go race tests", "wire conformance", "real app-server lifecycle and all owned RPC methods", "real body, reply, custody wait and restart", "real app-server proxy", "user-input and approval callback passivity"]}')"
+  '{status:$status, qualified:($status == "PASS"), checksPassed:$checksPassed, schema:"mektup/codex-qualification/v1", codexVersion:$version, codexAssetSha256:$digest, platform:$platform, mektupSourceCommit:$source, sourceDirty:$dirty, checks:["all Go race tests", "wire conformance", "real app-server lifecycle and all owned RPC methods", "built-in local identity and doctor on the managed socket", "real body, reply, custody wait and restart", "real app-server proxy", "user-input and approval callback passivity"]}')"
 printf '%s\n' "$receipt"
 if [[ -n "${MEKTUP_COMPAT_REPORT_DIR:-}" ]]; then
   install -d -m 0700 "$MEKTUP_COMPAT_REPORT_DIR"

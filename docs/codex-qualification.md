@@ -24,6 +24,9 @@ clean Mektup source commit:
   which must appear in the real request trace;
 - exact native body and reply identity, local custody wait, and journal
   recovery after close/reopen;
+- built-in `local` endpoint identity and stable-ID resolution through the
+  daemon's control path, including a symlinked managed socket, plus a healthy
+  read-only `doctor` socket finding;
 - Codex `app-server proxy` carrying an actual Mektup SSH transport client;
 - passive Mektup observation while another client handles both user-input
   and command-approval requests, including detach, replay, and blocker state.

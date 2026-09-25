@@ -2,6 +2,7 @@ package doctor
 
 import (
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -114,6 +115,56 @@ func TestDoctorPermissionRepairRefusesSymlink(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0644 {
 		t.Fatalf("symlink repair changed target mode to %04o", info.Mode().Perm())
+	}
+}
+
+func TestDoctorManagedDaemonSocketLink(t *testing.T) {
+	root := t.TempDir()
+	shortRoot, err := os.MkdirTemp("/tmp", "mektup-sock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(shortRoot) })
+	target := filepath.Join(shortRoot, "managed.sock")
+	listener, err := net.Listen("unix", target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	if err := os.Chmod(target, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "control.sock")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	findings, err := probeSocket(context.Background(), link)
+	if err != nil || len(findings) != 1 || findings[0].Severity != SeverityOK {
+		t.Fatalf("managed socket findings = %#v, %v", findings, err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(root, "missing.sock"), link); err != nil {
+		t.Fatal(err)
+	}
+	findings, err = probeSocket(context.Background(), link)
+	if err != nil || len(findings) != 1 || findings[0].Severity != SeverityNotice {
+		t.Fatalf("missing managed socket findings = %#v, %v", findings, err)
+	}
+	if err := os.Remove(link); err != nil {
+		t.Fatal(err)
+	}
+	regular := filepath.Join(root, "regular")
+	if err := os.WriteFile(regular, []byte("not a socket"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(regular, link); err != nil {
+		t.Fatal(err)
+	}
+	findings, err = probeSocket(context.Background(), link)
+	if err != nil || len(findings) != 1 || findings[0].Severity != SeverityError {
+		t.Fatalf("non-socket link findings = %#v, %v", findings, err)
 	}
 }
 
