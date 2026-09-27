@@ -643,7 +643,7 @@ func (e *Environment) openResources(ctx context.Context, inv cli.Invocation) (*r
 		if j == nil {
 			return nil, errors.New("messaging requires a writable local journal")
 		}
-		pool, messaging, err = e.composeMessaging(ctx, inv, j, store, artifacts, input, facts, audit)
+		pool, messaging, err = e.composeMessaging(ctx, inv, j, store, connections, artifacts, input, facts, audit)
 		if err != nil {
 			if artifacts != nil {
 				_ = artifacts.Close()
@@ -677,7 +677,7 @@ func (e *Environment) debug(inv cli.Invocation, event string, fields map[string]
 	_, _ = fmt.Fprintln(e.options.DebugWriter, "mektup debug:", strings.Join(clean, " "))
 }
 
-func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, j *journal.Journal, store endpoint.EndpointStore, artifacts *artifact.Store, input executor.ReaderInput, facts *connectionFacts, audit *auditCapture) (*runtime.ConnectionPool, *messageexecutor.Executor, error) {
+func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, j *journal.Journal, store endpoint.EndpointStore, connections *connectionFactory, artifacts *artifact.Store, input executor.ReaderInput, facts *connectionFacts, audit *auditCapture) (*runtime.ConnectionPool, *messageexecutor.Executor, error) {
 	codexHome := firstNonEmpty(inv.Resolved.CodexHome, e.options.CodexHome)
 	stateProbe := e.options.ThreadStateProbe
 	herdr := e.herdrResolver()
@@ -720,9 +720,28 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 		if err != nil {
 			return nil, err
 		}
-		return runtime.OriginalResolver{Observe: observe, Target: service.ResolvedTarget{EndpointID: source.EndpointID, URI: source.URI, ThreadID: threadIDFromURI(source.URI), Loaded: true, Persistent: true}, ValidateURI: func(_ context.Context, endpointID, uri string) error {
+		original := runtime.OriginalResolver{Observe: observe, Target: service.ResolvedTarget{EndpointID: source.EndpointID, URI: source.URI, ThreadID: threadIDFromURI(source.URI), Loaded: true, Persistent: true}, ValidateURI: func(_ context.Context, endpointID, uri string) error {
 			return validateEndpointURISelector(store, codexHome, endpointID, uri)
-		}}, nil
+		}}
+		if e.options.SessionFactory == nil {
+			original.CandidateLookup = func(lookupCtx context.Context, target service.ResolvedTarget, reference string) ([]service.ObservedItem, error) {
+				ep, err := store.ResolveEndpointID(target.EndpointID, codexHome)
+				if err != nil {
+					return nil, err
+				}
+				conn, err := connections.OpenPinned(lookupCtx, ep, executor.OpenOptions{ExperimentalAPI: true})
+				if err != nil {
+					return nil, err
+				}
+				defer conn.Close()
+				reader, ok := conn.Codex().(runtime.OriginalSearchClient)
+				if !ok {
+					return nil, runtime.ErrTargetedOriginalLookupUnsupported
+				}
+				return runtime.SearchOriginalCandidates(lookupCtx, reader, target, reference)
+			}
+		}
+		return original, nil
 	}
 	prepareCustody := func(prepareCtx context.Context, operation cli.Invocation) error {
 		resolver := resolverFor(operation)

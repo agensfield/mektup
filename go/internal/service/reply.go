@@ -18,6 +18,11 @@ type OriginalMessage struct {
 // materially different valid envelope for the requested identity. Callers
 // must not choose a fuzzy or ranked candidate.
 var ErrOriginalIdentityConflict = errors.New("service: original message identity conflict")
+var ErrOriginalNotFound = errors.New("service: original message not found")
+
+// ErrOriginalLookupIncomplete distinguishes a bounded or failed native history
+// read from authoritative evidence that an original message does not exist.
+var ErrOriginalLookupIncomplete = errors.New("service: original lookup incomplete")
 
 // OriginalResolver is deliberately separate from endpoint resolution. It may
 // use current history, a local receipt, or an explicitly imported receipt, but
@@ -86,6 +91,9 @@ func (s *Service) reply(ctx context.Context, resolver OriginalResolver, req Repl
 	if err != nil {
 		if errors.Is(err, ErrOriginalIdentityConflict) {
 			return ReplyResult{}, semantic(mektup.ErrMessageIdentityConflict, "original message identity is ambiguous", nil, err)
+		}
+		if errors.Is(err, ErrOriginalLookupIncomplete) {
+			return ReplyResult{}, semantic(mektup.ErrResolverUnavailable, "original message history could not be verified completely", nil, err)
 		}
 		return ReplyResult{}, semantic(mektup.ErrMessageNotFound, "original message could not be resolved", nil, err)
 	}

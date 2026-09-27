@@ -38,6 +38,8 @@ var (
 	ErrUnboundedPage            = errors.New("codexapi: response page exceeds the bounded limit")
 	ErrPaginationStalled        = errors.New("codexapi: pagination cursor repeated")
 	ErrPaginationExceeded       = errors.New("codexapi: reconciliation pagination bound exceeded")
+	ErrHistoryItemNotFound      = errors.New("codexapi: exact history item was not found")
+	ErrHistoryItemAmbiguous     = errors.New("codexapi: exact history item is ambiguous")
 	ErrCutoffUnproven           = errors.New("codexapi: exact cutoff read did not prove the requested turn")
 	ErrInvalidCWD               = errors.New("codexapi: cwd must be a string or []string")
 	ErrConflictingCWD           = errors.New("codexapi: CWD and Cwd aliases conflict")
@@ -217,6 +219,11 @@ type ThreadItemsResponse struct {
 	Raw                         json.RawMessage
 }
 type ThreadItemsListResponse = ThreadItemsResponse
+type ExactHistoryItem struct {
+	TurnID string
+	ItemID string
+	Item   json.RawMessage
+}
 type UnsubscribeResponse struct {
 	Status string
 	Raw    json.RawMessage
@@ -546,6 +553,46 @@ func (c *Client) ThreadItems(ctx context.Context, options ItemsOptions) (ThreadI
 	var out ThreadItemsResponse
 	err := c.callDecode(ctx, "thread/items/list", p, func(raw json.RawMessage) error { var e error; out, e = decodeItems(raw, options.Limit); return e })
 	return out, err
+}
+
+// ReadItemAtTurnCursor uses an opaque server cursor only as a locator. The
+// returned full native turn must independently contain the requested turn and
+// item IDs; the cursor itself never supplies identity or content authority.
+func (c *Client) ReadItemAtTurnCursor(ctx context.Context, threadID, turnID, itemID, cursor string) (ExactHistoryItem, error) {
+	if threadID == "" || turnID == "" || itemID == "" || cursor == "" {
+		return ExactHistoryItem{}, errors.New("codexapi: thread, turn, item, and turn cursor are required")
+	}
+	page, err := c.ThreadTurns(ctx, TurnsOptions{ThreadID: threadID, Cursor: cursor, Limit: 1, ItemsView: "full"})
+	if err != nil {
+		return ExactHistoryItem{}, err
+	}
+	if len(page.Data) != 1 || page.Data[0].ID != turnID {
+		return ExactHistoryItem{}, ErrHistoryItemNotFound
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(page.Data[0].Fields["items"], &items); err != nil {
+		return ExactHistoryItem{}, fmt.Errorf("codexapi: full turn items: %w", err)
+	}
+	var found json.RawMessage
+	for _, raw := range items {
+		var identity struct {
+			ID string `json:"id"`
+		}
+		if err := json.Unmarshal(raw, &identity); err != nil {
+			return ExactHistoryItem{}, fmt.Errorf("codexapi: full turn item: %w", err)
+		}
+		if identity.ID != itemID {
+			continue
+		}
+		if found != nil {
+			return ExactHistoryItem{}, ErrHistoryItemAmbiguous
+		}
+		found = append(json.RawMessage(nil), raw...)
+	}
+	if found == nil {
+		return ExactHistoryItem{}, ErrHistoryItemNotFound
+	}
+	return ExactHistoryItem{TurnID: turnID, ItemID: itemID, Item: found}, nil
 }
 
 func (c *Client) ThreadStart(ctx context.Context, options StartOptions) (ThreadStartResponse, error) {

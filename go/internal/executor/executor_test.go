@@ -21,10 +21,11 @@ import (
 )
 
 type fakeCodex struct {
-	scoped       bool
-	allowName    bool
-	threadIDs    *[]string
-	turnsOptions *codexapi.TurnsOptions
+	scoped        bool
+	allowName     bool
+	threadIDs     *[]string
+	turnsOptions  *codexapi.TurnsOptions
+	searchOptions *codexapi.SearchOccurrencesOptions
 }
 
 func (f fakeCodex) ThreadList(context.Context, codexapi.ThreadListOptions) (codexapi.ThreadListResponse, error) {
@@ -64,11 +65,21 @@ func (f fakeCodex) ThreadSetName(context.Context, string, string) (codexapi.Thre
 func (f fakeCodex) Search(context.Context, codexapi.SearchOptions) (codexapi.SearchResponse, error) {
 	return codexapi.SearchResponse{Raw: json.RawMessage(`{"data":[],"nextCursor":"search"}`), NextCursor: "search"}, nil
 }
-func (f fakeCodex) SearchOccurrences(context.Context, codexapi.SearchOccurrencesOptions) (codexapi.SearchOccurrencesResponse, error) {
+func (f fakeCodex) SearchOccurrences(_ context.Context, options codexapi.SearchOccurrencesOptions) (codexapi.SearchOccurrencesResponse, error) {
+	if f.searchOptions != nil {
+		*f.searchOptions = options
+	}
 	if !f.scoped {
 		return codexapi.SearchOccurrencesResponse{}, errors.New("scoped unavailable")
 	}
 	return codexapi.SearchOccurrencesResponse{Raw: json.RawMessage(`{"data":[],"nextCursor":"scoped"}`), NextCursor: "scoped"}, nil
+}
+
+func (fakeCodex) ReadItemAtTurnCursor(_ context.Context, threadID, turnID, itemID, cursor string) (codexapi.ExactHistoryItem, error) {
+	if threadID != "thr_1" || turnID != "turn-1" || itemID != "item-1" || cursor != "turn-cursor" {
+		return codexapi.ExactHistoryItem{}, codexapi.ErrHistoryItemNotFound
+	}
+	return codexapi.ExactHistoryItem{TurnID: turnID, ItemID: itemID, Item: json.RawMessage(`{"id":"item-1","type":"userMessage","content":[{"type":"text","text":"complete message"}]}`)}, nil
 }
 
 type noNameCodex struct{}
@@ -106,9 +117,10 @@ func (f *fakeConnection) Warnings() []string { return []string{"server_version_u
 func (f *fakeConnection) Close() error       { return nil }
 
 type fakeConnections struct {
-	opened  int
-	checked int
-	conn    *fakeConnection
+	opened   int
+	checked  int
+	conn     *fakeConnection
+	selector string
 }
 
 type fakeTargets struct {
@@ -140,9 +152,26 @@ func (f *optionsConnections) OpenWithOptions(ctx context.Context, selector strin
 	return f.fakeConnections.Open(ctx, selector)
 }
 
-func (f *fakeConnections) Open(context.Context, string) (Connection, error) {
+func (f *fakeConnections) Open(_ context.Context, selector string) (Connection, error) {
 	f.opened++
+	f.selector = selector
 	return f.conn, nil
+}
+
+func TestScopedSearchResolvesURIToNativeThreadBeforeOpening(t *testing.T) {
+	const uri = "codex://local/thread/01999999-9999-7999-8999-999999999999"
+	var search codexapi.SearchOccurrencesOptions
+	targets := &fakeTargets{endpoint: "ep_pinned", thread: "thr_1"}
+	connections := &fakeConnections{conn: &fakeConnection{api: fakeCodex{scoped: true, searchOptions: &search}}}
+	e := New(Ports{Connections: connections, Targets: targets, Receipts: &fakeReceipts{}})
+	var out, errOut bytes.Buffer
+	app := &cli.App{Out: &out, Err: &errOut, Executor: e}
+	if code := app.Run([]string{"search", "needle", "--thread", uri, "--limit", "1", "--json"}); code != int(cli.ExitSuccess) {
+		t.Fatalf("scoped URI search exit=%d stderr=%q", code, errOut.String())
+	}
+	if len(targets.seen) != 1 || targets.seen[0] != uri || search.ThreadID != "thr_1" || connections.selector != "ep_pinned" {
+		t.Fatalf("URI target was not pinned: seen=%#v search=%+v selector=%q", targets.seen, search, connections.selector)
+	}
 }
 func (f *fakeConnections) Check(context.Context, string) (any, error) {
 	f.checked++
@@ -491,6 +520,7 @@ func TestAppJSONLUsesLockedReadAndStorageFamilies(t *testing.T) {
 		{"thread read", []string{"thread", "read", "thr_1"}, "thread.read.completed", "thread", true, ""},
 		{"thread turns", []string{"thread", "turns", "thr_1", "--view", "summary"}, "thread.turns.completed", "thread", true, ""},
 		{"thread items", []string{"thread", "items", "thr_1"}, "thread.items.completed", "thread", true, ""},
+		{"thread item", []string{"thread", "item", "thr_1", "turn-1", "item-1", "--cursor", "turn-cursor"}, "thread.items.completed", "thread", true, ""},
 		{"search", []string{"search", "needle"}, "search.completed", "thread", true, ""},
 		{"search scoped", []string{"search", "needle", "--thread", "thr_1"}, "search.completed", "message", true, ""},
 		{"storage status", []string{"storage", "status"}, "storage.completed", "storage", false, "status"},

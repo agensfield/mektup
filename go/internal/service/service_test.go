@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -664,6 +665,22 @@ type originalResolver struct{ original OriginalMessage }
 
 func (r originalResolver) ResolveOriginal(context.Context, string) (OriginalMessage, error) {
 	return r.original, nil
+}
+
+type incompleteOriginalResolver struct{}
+
+func (incompleteOriginalResolver) ResolveOriginal(context.Context, string) (OriginalMessage, error) {
+	return OriginalMessage{}, fmt.Errorf("%w: native history exceeded its read bound", ErrOriginalLookupIncomplete)
+}
+
+func TestReplyIncompleteOriginalLookupIsNotMessageNotFound(t *testing.T) {
+	r := baseResolver()
+	s := validService(&r, &fakeDelivery{}, newFakeJournal())
+	_, err := s.Reply(context.Background(), incompleteOriginalResolver{}, ReplyRequest{Reference: "msg_01999999-9999-7999-8999-999999999999", Body: "answer"})
+	var semanticErr *Error
+	if !errors.As(err, &semanticErr) || semanticErr.Code != mektup.ErrResolverUnavailable {
+		t.Fatalf("incomplete original lookup error = %v, want resolver_unavailable", err)
+	}
 }
 
 func TestWaitGapReturnsIncompleteWithoutInventingReply(t *testing.T) {
