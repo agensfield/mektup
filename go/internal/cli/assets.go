@@ -40,7 +40,7 @@ Targets:
   herdr://<endpoint-alias-or-id>/pane/<workspace:pane>
 
 Thread/read:
-  thread list|read|turns|items|start|resume|fork
+  thread list|read|turns|items|item|start|resume|fork
   search <query> [--thread <target>]
 
 Receipts/endpoints/storage:
@@ -68,8 +68,10 @@ turn completion or human understanding.
 `,
 	"reply": `Usage: mektup reply <message-or-receipt-id> [message|--stdin|--file <path>] [options]
 
-Replies resolve the original pinned sender thread. --status is success or
-error; --error-code requires --status error.
+Replies resolve the exact wrapped original in your current thread. Use its
+message-id, not a search snippet or a native item ID. An incomplete history
+lookup reports resolver_unavailable rather than claiming message_not_found.
+--status is success or error; --error-code requires --status error.
 `,
 	"wait": `Usage: mektup wait <receipt-or-message-id> [--timeout <duration>]
 
@@ -91,11 +93,38 @@ Compact receipt pages include an opaque nextCursor consumed by
 
 Documentation is embedded and works without endpoint or journal state.
 `,
-	"search": "Usage: mektup search <query> [--thread <target>] [--archived] [--source <kind>]... [--limit <n>] [--cursor <token>]\n",
-	"thread": `Usage: mektup thread list|read|turns|items|start|resume|fork [options]
+	"search": `Usage: mektup search <query> [--thread <thread-UUID-or-URI>] [--archived] [--source <kind>]... [--limit <n>] [--cursor <token>]
+
+Scoped --thread accepts a bare native UUID or a Codex thread URI. The result
+includes turnId, itemId, and turnCursor for an exact full-item read:
+
+  mektup thread item <thread-URI> <turnId> <itemId> --cursor '<turnCursor>' --json
+`,
+	"thread": `Usage: mektup thread list|read|turns|items|item|start|resume|fork [options]
 
 Read and lifecycle commands accept a configured target URI. A known local
-thread UUID can be addressed as codex://local/thread/<thread-uuid>.
+thread UUID can be addressed as codex://local/thread/<thread-uuid>. For a
+search hit, use thread item with its turnId, itemId, and turnCursor to read
+only that native item instead of paging the whole thread.
+`,
+	"thread item": `Usage: mektup thread item <thread-target> <turn-id> <item-id> --cursor <turnCursor> [--json]
+
+Use the exact turnId, itemId, and turnCursor from a scoped search hit. Mektup
+reads the native full turn at that cursor, checks both IDs, and returns one
+row in the existing thread.items.completed event. Implicit agent output is a
+bounded preview; --json deliberately returns the complete native item.
+Search/cursor metadata is never trusted as content or reply authority.
+`,
+	"thread items": `Usage: mektup thread items <thread-target> [--turn <turn-id>] [--limit <n>] [--cursor <token>] [--json]
+
+This is a paginated collection. --turn restricts it to one turn; --json keeps
+full native items, while implicit agent mode previews them. For a known search
+hit, thread item with turnCursor avoids paging even a long turn.
+`,
+	"thread turns": `Usage: mektup thread turns <thread-target> [--view summary|full] [--limit <n>] [--cursor <token>]
+
+--view full is an explicit exact turn read. Search-hit turnCursor can locate
+one turn with --cursor and --limit 1; thread item extracts one item directly.
 `,
 	"receipt":    "Usage: mektup receipt list [--limit <n>] [--cursor <token>]|show|reconcile|resolve [options]\n",
 	"endpoint":   "Usage: mektup endpoint list|show|add|remove|check [options]\n",

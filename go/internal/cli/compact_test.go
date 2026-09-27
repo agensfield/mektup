@@ -285,6 +285,27 @@ func TestCompactPreviewAndScopedSearchLocatorPreserveOriginalBasis(t *testing.T)
 	}
 }
 
+func TestCompactSingleItemKeepsLocatorWithoutLeakingFullBody(t *testing.T) {
+	body := strings.Repeat("full item body ", 100)
+	event := compactLifecycleEvent(Invocation{Resolved: ResolvedGlobals{Compact: true}}, map[string]any{
+		"event": "thread.items.completed", "data": map[string]any{
+			"endpointId": "ep_stable", "threadId": "thread-1", "data": []any{map[string]any{
+				"turnId": "turn-1",
+				"item":   map[string]any{"id": "item-1", "type": "userMessage", "content": []any{map[string]any{"type": "text", "text": body}}},
+			}},
+		},
+	})
+	row := event["data"].(map[string]any)["data"].([]any)[0].(map[string]any)
+	locator := row["historyLocator"].(map[string]any)
+	if row["id"] != "item-1" || row["item"] != nil || locator["turnId"] != "turn-1" || locator["itemId"] != "item-1" {
+		t.Fatalf("compact item leaked or lost identity: %#v", row)
+	}
+	preview := row["textPreview"].(map[string]any)
+	if preview["truncated"] != true || preview["sourceChars"].(int) <= preview["chars"].(int) {
+		t.Fatalf("compact item preview = %#v", preview)
+	}
+}
+
 func TestCompactErrorRetainsTruncatedDetailsWithoutChangingUsageExit(t *testing.T) {
 	huge := strings.Repeat("detail", 500)
 	executor := &compactTestExecutor{err: &Error{Code: "invalid_arguments", Message: "bad request", Effect: "not_sent", Exit: ExitUsage, Details: map[string]any{"cause": huge}}}

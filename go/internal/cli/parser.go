@@ -374,7 +374,7 @@ func validateNested(inv Invocation) *Error {
 		return usageError("invalid positional arguments for " + key)
 	}
 	switch key {
-	case "thread read", "thread turns", "thread items", "thread resume", "thread fork", "receipt show", "receipt reconcile", "receipt resolve", "endpoint show", "endpoint remove":
+	case "thread read", "thread turns", "thread items", "thread item", "thread resume", "thread fork", "receipt show", "receipt reconcile", "receipt resolve", "endpoint show", "endpoint remove":
 		if len(inv.Position) > 1 && inv.Position[1] == "" {
 			return usageError("target or receipt identifier must not be empty")
 		}
@@ -402,6 +402,9 @@ func validateNested(inv Invocation) *Error {
 	if key == "thread fork" && has(inv, "through-turn") && has(inv, "before-turn") {
 		return usageError("--through-turn and --before-turn are mutually exclusive")
 	}
+	if key == "thread item" && (inv.Position[2] == "" || inv.Position[3] == "" || inv.Option("cursor") == "") {
+		return usageError("thread item requires a turn ID, item ID, and search-hit --cursor")
+	}
 	if key == "receipt show" && has(inv, "portable") && has(inv, "content") {
 		return usageError("--portable and --content are mutually exclusive")
 	}
@@ -422,6 +425,8 @@ func validateNested(inv Invocation) *Error {
 
 func positionalMinimum(key string) int {
 	switch key {
+	case "thread item":
+		return 4
 	case "thread list", "receipt list", "endpoint list", "storage status", "storage check", "storage maintain", "storage vacuum":
 		return 1 // includes the subcommand in Position
 	case "thread start", "endpoint check":
@@ -433,6 +438,8 @@ func positionalMinimum(key string) int {
 
 func positionalMaximum(key string) int {
 	switch key {
+	case "thread item":
+		return 4
 	case "thread list", "receipt list", "endpoint list", "storage status", "storage check", "storage maintain", "storage vacuum", "thread start":
 		return 1
 	case "endpoint check":
@@ -462,6 +469,7 @@ var allowedOptionTable = map[string]string{
 	"thread read":       "",
 	"thread turns":      "view order limit cursor",
 	"thread items":      "turn order limit cursor",
+	"thread item":       "cursor",
 	"thread start":      "cwd model name",
 	"thread resume":     "",
 	"thread fork":       "through-turn before-turn name",

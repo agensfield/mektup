@@ -502,12 +502,15 @@ func (a *App) RunContext(ctx context.Context, args []string) int {
 		return a.writeGuide(parsed.Resolved.Color)
 	}
 	if parsed.Global.Help || parsed.Command == "" || parsed.Command == "help" {
-		if parsed.Command == "help" && len(parsed.Position) > 1 {
-			return a.finish(presentation, parsed, usageError("usage: mektup help [command]"))
+		if parsed.Command == "help" && len(parsed.Position) > 2 {
+			return a.finish(presentation, parsed, usageError("usage: mektup help [command [subcommand]]"))
 		}
 		topic := parsed.Position
+		if parsed.Command == "help" && len(topic) > 1 {
+			topic = []string{strings.Join(topic, " ")}
+		}
 		if parsed.Global.Help && parsed.Command != "" && parsed.Command != "help" {
-			topic = []string{parsed.Command}
+			topic = []string{strings.Join(parsed.Path, " ")}
 		}
 		return a.help(presentation, topic, parsed.Resolved.Color, parsed.Resolved.ErrorColor)
 	}

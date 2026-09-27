@@ -338,6 +338,12 @@ func TestHumanCommandDocsAndInspectHelpAreNavigable(t *testing.T) {
 			t.Fatalf("inspect help missing %q: code=%d stdout=%q stderr=%q", want, code, stdout, stderr)
 		}
 	}
+	for _, args := range [][]string{{"help", "thread", "item"}, {"thread", "item", "--help"}, {"help", "thread", "items"}} {
+		code, stdout, stderr = runTest(t, args...)
+		if code != int(ExitSuccess) || stderr != "" || !strings.Contains(stdout, "turnCursor") {
+			t.Fatalf("history help %v: code=%d stdout=%q stderr=%q", args, code, stdout, stderr)
+		}
+	}
 }
 
 func TestImplicitAgentPresentationsKeepCommandDocsMachineJSON(t *testing.T) {

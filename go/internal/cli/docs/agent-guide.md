@@ -46,6 +46,23 @@ codex://local/thread/<thread-uuid>
 Zero or multiple live Herdr-name matches fail closed. Resolution success proves
 the target identity was found; it is not message delivery evidence.
 
+To find a message and read only its exact native item, scope search to a
+thread URI and carry the returned `turnId`, `itemId`, and `turnCursor` into
+`thread item`:
+
+```text
+mektup search 'phrase' --thread codex://local/thread/<thread-uuid>
+mektup thread item codex://local/thread/<thread-uuid> <turnId> <itemId> --cursor '<turnCursor>' --json
+```
+
+The first command is bounded discovery. The second reads one full native
+turn at the server cursor, verifies both IDs, and returns only the selected
+item. Implicit agent mode returns a preview; explicit `--json` returns the
+full item. `thread items --turn <turnId> --json`
+remains a paginated alternative. Neither search hits nor cursors prove reply
+authority. For replies, use an exact wrapped original message ID and a
+request-reply envelope visible in your current thread.
+
 When the source has one verified Herdr pane association and a safe registered
 agent name, wrapped envelopes may include `from-herdr-name` beside the stable
 `from-herdr` URI. Treat the name as convenient sender presentation only. It is

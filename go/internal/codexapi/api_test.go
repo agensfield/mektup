@@ -375,6 +375,25 @@ func TestReconcileHistoryCountsNestedItems(t *testing.T) {
 	}
 }
 
+func TestReadItemAtTurnCursorBindsFullNativeTurnAndItem(t *testing.T) {
+	r := &recordingCaller{result: json.RawMessage(`{"data":[{"id":"turn-1","items":[{"id":"item-1","type":"userMessage","content":[{"type":"text","text":"full body"}]}],"status":"completed","itemsView":"full"}],"nextCursor":null}`)}
+	client := New(r, Options{})
+	item, err := client.ReadItemAtTurnCursor(context.Background(), "thread-1", "turn-1", "item-1", "opaque-cursor")
+	if err != nil || item.TurnID != "turn-1" || !strings.Contains(string(item.Item), "full body") {
+		t.Fatalf("exact item = %+v, %v", item, err)
+	}
+	var params map[string]any
+	if r.method != "thread/turns/list" || json.Unmarshal(r.params, &params) != nil || params["threadId"] != "thread-1" || params["cursor"] != "opaque-cursor" || params["itemsView"] != "full" || params["limit"] != float64(1) {
+		t.Fatalf("request = %s %s", r.method, r.params)
+	}
+	if _, err := client.ReadItemAtTurnCursor(context.Background(), "thread-1", "other-turn", "item-1", "opaque-cursor"); !errors.Is(err, ErrHistoryItemNotFound) {
+		t.Fatalf("wrong turn error = %v", err)
+	}
+	if _, err := client.ReadItemAtTurnCursor(context.Background(), "thread-1", "turn-1", "other-item", "opaque-cursor"); !errors.Is(err, ErrHistoryItemNotFound) {
+		t.Fatalf("wrong item error = %v", err)
+	}
+}
+
 func lifecycleFixture() json.RawMessage {
 	return json.RawMessage(`{"thread":{"id":"t","cliVersion":"x","createdAt":1,"cwd":"/tmp","ephemeral":false,"modelProvider":"openai","preview":"p","projectId":null,"sessionId":"s","source":"cli","status":{"type":"idle"},"turns":[],"updatedAt":1},"model":"m","modelProvider":"openai","cwd":"/tmp","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite","writableRoots":[],"networkAccess":false,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}`)
 }

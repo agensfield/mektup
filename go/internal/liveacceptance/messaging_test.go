@@ -216,7 +216,9 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 	if sent.Receipt.Message.MessageID == "" || sent.Receipt.Message.PayloadBytes == 0 {
 		t.Fatalf("accepted send lacks durable identity: %+v", sent.Receipt)
 	}
-	originalResolver := mekruntime.OriginalResolver{Observe: observation, Target: targetResolved}
+	originalResolver := mekruntime.OriginalResolver{Observe: observation, Target: targetResolved, CandidateLookup: func(ctx context.Context, target service.ResolvedTarget, reference string) ([]service.ObservedItem, error) {
+		return mekruntime.SearchOriginalCandidates(ctx, api, target, reference)
+	}}
 	var original service.OriginalMessage
 	for original.Envelope.MessageID == "" && ctx.Err() == nil {
 		original, err = originalResolver.ResolveOriginal(ctx, sent.Receipt.Message.MessageID)
@@ -226,6 +228,15 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 	}
 	if err != nil {
 		t.Fatalf("native original discovery: %v", err)
+	}
+	hits, err := api.SearchOccurrences(ctx, codexapi.SearchOccurrencesOptions{ThreadID: target.Thread.ID, SearchTerm: sent.Receipt.Message.MessageID, Limit: 1})
+	if err != nil || len(hits.Data) != 1 {
+		t.Fatalf("indexed original hit: %+v, %v", hits, err)
+	}
+	hit := hits.Data[0]
+	item, err := api.ReadItemAtTurnCursor(ctx, target.Thread.ID, hit.TurnID, hit.ItemID, hit.TurnCursor)
+	if err != nil || !strings.Contains(string(item.Item), "Mektup qualification body") {
+		t.Fatalf("exact search-hit item: %+v, %v", item, err)
 	}
 	replied, err := receiver.Reply(ctx, originalResolver, service.ReplyRequest{Reference: original.Envelope.MessageID, Source: targetURI, Body: "Mektup qualification reply"})
 	if err != nil {

@@ -51,6 +51,10 @@ type ScopedSearcher interface {
 	SearchOccurrences(context.Context, codexapi.SearchOccurrencesOptions) (codexapi.SearchOccurrencesResponse, error)
 }
 
+type ExactHistoryItemReader interface {
+	ReadItemAtTurnCursor(context.Context, string, string, string, string) (codexapi.ExactHistoryItem, error)
+}
+
 // ThreadNameSetter is the semantic adapter for the separate
 // thread/name/set mutation. It is optional on Codex so older adapters cannot
 // accidentally treat --name as a start/fork field.
@@ -355,6 +359,23 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		kind = "thread.items"
 		data = responseDataArray(r.Raw)
 		collection, resultKind = true, "thread"
+	case "item":
+		reader, ok := api.(ExactHistoryItemReader)
+		if !ok {
+			return cli.ExecutionResult{}, missing("exact history item reader")
+		}
+		item, callErr := reader.ReadItemAtTurnCursor(ctx, threadID, inv.Position[2], inv.Position[3], inv.Option("cursor"))
+		if errors.Is(callErr, codexapi.ErrHistoryItemNotFound) {
+			return cli.ExecutionResult{}, &cli.Error{Code: "content_unavailable", Message: "exact item is not present at the search-hit turn cursor", Effect: "not_sent", Exit: cli.ExitRejected}
+		}
+		if errors.Is(callErr, codexapi.ErrHistoryItemAmbiguous) {
+			return cli.ExecutionResult{}, &cli.Error{Code: "message_identity_conflict", Message: "exact item identity is ambiguous in the native turn", Effect: "not_sent", Exit: cli.ExitRejected}
+		}
+		if callErr != nil {
+			return cli.ExecutionResult{}, mapError(callErr, "not_sent")
+		}
+		data, kind = []any{map[string]any{"turnId": item.TurnID, "item": item.Item}}, "thread.items"
+		collection, resultKind = true, "thread"
 	case "start":
 		r, callErr := api.ThreadStart(ctx, codexapi.StartOptions{Model: inv.Option("model"), CWD: inv.Option("cwd"), ThreadSource: inv.Option("source")})
 		if callErr != nil {
@@ -466,9 +487,50 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (result cli.E
 	if e.ports.ReadReceipts == nil && e.ports.Receipts == nil {
 		return cli.ExecutionResult{}, missing("read receipt journal")
 	}
-	conn, api, err := e.openWithOptions(ctx, inv.Resolved.Endpoint, OpenOptions{ExperimentalAPI: true})
+	threadID := inv.Option("thread")
+	endpointSelector, endpointID := inv.Resolved.Endpoint, inv.Resolved.Endpoint
+	var resolvedEndpoint endpoint.Endpoint
+	if threadID != "" && e.ports.Targets != nil {
+		var target ThreadTarget
+		var resolveErr error
+		if explicit, ok := e.ports.Targets.(ExplicitThreadTargetResolver); ok {
+			target, resolveErr = explicit.ResolveThreadWithOptions(ctx, threadID, inv.Resolved.Endpoint, inv.Resolved.EndpointSource != cli.PathDefault)
+		} else {
+			target, resolveErr = e.ports.Targets.ResolveThread(ctx, threadID, inv.Resolved.Endpoint)
+		}
+		if resolveErr != nil {
+			return cli.ExecutionResult{}, mapError(resolveErr, "not_sent")
+		}
+		threadID, endpointSelector, endpointID, resolvedEndpoint = target.ThreadID, target.Endpoint, target.EndpointID, target.Resolved
+		if endpointID == "" {
+			endpointID = endpointSelector
+		}
+	} else if strings.Contains(threadID, "://") {
+		return cli.ExecutionResult{}, &cli.Error{Code: "invalid_target", Message: "search --thread URI requires a thread target resolver", Effect: "not_sent", Exit: cli.ExitUsage}
+	}
+	var conn Connection
+	var api Codex
+	var err error
+	if resolvedEndpoint.ID != "" {
+		if pinned, ok := e.ports.Connections.(PinnedConnectionFactory); ok {
+			conn, err = pinned.OpenPinned(ctx, resolvedEndpoint, OpenOptions{ExperimentalAPI: true})
+			if err == nil && conn != nil {
+				api = conn.Codex()
+			}
+		} else {
+			conn, api, err = e.openWithOptions(ctx, endpointSelector, OpenOptions{ExperimentalAPI: true})
+		}
+	} else {
+		conn, api, err = e.openWithOptions(ctx, endpointSelector, OpenOptions{ExperimentalAPI: true})
+	}
 	if err != nil {
-		return cli.ExecutionResult{}, err
+		return cli.ExecutionResult{}, mapError(err, "not_sent")
+	}
+	if conn == nil || api == nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return cli.ExecutionResult{}, missing("codex connection")
 	}
 	defer func() {
 		if closeErr := conn.Close(); closeErr != nil {
@@ -483,24 +545,24 @@ func (e *Executor) search(ctx context.Context, inv cli.Invocation) (result cli.E
 		}
 	}()
 	options := codexapi.SearchOptions{SearchTerm: inv.Position[0], Cursor: inv.Option("cursor"), Limit: optionInt(inv, "limit"), SourceKinds: options(inv, "source"), Archived: boolOption(inv, "archived")}
-	if thread := inv.Option("thread"); thread != "" {
+	if threadID != "" {
 		scoped, ok := api.(ScopedSearcher)
 		if !ok {
 			return cli.ExecutionResult{}, &cli.Error{Code: "experimental_method_unavailable", Message: "scoped search is not available on this connection", Effect: "not_sent", Exit: cli.ExitRejected}
 		}
-		r, callErr := scoped.SearchOccurrences(ctx, codexapi.SearchOccurrencesOptions{ThreadID: thread, SearchTerm: inv.Position[0], Cursor: inv.Option("cursor"), Limit: optionInt(inv, "limit")})
+		r, callErr := scoped.SearchOccurrences(ctx, codexapi.SearchOccurrencesOptions{ThreadID: threadID, SearchTerm: inv.Position[0], Cursor: inv.Option("cursor"), Limit: optionInt(inv, "limit")})
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}
 		data, cursor := responseDataArray(r.Raw), r.NextCursor
 		warnings := append([]string(nil), conn.Warnings()...)
-		receipt, receiptErr := e.searchReceipt(ctx, inv.Resolved.Endpoint, "message", data, cursor)
+		receipt, receiptErr := e.searchReceipt(ctx, endpointID, "message", data, cursor)
 		if receiptErr != nil {
 			return cli.ExecutionResult{}, receiptErr
 		}
-		output, outputErr := e.collectionResultWithReceipt(ctx, "search", "message", data, cursor, warnings, inv.Resolved.Endpoint, receipt)
+		output, outputErr := e.collectionResultWithReceipt(ctx, "search", "message", data, cursor, warnings, endpointID, receipt)
 		if outputErr == nil {
-			addResultData(&output, "threadId", thread)
+			addResultData(&output, "threadId", threadID)
 		}
 		return output, outputErr
 	}
