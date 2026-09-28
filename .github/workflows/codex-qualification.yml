@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Published Codex version (for example 0.157.0)
+        description: Published Codex version (for example 0.158.0)
         required: true
         type: string
   schedule:
