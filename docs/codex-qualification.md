@@ -24,6 +24,9 @@ clean Mektup source commit:
   which must appear in the real request trace;
 - exact native body and reply identity, local custody wait, and journal
   recovery after close/reopen;
+- production CLI metadata-only resume and sends against more than 16 MiB
+  of stored conversation: cold send resumes once, loaded send skips resume,
+  and exact body readback uses a bounded native page;
 - built-in `local` endpoint identity and stable-ID resolution through the
   daemon's control path, including a symlinked managed socket, plus a healthy
   read-only `doctor` socket finding;

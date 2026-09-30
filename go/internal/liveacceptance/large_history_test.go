@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -47,6 +48,9 @@ func qualifyLargeHistory(t *testing.T, ctx context.Context, api *codexapi.Client
 	}
 	t.Logf("full-history resume exceeded transport limit: %v", resumeErr)
 	waitThread(t, ctx, api, large.Thread.ID, false)
+	if err := os.Mkdir(filepath.Join(root, "large-history"), 0700); err != nil {
+		t.Fatal(err)
+	}
 	config := filepath.Join(root, "large-history", "endpoints.json")
 	state := filepath.Join(root, "large-history", "state")
 	identity := filepath.Join(root, "large-history", "identity")
