@@ -131,10 +131,19 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The seed client observes many turns; drain notifications continuously
+	// rather than overflowing its bounded event queue while issuing RPCs.
+	adminDrained := make(chan struct{})
+	go func() {
+		defer close(adminDrained)
+		for range admin.Events() {
+		}
+	}()
 	t.Cleanup(func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer closeCancel()
 		_ = admin.Close(closeCtx)
+		<-adminDrained
 	})
 	info := admin.Info()
 	if expected := os.Getenv("MEKTUP_ACCEPT_CODEX_VERSION"); expected == "" || info.Compatibility.Version != expected {
