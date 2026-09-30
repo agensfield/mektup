@@ -58,7 +58,7 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 	if err := os.Mkdir(codexHome, 0700); err != nil {
 		t.Fatal(err)
 	}
-	config := fmt.Sprintf("model = \"mock-model\"\napproval_policy = \"never\"\nsandbox_mode = \"read-only\"\nmodel_provider = \"mock_provider\"\n[model_providers.mock_provider]\nname = \"Mektup qualification\"\nbase_url = %q\nwire_api = \"responses\"\nrequest_max_retries = 0\nstream_max_retries = 0\n", responses.URL+"/v1")
+	config := fmt.Sprintf("thread_unload_delay_secs = 1\nmodel = \"mock-model\"\napproval_policy = \"never\"\nsandbox_mode = \"read-only\"\nmodel_provider = \"mock_provider\"\n[model_providers.mock_provider]\nname = \"Mektup qualification\"\nbase_url = %q\nwire_api = \"responses\"\nrequest_max_retries = 0\nstream_max_retries = 0\n", responses.URL+"/v1")
 	if err := os.WriteFile(filepath.Join(codexHome, "config.toml"), []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
