@@ -4,7 +4,7 @@ Mektup is an agent-first, reliable Codex thread-control library and CLI.
 Messaging is its first product-critical workflow; thread control is its reusable
 foundation.
 
-Mektup v1.0.9 implements specification revision 1.0.8 and is tested against
+Mektup v1.0.10 implements specification revision 1.0.8 and is tested against
 Codex app-server 0.154.0, 0.155.1, 0.156.0, 0.156.1, 0.157.0, 0.158.0,
 0.159.0, 0.159.1, and 0.159.2.
 
@@ -23,7 +23,7 @@ brew install agensfield/tap/mektup
 Or with Go 1.25.13 or newer:
 
 ```sh
-go install github.com/agensfield/mektup/go/cmd/mektup@v1.0.9
+go install github.com/agensfield/mektup/go/cmd/mektup@v1.0.10
 ```
 
 Run `mektup --skill` for agent-facing operating instructions or

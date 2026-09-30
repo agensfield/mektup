@@ -485,7 +485,9 @@ func deliveryErrorFromCall(err error, fallback service.WritePhase) error {
 }
 
 func (s *connectionSession) Resume(ctx context.Context, threadID string) error {
-	_, err := s.api.ThreadResume(ctx, codexapi.ResumeOptions{ThreadID: threadID})
+	// Attaching needs metadata only; history is read through paginated APIs.
+	excludeTurns := true
+	_, err := s.api.ThreadResume(ctx, codexapi.ResumeOptions{ThreadID: threadID, ExcludeTurns: &excludeTurns})
 	return err
 }
 

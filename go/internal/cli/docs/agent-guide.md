@@ -93,3 +93,8 @@ body content or revives authority, and returns only the strict `winner`,
 Run `mektup docs commands --json` for version-matched command metadata and
 `mektup version --json` for build and tested Codex metadata. Embedded docs work
 offline and do not require endpoint or journal state.
+
+`mektup thread resume <target>` reopens or attaches to a thread and returns
+metadata only. Messaging also resumes without requesting stored turns when
+needed. Read conversation history separately with paginated `thread turns` or
+`thread items` commands.

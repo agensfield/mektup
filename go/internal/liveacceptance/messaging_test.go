@@ -83,7 +83,7 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 		t.Fatalf("publish managed control socket link: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	identityStore := endpoint.NewStoreWithIdentityHome(filepath.Join(root, "config", "endpoints.json"), filepath.Join(root, "identity-state"), filepath.Join(root, "identity-state"))
 	local, err := identityStore.EnsureBuiltinLocal(codexHome)
@@ -326,6 +326,7 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 	if err != nil || status.ReplyID != replied.Receipt.Message.MessageID {
 		t.Fatalf("durable reply after restart: %+v, %v", status, err)
 	}
+	qualifyLargeHistory(t, ctx, api, route, codexHome, root, source.Thread.ID)
 	methodsMu.Lock()
 	for _, method := range requiredNativeMethods(t) {
 		if !methodsSeen[method] {
