@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	mektup "github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/appserver"
 	"github.com/agensfield/mektup/go/internal/application"
 	"github.com/agensfield/mektup/go/internal/cli"
@@ -26,7 +27,7 @@ func qualifyLargeHistory(t *testing.T, ctx context.Context, api *codexapi.Client
 	}
 	body := strings.Repeat("x", 900_000)
 	for i := 0; i < 20; i++ {
-		if _, err := api.StartOrSteer(ctx, large.Thread.ID, body, ""); err != nil {
+		if _, err := api.StartOrSteer(ctx, large.Thread.ID, body, mektup.NewMessageID()); err != nil {
 			t.Fatalf("seed turn %d: %v", i, err)
 		}
 		waitThread(t, ctx, api, large.Thread.ID, true)
