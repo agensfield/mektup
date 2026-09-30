@@ -756,3 +756,24 @@ func (p *historyPort) Subscribe(context.Context, service.ResolvedTarget) (servic
 func (p *historyPort) FullHistory(context.Context, service.ResolvedTarget) ([]service.ObservedItem, error) {
 	return p.items, nil
 }
+
+// A new connection must attach without requesting the stored conversation.
+func TestConnectionSessionResumeRequestsMetadataOnly(t *testing.T) {
+	caller := codexapi.FuncCaller(func(_ context.Context, method string, params json.RawMessage) (json.RawMessage, *codexapi.ServerError, error) {
+		var request struct {
+			ThreadID     string `json:"threadId"`
+			ExcludeTurns bool   `json:"excludeTurns"`
+		}
+		if err := json.Unmarshal(params, &request); err != nil {
+			t.Fatal(err)
+		}
+		if method != "thread/resume" || request.ThreadID != "t" || !request.ExcludeTurns {
+			t.Fatalf("resume requested conversation history: method=%s params=%s", method, params)
+		}
+		return json.RawMessage(`{"thread":{"id":"t","cliVersion":"x","createdAt":1,"cwd":"/tmp","ephemeral":false,"modelProvider":"openai","preview":"p","projectId":null,"sessionId":"s","source":"cli","status":{"type":"idle"},"turns":[],"updatedAt":1},"model":"m","modelProvider":"openai","cwd":"/tmp","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{"type":"workspaceWrite","writableRoots":[],"networkAccess":false,"excludeTmpdirEnvVar":false,"excludeSlashTmp":false}}`), nil, nil
+	})
+	session := &connectionSession{api: codexapi.New(caller, codexapi.Options{})}
+	if err := session.Resume(context.Background(), "t"); err != nil {
+		t.Fatal(err)
+	}
+}

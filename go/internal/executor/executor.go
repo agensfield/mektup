@@ -391,7 +391,8 @@ func (e *Executor) thread(ctx context.Context, inv cli.Invocation) (result cli.E
 		if len(inv.Position) < 2 {
 			return cli.ExecutionResult{}, usage("thread resume requires a thread identifier")
 		}
-		r, callErr := api.ThreadResume(ctx, codexapi.ResumeOptions{ThreadID: threadID})
+		excludeTurns := true
+		r, callErr := api.ThreadResume(ctx, codexapi.ResumeOptions{ThreadID: threadID, ExcludeTurns: &excludeTurns})
 		if callErr != nil {
 			return cli.ExecutionResult{}, mapError(callErr, "unknown")
 		}

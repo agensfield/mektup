@@ -58,7 +58,7 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 	if err := os.Mkdir(codexHome, 0700); err != nil {
 		t.Fatal(err)
 	}
-	config := fmt.Sprintf("model = \"mock-model\"\napproval_policy = \"never\"\nsandbox_mode = \"read-only\"\nmodel_provider = \"mock_provider\"\n[model_providers.mock_provider]\nname = \"Mektup qualification\"\nbase_url = %q\nwire_api = \"responses\"\nrequest_max_retries = 0\nstream_max_retries = 0\n", responses.URL+"/v1")
+	config := fmt.Sprintf("thread_unload_delay_secs = 1\nmodel = \"mock-model\"\napproval_policy = \"never\"\nsandbox_mode = \"read-only\"\nmodel_provider = \"mock_provider\"\n[model_providers.mock_provider]\nname = \"Mektup qualification\"\nbase_url = %q\nwire_api = \"responses\"\nrequest_max_retries = 0\nstream_max_retries = 0\n", responses.URL+"/v1")
 	if err := os.WriteFile(filepath.Join(codexHome, "config.toml"), []byte(config), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 		t.Fatalf("publish managed control socket link: %v", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	identityStore := endpoint.NewStoreWithIdentityHome(filepath.Join(root, "config", "endpoints.json"), filepath.Join(root, "identity-state"), filepath.Join(root, "identity-state"))
 	local, err := identityStore.EnsureBuiltinLocal(codexHome)
@@ -131,10 +131,19 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The seed client observes many turns; drain notifications continuously
+	// rather than overflowing its bounded event queue while issuing RPCs.
+	adminDrained := make(chan struct{})
+	go func() {
+		defer close(adminDrained)
+		for range admin.Events() {
+		}
+	}()
 	t.Cleanup(func() {
 		closeCtx, closeCancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer closeCancel()
 		_ = admin.Close(closeCtx)
+		<-adminDrained
 	})
 	info := admin.Info()
 	if expected := os.Getenv("MEKTUP_ACCEPT_CODEX_VERSION"); expected == "" || info.Compatibility.Version != expected {
@@ -326,6 +335,7 @@ func TestIsolatedMessagingLifecycle(t *testing.T) {
 	if err != nil || status.ReplyID != replied.Receipt.Message.MessageID {
 		t.Fatalf("durable reply after restart: %+v, %v", status, err)
 	}
+	qualifyLargeHistory(t, ctx, api, route, codexHome, root, source.Thread.ID)
 	methodsMu.Lock()
 	for _, method := range requiredNativeMethods(t) {
 		if !methodsSeen[method] {

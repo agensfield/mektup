@@ -24,6 +24,7 @@ type fakeCodex struct {
 	scoped        bool
 	allowName     bool
 	threadIDs     *[]string
+	resumeOptions *codexapi.ResumeOptions
 	turnsOptions  *codexapi.TurnsOptions
 	searchOptions *codexapi.SearchOccurrencesOptions
 }
@@ -49,7 +50,10 @@ func (f fakeCodex) ThreadItems(context.Context, codexapi.ItemsOptions) (codexapi
 func (f fakeCodex) ThreadStart(context.Context, codexapi.StartOptions) (codexapi.ThreadStartResponse, error) {
 	return codexapi.ThreadStartResponse{Thread: codexapi.Thread{ID: "thr_new"}, Raw: json.RawMessage(`{"thread":{"id":"thr_new","turns":[{"items":[{"text":"secret body"}]}]}}`)}, nil
 }
-func (f fakeCodex) ThreadResume(context.Context, codexapi.ResumeOptions) (codexapi.ThreadResumeResponse, error) {
+func (f fakeCodex) ThreadResume(_ context.Context, options codexapi.ResumeOptions) (codexapi.ThreadResumeResponse, error) {
+	if f.resumeOptions != nil {
+		*f.resumeOptions = options
+	}
 	return codexapi.ThreadResumeResponse{Raw: json.RawMessage(`{"thread":{"id":"thr_resume"}}`)}, nil
 }
 func (f fakeCodex) ThreadFork(context.Context, codexapi.ForkOptions) (codexapi.ThreadForkResponse, error) {
@@ -255,7 +259,8 @@ func invocation(command string, position ...string) cli.Invocation {
 }
 
 func TestOwnedCommandsUseOnlyInjectedPorts(t *testing.T) {
-	conn := &fakeConnection{api: fakeCodex{scoped: true}}
+	var resumeOptions codexapi.ResumeOptions
+	conn := &fakeConnection{api: fakeCodex{scoped: true, resumeOptions: &resumeOptions}}
 	connections := &fakeConnections{conn: conn}
 	endpoints := &fakeEndpoints{item: endpoint.Endpoint{ID: mektup.NewEndpointID(), Alias: "local"}}
 	storage := &fakeStorage{}
@@ -303,6 +308,9 @@ func TestOwnedCommandsUseOnlyInjectedPorts(t *testing.T) {
 			result, err := e.Execute(context.Background(), tc.inv)
 			if err != nil {
 				t.Fatalf("execute: %v", err)
+			}
+			if tc.name == "thread resume" && (resumeOptions.ThreadID != "thr_1" || resumeOptions.ExcludeTurns == nil || !*resumeOptions.ExcludeTurns) {
+				t.Fatalf("resume must request metadata only: %+v", resumeOptions)
 			}
 			if len(result.Events) != 1 {
 				t.Fatalf("events=%d", len(result.Events))
