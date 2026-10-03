@@ -1,6 +1,6 @@
 # Qualifying a Codex app-server release
 
-Run `scripts/qualify-codex-release.sh 0.159.2` from any checkout with Docker,
+Run `scripts/qualify-codex-release.sh 0.160.0` from any checkout with Docker,
 `curl`, and `jq`. The argument may be any published Codex version with Linux
 release assets, including prereleases. The optional GitHub Actions workflow
 accepts the same version through `workflow_dispatch`; its weekly run selects
