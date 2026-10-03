@@ -12,7 +12,7 @@ import (
 
 const MinimumExclusive = "v0.142.0"
 
-var testedVersions = [...]string{"v0.154.0", "v0.155.1", "v0.156.0", "v0.156.1", "v0.157.0", "v0.158.0", "v0.159.0", "v0.159.1", "v0.159.2"}
+var testedVersions = [...]string{"v0.154.0", "v0.155.1", "v0.156.0", "v0.156.1", "v0.157.0", "v0.158.0", "v0.159.0", "v0.159.1", "v0.159.2", "v0.160.0"}
 
 // Class describes whether Mektup has conformance evidence for a server.
 type Class string
