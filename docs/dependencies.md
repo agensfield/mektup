@@ -96,7 +96,9 @@ networked `npm ci` installation as a distinct step before running validation.
 
 Vulnerability scanning is intentionally separate from archive generation. CI
 and the local Make target use `golang.org/x/vuln` `v1.7.0`, the latest pinned
-scanner release whose own module retains Mektup's Go 1.25 toolchain floor:
+scanner release. Mektup requires Go 1.26.9 or newer to include the October
+2026 standard-library security fixes; CI, release packaging, and the isolated
+qualification image use that patched floor:
 
 ```sh
 make govulncheck
