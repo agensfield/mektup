@@ -1,7 +1,8 @@
 # Control receiver policy
 
-`go/internal/controlreceiver` is a callable one-shot custody receiver. It is
-not wired into the production command in this lane.
+`mektup control receive` runs the one-shot custody receiver in
+`go/internal/controlreceiver`. SSH invokes this fixed command without allowing
+the incoming document to choose an executable or runtime path.
 
 The receiver accepts one `mektup/control/v1` metadata document on stdin. The
 registry path, state directory, executable, journal path, and reply body are
@@ -32,3 +33,8 @@ Claim results use the locked union: `disposition: "claimed"` carries the
 current fencing token and lease and authorizes the first body attempt;
 `disposition: "existing"` carries status/winner metadata only and never
 authorizes body dispatch or fencing operations.
+
+`mektup control preflight` separately accepts bounded `mektup/preflight/v1`
+readiness metadata. It checks the default runtime identity, reverse body route
+and registered custody store before a request-reply body is submitted. See
+[delivery and recovery boundaries](reliability.md) for compatibility and limits.

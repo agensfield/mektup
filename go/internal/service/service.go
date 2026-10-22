@@ -140,6 +140,12 @@ type Resolver interface {
 	ResolvePinned(context.Context, string, string) (ResolvedTarget, error)
 }
 
+// ReplyRoutePreflighter optionally verifies return routing before a request
+// with correlated replies creates durable state or dispatches a body.
+type ReplyRoutePreflighter interface {
+	PreflightReply(context.Context, ResolvedTarget, SourceIdentity) error
+}
+
 type DeliveryResult struct {
 	TurnID   string
 	Accepted bool
@@ -315,6 +321,7 @@ type SendRequest struct {
 	Wait                   bool
 	Source                 string
 	DeliveryTimeout        time.Duration
+	DeliveryDeadline       time.Time
 	WaitTimeout            time.Duration
 	DisableDeliveryTimeout bool
 }
@@ -341,7 +348,7 @@ func (s *Service) SendWithAcceptance(ctx context.Context, req SendRequest, onAcc
 	return s.send(ctx, req, onAccepted)
 }
 
-func (s *Service) send(ctx context.Context, req SendRequest, onAccepted AcceptanceCallback) (SendResult, error) {
+func (s *Service) send(ctx context.Context, req SendRequest, onAccepted AcceptanceCallback) (out SendResult, retErr error) {
 	if err := s.validate(); err != nil {
 		return SendResult{}, err
 	}
@@ -361,11 +368,13 @@ func (s *Service) send(ctx context.Context, req SendRequest, onAccepted Acceptan
 		return SendResult{}, semantic(mektup.ErrInvalidRawReplyRequest, "raw delivery cannot request a correlated reply", nil, nil)
 	}
 
-	target, err := s.Resolver.Resolve(ctx, req.Target)
+	deliveryCtx, cancel := admissionContext(ctx, req.DeliveryTimeout, req.DisableDeliveryTimeout, req.DeliveryDeadline)
+	defer cancel()
+	target, err := s.Resolver.Resolve(deliveryCtx, req.Target)
 	if err != nil {
 		return SendResult{}, semantic(mektup.ErrInvalidTarget, "destination resolution failed", nil, err)
 	}
-	source, err := s.Resolver.ResolveSource(ctx, req.Source)
+	source, err := s.Resolver.ResolveSource(deliveryCtx, req.Source)
 	if err != nil {
 		if req.RequestReply {
 			return SendResult{}, semantic(mektup.ErrReplyRouteRequired, "a routable source is required for request-reply", nil, err)
@@ -379,6 +388,13 @@ func (s *Service) send(ctx context.Context, req SendRequest, onAccepted Acceptan
 	}
 	if req.RequestReply && (source.URI == "" || source.EndpointID == "" || source.CustodyEndpointID == "" || source.CustodyStoreID == "") {
 		return SendResult{}, semantic(mektup.ErrReplyRouteRequired, "reply source and custody identities are incomplete", nil, nil)
+	}
+	if req.RequestReply {
+		if verifier, ok := s.Resolver.(ReplyRoutePreflighter); ok {
+			if err := verifier.PreflightReply(deliveryCtx, target, source); err != nil {
+				return SendResult{}, err
+			}
+		}
 	}
 	wireTargetURI := canonicalThreadURI(target.EndpointID, target.URI)
 	wireSourceURI := canonicalThreadURI(source.EndpointID, source.URI)
@@ -426,14 +442,25 @@ func (s *Service) send(ctx context.Context, req SendRequest, onAccepted Acceptan
 		Semantics: semantics(req.Raw), ReplyRoute: envelope.ReplyTo, ReplyEndpointID: envelope.ReplyEndpointID, CustodyRoute: envelope.ReplyCustodyEndpointID,
 		CustodyStoreID: envelope.ReplyCustodyStoreID, Digest: digest, BodySize: int64(len([]byte(req.Body))),
 		ReplyRequested: req.RequestReply, SourceEndpointID: source.EndpointID, TargetEndpointID: target.EndpointID}
-	prepared, err := s.Journal.Prepare(ctx, op)
+	prepared, err := s.Journal.Prepare(deliveryCtx, op)
 	if err != nil {
 		return SendResult{}, semantic(mektup.ErrMessageIdentityConflict, "message relationship could not be prepared", nil, err)
 	}
+	receiptState := mektup.StatePrepared
+	turnID := ""
+	defer func() {
+		if retErr != nil {
+			if out.Receipt.OperationID == "" {
+				out.Receipt = receiptFor(op, envelope, receiptState, turnID)
+			}
+			retErr = operationError(retErr, out.Receipt)
+		}
+	}()
 
 	resumed := false
 	if !target.Loaded && target.Persistent {
-		if _, err := s.Delivery.Resume(ctx, target); err != nil {
+		if _, err := s.Delivery.Resume(deliveryCtx, target); err != nil {
+			receiptState = mektup.StateNotSent
 			recordCtx, recordCancel := custodyContext(ctx)
 			defer recordCancel()
 			if recordErr := s.Journal.RecordResult(recordCtx, opID, mektup.StateNotSent, "resume_failed"); recordErr != nil {
@@ -443,7 +470,8 @@ func (s *Service) send(ctx context.Context, req SendRequest, onAccepted Acceptan
 		}
 		resumed = true
 	}
-	if err := s.Journal.MarkDispatchStarted(ctx, prepared.OperationID, prepared.Owner, prepared.Token); err != nil {
+	receiptState = mektup.StateOutcomeUnknown
+	if err := s.Journal.MarkDispatchStarted(deliveryCtx, prepared.OperationID, prepared.Owner, prepared.Token); err != nil {
 		if resumed {
 			if detachErr := detachTarget(s.Delivery, target); detachErr != nil {
 				return SendResult{}, semantic(mektup.ErrInternal, "dispatch fence and target cleanup both failed", nil, errors.Join(err, detachErr))
@@ -452,8 +480,6 @@ func (s *Service) send(ctx context.Context, req SendRequest, onAccepted Acceptan
 		return SendResult{}, semantic(mektup.ErrInternal, "dispatch fence could not be committed", nil, err)
 	}
 
-	deliveryCtx, cancel := deliveryContext(ctx, req.DeliveryTimeout, req.DisableDeliveryTimeout)
-	defer cancel()
 	result, dispatchErr := s.dispatch(deliveryCtx, target, string(payload), messageID)
 	if dispatchErr != nil {
 		state, code, retry := classifyDelivery(dispatchErr)
@@ -465,6 +491,7 @@ func (s *Service) send(ctx context.Context, req SendRequest, onAccepted Acceptan
 			if state == mektup.StateNotSent {
 				state, code = mektup.StateOutcomeUnknown, "outcome_unknown_after_dispatch_fence"
 			}
+			receiptState = state
 			if recordErr := s.Journal.RecordResult(recordCtx, opID, state, code); recordErr != nil {
 				recordCancel()
 				if resumed {
@@ -483,6 +510,7 @@ func (s *Service) send(ctx context.Context, req SendRequest, onAccepted Acceptan
 			return SendResult{}, deliveryError(dispatchErr, state, code)
 		}
 	}
+	receiptState, turnID = mektup.StateAccepted, result.TurnID
 	recordCtx, recordCancel := custodyContext(ctx)
 	if err := s.Journal.RecordResult(recordCtx, opID, mektup.StateAccepted, result.Evidence); err != nil {
 		recordCancel()
@@ -504,7 +532,7 @@ func (s *Service) send(ctx context.Context, req SendRequest, onAccepted Acceptan
 		}
 	}
 	receipt := receiptFor(op, envelope, mektup.StateAccepted, result.TurnID)
-	out := SendResult{Receipt: receipt}
+	out = SendResult{Receipt: receipt}
 	if onAccepted != nil {
 		if callbackErr := onAccepted(out); callbackErr != nil {
 			return out, callbackErr
@@ -533,6 +561,26 @@ func (s *Service) dispatch(ctx context.Context, target ResolvedTarget, text, mes
 		return result, de
 	}
 	return result, &DeliveryError{Err: err, Phase: WriteMayHaveWritten}
+}
+
+// operationError retains the semantic code and cause while attaching the
+// durable identities needed to recover an operation after any later failure.
+func operationError(err error, receipt mektup.Receipt) error {
+	var typed *Error
+	if !errors.As(err, &typed) {
+		return semantic(mektup.ErrInternal, err.Error(), map[string]any{"operationId": receipt.OperationID, "messageId": receipt.Message.MessageID, "evidenceState": receipt.State}, err)
+	}
+	copy := *typed
+	copy.Details = make(map[string]any, len(typed.Details)+3)
+	for key, value := range typed.Details {
+		copy.Details[key] = value
+	}
+	copy.Details["operationId"] = receipt.OperationID
+	copy.Details["messageId"] = receipt.Message.MessageID
+	copy.Details["evidenceState"] = receipt.State
+	// Keep the original error in the chain, including when it had no cause.
+	copy.Cause = err
+	return &copy
 }
 
 func deliveryContext(parent context.Context, timeout time.Duration, disabled bool) (context.Context, context.CancelFunc) {
@@ -594,10 +642,9 @@ func detachTarget(delivery DeliveryPort, target ResolvedTarget) error {
 }
 
 func custodyContext(parent context.Context) (context.Context, context.CancelFunc) {
-	if parent.Err() == nil {
-		return parent, func() {}
-	}
-	return context.WithTimeout(context.Background(), 5*time.Second)
+	// Recording an accepted effect must survive cancellation or expiry of the
+	// admission deadline, but storage and cleanup must themselves stay bounded.
+	return context.WithTimeout(context.WithoutCancel(parent), 5*time.Second)
 }
 
 func classifyDelivery(err *DeliveryError) (mektup.EvidenceState, string, bool) {

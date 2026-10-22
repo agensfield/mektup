@@ -1,4 +1,4 @@
-# Mektup agent guide (contract 1.0.8)
+# Mektup agent guide (contract 1.0.9)
 
 Mektup delivers messages to Codex threads and preserves evidence. Use ordinary
 `mektup send <target> <message>` for one-way delivery. Use
@@ -98,3 +98,19 @@ offline and do not require endpoint or journal state.
 metadata only. Messaging also resumes without requesting stored turns when
 needed. Read conversation history separately with paginated `thread turns` or
 `thread items` commands.
+
+SSH request-reply checks the recipient's return-body and custody routes before
+dispatch. Both peers must support `mektup/preflight/v1` (Mektup 1.0.14 or newer).
+The current SSH topology selects each host user's default Codex runtime; an
+endpoint for another runtime fails explicitly rather than silently switching.
+
+The delivery deadline covers resolution, preflight, claim and resume as well
+as submission. Waiting for a reply has its own deadline. If observation fails,
+a finite wait can still finish from authoritative custody; without a finite
+deadline it returns an explicit gap rather than waiting indefinitely.
+
+Failure receipts retain the actual operation and message IDs. Use
+`mektup receipt show <receipt-id>` and `mektup receipt reconcile <receipt-id>`
+to inspect or strengthen that same operation. Repeating `send` or `reply` is a
+new operation, not recovery. A body that was not sent can still have an unknown
+remote claim outcome; never turn that uncertainty into a new-ID resend.
