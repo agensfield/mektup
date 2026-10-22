@@ -1,4 +1,4 @@
-FROM golang:1.26.9-bookworm
+FROM golang:1.26.10-bookworm
 
 ARG CODEX_VERSION
 ARG CODEX_ARCH
@@ -6,6 +6,7 @@ ARG CODEX_ASSET_URL
 ARG CODEX_ASSET_SHA256
 
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge '20250419~deb12u2' \
     && rm -rf /var/lib/apt/lists/*
 
 RUN set -eu; \

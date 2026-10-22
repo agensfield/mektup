@@ -92,13 +92,28 @@ The validator script invokes only `node_modules/.bin/ajv`; it does not run
 `npx`, resolve a mutable package tag, or access the network. CI performs the
 networked `npm ci` installation as a distinct step before running validation.
 
+The Ajv CLI dependency on `fast-json-patch` is overridden to patched 3.1.1
+for [GHSA-8gh8-hqwg-xf34](https://github.com/advisories/GHSA-8gh8-hqwg-xf34).
+The remaining npm audit finding, `sprintf-js` through `argparse`, has no
+published fix. That dependency is used by the standalone `js-yaml` executable;
+Mektup's validator calls Ajv directly, and Ajv's YAML library path does not
+load `argparse`. It is not part of the Go executable. Retain this explicit
+build-tool exception until an upstream fix is available; do not replace
+js-yaml 3 with its incompatible version 4 API to silence the audit.
+
 ## Vulnerability scanning
 
 Vulnerability scanning is intentionally separate from archive generation. CI
 and the local Make target use `golang.org/x/vuln` `v1.7.0`, the latest pinned
-scanner release. Mektup requires Go 1.26.9 or newer to include the October
-2026 standard-library security fixes; CI, release packaging, and the isolated
-qualification image use that patched floor:
+scanner release. Mektup requires patched Go 1.26.10 or Go 1.27.3 and later
+patched releases. These versions include the October 2026 standard-library
+fixes and the compromised-intermediate blocklist for
+[GO-2026-6809 / CVE-2026-111943](https://pkg.go.dev/vuln/GO-2026-6809).
+Go 1.27.0 through 1.27.2 remain affected despite satisfying the module's
+minimum Go version. CI, release packaging, and the isolated qualification
+image use Go 1.26.10. The image also requires Debian's corrected
+`ca-certificates` package before its HTTPS download, because updating Go
+does not update curl's trust store:
 
 ```sh
 make govulncheck
