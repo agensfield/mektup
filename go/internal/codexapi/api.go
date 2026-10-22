@@ -297,15 +297,25 @@ func (c *Client) StartOrSteer(ctx context.Context, threadID, text, clientUserMes
 // backed by legacy thread stores reject thread/items/list; this helper never
 // attempts a lossy local projection or silently filters one partial page.
 func (c *Client) ReconcileHistory(ctx context.Context, threadID string) (ThreadTurnsResponse, error) {
+	return c.ReadFullTurnsWithLimit(ctx, threadID, MaxTurnsPageLimit)
+}
+
+// ReadFullTurnsWithLimit keeps the reconciliation bounds while allowing a
+// transport owner to retry an oversized page at a smaller size on a fresh connection.
+// Every attempt starts at the beginning; errors never return a partial history.
+func (c *Client) ReadFullTurnsWithLimit(ctx context.Context, threadID string, limit int) (ThreadTurnsResponse, error) {
 	if threadID == "" {
 		return ThreadTurnsResponse{}, errors.New("codexapi: threadId is required")
+	}
+	if limit < 1 || limit > MaxTurnsPageLimit {
+		return ThreadTurnsResponse{}, ErrUnboundedPage
 	}
 	var all []Turn
 	cursor := ""
 	var lastRaw json.RawMessage
 	var totalItems, totalBytes int
 	for pageNo := 0; pageNo < MaxReconciliationPages; pageNo++ {
-		page, err := c.ThreadTurns(ctx, TurnsOptions{ThreadID: threadID, Cursor: cursor, Limit: MaxTurnsPageLimit, ItemsView: "full"})
+		page, err := c.ThreadTurns(ctx, TurnsOptions{ThreadID: threadID, Cursor: cursor, Limit: limit, ItemsView: "full"})
 		if err != nil {
 			return ThreadTurnsResponse{}, fmt.Errorf("codexapi: reconcile turns page %d: %w", pageNo+1, err)
 		}

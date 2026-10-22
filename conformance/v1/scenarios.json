@@ -1,7 +1,7 @@
 {
   "schema": "mektup/conformance/v1/scenarios",
   "version": "1.0.0",
-  "specVersion": "1.0.8",
+  "specVersion": "1.0.9",
   "source": "acceptance-v1.md",
   "profiles": {
     "plain_accept": {
@@ -27,6 +27,10 @@
     "usage_rejected": {
       "transitions": [],
       "terminal": { "event": "operation.failed", "exit": 2, "state": "not_sent" }
+    },
+    "preflight_rejected": {
+      "transitions": [],
+      "terminal": { "event": "operation.rejected", "exit": 3, "state": "not_sent" }
     },
     "not_sent_recovered": {
       "transitions": ["intent.persisted", "recovery.prepared_orphan"],
@@ -186,6 +190,10 @@
     { "id": "rpc.worst-case-classification", "matrix": "raw-rpc", "profile": "usage_rejected", "observable": ["method classification uses worst-case behavior and parameters"] },
     { "id": "rpc.large-response-spill", "matrix": "raw-rpc", "profile": "read_complete", "observable": ["complete owner-private artifact", "artifact.spilled includes path/bytes/digest", "not silently truncated"] },
     { "id": "rpc.server-error-nested", "matrix": "raw-rpc", "profile": "rejected", "observable": ["app-server JSON-RPC error remains nested", "stable Mektup code remains authoritative"] },
-    { "id": "rpc.uncertain-mutation-no-retry", "matrix": "raw-rpc", "profile": "unknown", "observable": ["possible mutation remains unknown", "automatic retry is forbidden"] }
+    { "id": "rpc.uncertain-mutation-no-retry", "matrix": "raw-rpc", "profile": "unknown", "observable": ["possible mutation remains unknown", "automatic retry is forbidden"] },
+    { "id": "endpoint.reverse-route-preflight", "matrix": "endpoint", "profile": "preflight_rejected", "observable": ["unavailable SSH return route rejects before body dispatch", "registered identities are read without mutation", "unsupported peers require upgrade"] },
+    { "id": "messaging.admission-deadline", "matrix": "messaging", "profile": "preflight_rejected", "observable": ["one deadline includes CLI setup and semantic admission", "reply waiting has a separate deadline", "expired setup never dispatches a body"] },
+    { "id": "reply.terminal-custody-despite-gap", "matrix": "reply", "profile": "reply_wait_success", "observable": ["terminal custody takes precedence over observation failure", "gap remains diagnostic evidence", "no body is replayed"] },
+    { "id": "history.oversized-page-fresh-connection", "matrix": "read", "profile": "read_complete", "observable": ["oversized read retries with smaller full-turn pages on fresh connections", "item fallback does not reuse a failed connection", "partial history is never called complete"] }
   ]
 }

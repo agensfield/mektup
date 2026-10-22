@@ -497,7 +497,11 @@ func (s *connectionSession) Unsubscribe(ctx context.Context, threadID string) er
 }
 
 func (s *connectionSession) History(ctx context.Context, threadID string) ([]codexapi.Turn, error) {
-	result, err := s.api.ReadFullTurns(ctx, threadID)
+	return s.HistoryWithLimit(ctx, threadID, codexapi.DefaultTurnsPageLimit)
+}
+
+func (s *connectionSession) HistoryWithLimit(ctx context.Context, threadID string, limit int) ([]codexapi.Turn, error) {
+	result, err := s.api.ReadFullTurnsWithLimit(ctx, threadID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -549,11 +553,18 @@ func (s *connectionSession) LoadedThreads(ctx context.Context) ([]string, error)
 }
 
 func (s *connectionSession) ItemsHistory(ctx context.Context, threadID string) ([]codexapi.ItemEntry, error) {
+	return s.ItemsHistoryWithLimit(ctx, threadID, codexapi.DefaultItemsPageLimit)
+}
+
+func (s *connectionSession) ItemsHistoryWithLimit(ctx context.Context, threadID string, limit int) ([]codexapi.ItemEntry, error) {
+	if limit < 1 || limit > codexapi.MaxItemsPageLimit {
+		return nil, codexapi.ErrUnboundedPage
+	}
 	var all []codexapi.ItemEntry
 	cursor := ""
 	totalBytes := 0
 	for pageNo := 0; pageNo < codexapi.MaxReconciliationPages; pageNo++ {
-		page, err := s.api.ThreadItems(ctx, codexapi.ItemsOptions{ThreadID: threadID, Cursor: cursor, Limit: codexapi.MaxItemsPageLimit})
+		page, err := s.api.ThreadItems(ctx, codexapi.ItemsOptions{ThreadID: threadID, Cursor: cursor, Limit: limit})
 		if err != nil {
 			return nil, fmt.Errorf("runtime: item history page %d: %w", pageNo+1, err)
 		}

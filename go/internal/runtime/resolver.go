@@ -24,6 +24,7 @@ type ResolverAdapter struct {
 	CustodyEndpointID string
 	CustodyStoreID    string
 	StateProbe        ThreadStateProbe
+	ReplyPreflight    func(context.Context, service.ResolvedTarget, service.SourceIdentity) error
 }
 
 // ThreadStateProbe is an explicit preflight seam for authoritative loaded and
@@ -138,3 +139,12 @@ func firstNonEmpty(values ...string) string {
 }
 
 var _ service.Resolver = ResolverAdapter{}
+
+// PreflightReply checks an invocation-scoped reverse-route snapshot before any
+// operation is prepared. Absence of the optional composition hook is a no-op.
+func (r ResolverAdapter) PreflightReply(ctx context.Context, target service.ResolvedTarget, source service.SourceIdentity) error {
+	if r.ReplyPreflight != nil {
+		return r.ReplyPreflight(ctx, target, source)
+	}
+	return nil
+}

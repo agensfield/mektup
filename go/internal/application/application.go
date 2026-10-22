@@ -70,6 +70,7 @@ type Options struct {
 	ThreadStateProbe    runtime.ThreadStateProbe
 	HumanGate           receipts.HumanGate
 	ControlInvoker      service.ControlInvoker
+	PreflightInvoker    func(context.Context, endpoint.Route, sshproxy.PreflightDocument) error
 
 	DialerForRoute func(endpoint.Route, bool) connection.ClientDialer
 }
@@ -702,7 +703,7 @@ func (e *Environment) composeMessaging(ctx context.Context, inv cli.Invocation, 
 		current := firstNonEmpty(operation.Resolved.CurrentThreadID, e.options.CurrentThreadID)
 		custodyStore := firstNonEmpty(e.options.CustodyStoreID, j.StoreID())
 		custodyEndpoint := firstNonEmpty(e.options.CustodyEndpointID, localEndpoint.ID)
-		return runtime.ResolverAdapter{Store: store, Herdr: herdr, EndpointOverride: operation.Resolved.Endpoint, CodexHome: codexHome, CurrentThreadID: current, ReplyTo: operation.Option("reply-to"), CustodyEndpointID: custodyEndpoint, CustodyStoreID: custodyStore, StateProbe: stateProbe}
+		return runtime.ResolverAdapter{Store: store, Herdr: herdr, EndpointOverride: operation.Resolved.Endpoint, CodexHome: codexHome, CurrentThreadID: current, ReplyTo: operation.Option("reply-to"), CustodyEndpointID: custodyEndpoint, CustodyStoreID: custodyStore, StateProbe: stateProbe, ReplyPreflight: e.replyPreflight(store, codexHome, j)}
 	}
 	localJournal, err := runtime.NewJournalAdapter(j, nil)
 	if err != nil {

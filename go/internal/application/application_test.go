@@ -1019,7 +1019,7 @@ func TestMessagingReceiptPersistsBeforeOutputAndWaitResolvesReceiptID(t *testing
 	}
 	state := filepath.Join(root, "state")
 	out := &bytes.Buffer{}
-	env := New(Options{CodexHome: home, ConfigPath: filepath.Join(root, "endpoints.json"), StateDir: state, IdentityHome: filepath.Join(root, "identity"), CurrentThreadID: "source", ThreadStateProbe: func(context.Context, string, string) (bool, bool, error) { return true, true, nil }, SessionFactory: runtime.SessionFactoryFunc(func(_ context.Context, ep endpoint.Endpoint) (runtime.Session, error) {
+	env := New(Options{CodexHome: home, ConfigPath: filepath.Join(root, "endpoints.json"), StateDir: state, IdentityHome: filepath.Join(root, "identity"), Registry: controlreceiver.FileRegistry{Path: filepath.Join(root, "control-registry.json")}, CurrentThreadID: "source", ThreadStateProbe: func(context.Context, string, string) (bool, bool, error) { return true, true, nil }, SessionFactory: runtime.SessionFactoryFunc(func(_ context.Context, ep endpoint.Endpoint) (runtime.Session, error) {
 		return messagingFakeSession{endpointID: ep.ID}, nil
 	})})
 	app := &cli.App{Out: out, Err: &bytes.Buffer{}, Executor: env, Env: []string{"MEKTUP_AGENT=1", "CODEX_HOME=" + home, "CODEX_THREAD_ID=source", "MEKTUP_CONFIG=" + filepath.Join(root, "endpoints.json"), "MEKTUP_STATE_DIR=" + state}}

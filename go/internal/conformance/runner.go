@@ -1050,11 +1050,11 @@ func validateOriginalStatusResultRunner(result map[string]any) error {
 }
 
 func validateScenarioDocuments(s scenariosDocument, t transitionsDocument) error {
-	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.8" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
+	if s.Schema != "mektup/conformance/v1/scenarios" || s.Version == "" || s.SpecVersion != "1.0.9" || len(s.Profiles) == 0 || len(s.Scenarios) == 0 {
 		return errors.New("scenarios document metadata is incomplete")
 	}
-	if t.SpecVersion != "1.0.8" {
-		return errors.New("transitions document spec revision is not 1.0.8")
+	if t.SpecVersion != "1.0.9" {
+		return errors.New("transitions document spec revision is not 1.0.9")
 	}
 	states := map[string]bool{"none": true}
 	for _, state := range t.States {

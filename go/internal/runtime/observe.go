@@ -14,8 +14,10 @@ import (
 
 	"github.com/agensfield/mektup/go"
 	"github.com/agensfield/mektup/go/appserver"
+	"github.com/agensfield/mektup/go/internal/codexapi"
 	"github.com/agensfield/mektup/go/internal/journal"
 	"github.com/agensfield/mektup/go/internal/service"
+	"github.com/gorilla/websocket"
 )
 
 // ObservationAdapter establishes an event stream before the caller starts a
@@ -58,17 +60,42 @@ func (a *ObservationAdapter) FullHistory(ctx context.Context, target service.Res
 	if a == nil || a.Pool == nil {
 		return nil, errors.New("runtime: observation pool is required")
 	}
-	session, err := a.Pool.session(ctx, target)
-	if err != nil {
-		return nil, err
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	turns, err := session.History(ctx, target.ThreadID)
+	var turns []codexapi.Turn
+	err := a.readHistory(ctx, target, codexapi.DefaultTurnsPageLimit, func(session Session, limit int) (bool, error) {
+		if reader, ok := session.(interface {
+			HistoryWithLimit(context.Context, string, int) ([]codexapi.Turn, error)
+		}); ok {
+			var err error
+			turns, err = reader.HistoryWithLimit(ctx, target.ThreadID, limit)
+			return true, err
+		}
+		var err error
+		turns, err = session.History(ctx, target.ThreadID)
+		return false, err
+	})
 	if err != nil {
-		fallback, ok := session.(itemHistorySession)
-		if !ok {
+		if ctx.Err() != nil {
 			return nil, err
 		}
-		entries, fallbackErr := fallback.ItemsHistory(ctx, target.ThreadID)
+		var entries []codexapi.ItemEntry
+		fallbackErr := a.readHistory(ctx, target, codexapi.DefaultItemsPageLimit, func(session Session, limit int) (bool, error) {
+			if reader, ok := session.(interface {
+				ItemsHistoryWithLimit(context.Context, string, int) ([]codexapi.ItemEntry, error)
+			}); ok {
+				var err error
+				entries, err = reader.ItemsHistoryWithLimit(ctx, target.ThreadID, limit)
+				return true, err
+			}
+			if fallback, ok := session.(itemHistorySession); ok {
+				var err error
+				entries, err = fallback.ItemsHistory(ctx, target.ThreadID)
+				return false, err
+			}
+			return false, errors.New("runtime: session cannot read item history")
+		})
 		if fallbackErr != nil {
 			return nil, errors.Join(err, fallbackErr)
 		}
@@ -97,6 +124,33 @@ func (a *ObservationAdapter) FullHistory(ctx context.Context, target service.Res
 		}
 	}
 	return items, nil
+}
+
+// Each attempt owns its connection, including fallback. An oversized frame
+// terminates a websocket; reusing it would turn a recoverable page size into a
+// failed fallback and could also poison concurrent delivery on the pool.
+func (a *ObservationAdapter) readHistory(ctx context.Context, target service.ResolvedTarget, limit int, read func(Session, int) (bool, error)) error {
+	for {
+		session, err := a.Pool.openIsolated(ctx, target)
+		if err != nil {
+			return err
+		}
+		adjustable, readErr := read(session, limit)
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = session.Detach(cleanupCtx)
+		cancel()
+		if readErr == nil {
+			return nil
+		}
+		oversized := errors.Is(readErr, websocket.ErrReadLimit) || errors.Is(readErr, codexapi.ErrResponseTooLarge)
+		if !adjustable || !oversized || ctx.Err() != nil {
+			return readErr
+		}
+		if limit == 1 {
+			return fmt.Errorf("runtime: single history entry exceeds response byte bound: %w", readErr)
+		}
+		limit /= 2
+	}
 }
 
 type eventStream struct {

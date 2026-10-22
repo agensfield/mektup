@@ -22,10 +22,17 @@ func main() {
 type controlReceiveFunc func(context.Context, io.Reader, io.Writer, controlreceiver.CommandOptions) error
 
 func run(ctx context.Context, args []string, input io.Reader, output, errorOutput io.Writer, receive controlReceiveFunc) int {
-	// This is the only private control command. It is matched before public CLI
-	// construction so the one-shot receiver cannot open an operation-selected
+	// Private control commands are matched before public CLI construction
+	// so the one-shot receiver cannot open an operation-selected
 	// journal or artifact store. SSH supplies the fixed argv and the request
 	// itself carries no path or executable authority.
+	if len(args) == 2 && args[0] == "control" && args[1] == "preflight" {
+		if err := controlreceiver.RunPreflight(ctx, input, output, controlreceiver.PreflightOptions{}); err != nil {
+			_, _ = fmt.Fprintln(errorOutput, "mektup: control preflight failed:", err)
+			return int(cli.ExitInternal)
+		}
+		return int(cli.ExitSuccess)
+	}
 	if len(args) == 2 && args[0] == "control" && args[1] == "receive" {
 		if err := receive(ctx, input, output, controlreceiver.CommandOptions{}); err != nil {
 			_, _ = fmt.Fprintln(errorOutput, "mektup: control receive failed:", err)

@@ -67,7 +67,7 @@ func (s *Service) Wait(ctx context.Context, req WaitRequest) (WaitResult, error)
 		return s.waitResult(status, true, "reply route has no native thread identity"), semantic(mektup.ErrReplyRouteUnavailable, "reply route has no native thread identity", nil, nil)
 	}
 	if s.Observe == nil {
-		return s.pollCustody(ctx, status)
+		return s.pollCustody(ctx, status, "")
 	}
 	pinnedTarget := ResolvedTarget{EndpointID: status.ReplyEndpointID, URI: pinnedRoute, ThreadID: pinnedThread, Loaded: true, Persistent: true}
 	if pinnedTarget.EndpointID == "" {
@@ -78,18 +78,25 @@ func (s *Service) Wait(ctx context.Context, req WaitRequest) (WaitResult, error)
 	stream, err := s.Observe.Subscribe(scanCtx, pinnedTarget)
 	if err != nil {
 		stopScan()
-		return s.pollCustody(ctx, status)
+		return s.incompleteAfterGap(ctx, status, "event_stream: "+err.Error(), func() {})
 	}
 	history := make(chan historyResult, 1)
 	events := make(chan Event, 16)
 	workerDone := make(chan struct{})
+	var workers sync.WaitGroup
+	workers.Add(2)
 	var stopOnce sync.Once
 	stopWorkers := func() {
 		stopOnce.Do(func() {
 			stopScan()
-			_ = stream.Close()
+			closed := make(chan struct{})
+			go func() {
+				_ = stream.Close()
+				<-workerDone
+				close(closed)
+			}()
 			select {
-			case <-workerDone:
+			case <-closed:
 			case <-time.After(250 * time.Millisecond):
 			}
 		})
@@ -97,6 +104,7 @@ func (s *Service) Wait(ctx context.Context, req WaitRequest) (WaitResult, error)
 	defer stopWorkers()
 
 	go func() {
+		defer workers.Done()
 		defer close(events)
 		for {
 			e, nextErr := stream.Next(scanCtx)
@@ -115,12 +123,16 @@ func (s *Service) Wait(ctx context.Context, req WaitRequest) (WaitResult, error)
 		}
 	}()
 	go func() {
-		defer close(workerDone)
+		defer workers.Done()
 		items, scanErr := s.Observe.FullHistory(scanCtx, pinnedTarget)
 		select {
 		case history <- historyResult{items: items, err: scanErr}:
 		case <-scanCtx.Done():
 		}
+	}()
+	go func() {
+		workers.Wait()
+		close(workerDone)
 	}()
 
 	ticker := time.NewTicker(50 * time.Millisecond)
@@ -131,40 +143,36 @@ func (s *Service) Wait(ctx context.Context, req WaitRequest) (WaitResult, error)
 		select {
 		case <-ctx.Done():
 			stopWorkers()
-			fresh, lookupErr := s.lookupCustodyContext(ctx, req.Reference)
-			if lookupErr != nil {
-				fresh = status
-			}
-			return s.waitResult(fresh, true, ""), semantic(mektup.ErrWaitIncomplete, "wait ended before correlated reply evidence was complete", nil, ctx.Err())
+			return s.finishWait(ctx, status, "")
 		case result := <-history:
 			if historyDone {
 				continue
 			}
 			historyDone = true
 			if result.err != nil {
-				return s.incompleteAfterGap(req.Reference, status, "history: "+result.err.Error(), stopWorkers)
+				return s.incompleteAfterGap(ctx, status, "history: "+result.err.Error(), stopWorkers)
 			}
 			for _, item := range result.items {
 				if observeErr := s.observeCandidate(ctx, pinnedStatus, item, seen, true); observeErr != nil {
 					if errors.Is(observeErr, ErrObservationPending) {
 						continue
 					}
-					return s.incompleteAfterGap(req.Reference, status, "observation: "+observeErr.Error(), stopWorkers)
+					return s.incompleteAfterGap(ctx, status, "observation: "+observeErr.Error(), stopWorkers)
 				}
 			}
 		case event, ok := <-events:
 			if !ok {
-				return s.incompleteAfterGap(req.Reference, status, "event_stream: closed", stopWorkers)
+				return s.incompleteAfterGap(ctx, status, "event_stream: closed", stopWorkers)
 			}
 			if event.Gap {
-				return s.incompleteAfterGap(req.Reference, status, event.Reason, stopWorkers)
+				return s.incompleteAfterGap(ctx, status, event.Reason, stopWorkers)
 			}
 			if event.Item != nil {
 				if observeErr := s.observeCandidate(ctx, pinnedStatus, *event.Item, seen, false); observeErr != nil {
 					if errors.Is(observeErr, ErrObservationPending) {
 						continue
 					}
-					return s.incompleteAfterGap(req.Reference, status, "observation: "+observeErr.Error(), stopWorkers)
+					return s.incompleteAfterGap(ctx, status, "observation: "+observeErr.Error(), stopWorkers)
 				}
 			}
 		case <-ticker.C:
@@ -187,10 +195,6 @@ type historyResult struct {
 	err   error
 }
 
-func (s *Service) lookupCustody(reference string) (OperationStatus, error) {
-	return s.lookupCustodyContext(context.Background(), reference)
-}
-
 func (s *Service) lookupCustodyContext(parent context.Context, reference string) (OperationStatus, error) {
 	ctx, cancel := context.WithTimeout(parent, 5*time.Second)
 	defer cancel()
@@ -200,29 +204,62 @@ func (s *Service) lookupCustodyContext(parent context.Context, reference string)
 	return s.Journal.Lookup(ctx, reference)
 }
 
-func (s *Service) incompleteAfterGap(reference string, status OperationStatus, reason string, stop func()) (WaitResult, error) {
+func (s *Service) incompleteAfterGap(ctx context.Context, status OperationStatus, reason string, stop func()) (WaitResult, error) {
 	stop()
-	fresh, err := s.lookupCustody(reference)
-	if err != nil {
-		fresh = status
+	if reason == "" {
+		reason = "event_stream: unspecified gap"
 	}
-	return s.waitResult(fresh, true, reason), semantic(mektup.ErrWaitIncomplete, "event/history reconciliation has an explicit gap", map[string]any{"gap": reason}, err)
+	return s.pollCustody(ctx, status, reason)
 }
 
-func (s *Service) pollCustody(ctx context.Context, status OperationStatus) (WaitResult, error) {
+func (s *Service) pollCustody(ctx context.Context, status OperationStatus, gap string) (WaitResult, error) {
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
+		if ctx.Err() != nil {
+			return s.finishWait(ctx, status, gap)
+		}
 		fresh, err := s.lookupCustodyContext(ctx, status.MessageID)
-		if err == nil && terminalWaitState(fresh.State) {
-			return s.waitResult(fresh, false, ""), waitStateError(fresh)
+		if err == nil {
+			status = fresh
+			if terminalWaitState(status.State) {
+				return s.waitResult(status, false, gap), waitStateError(status)
+			}
+		}
+		// A known gap can still be resolved by custody, but only wait for
+		// delayed custody when the caller supplied a finite time bound.
+		if _, bounded := ctx.Deadline(); gap != "" && !bounded && ctx.Err() == nil {
+			return s.waitIncomplete(status, gap, err)
 		}
 		select {
 		case <-ctx.Done():
-			return s.waitResult(status, true, ""), semantic(mektup.ErrWaitIncomplete, "wait ended before correlated reply evidence was complete", nil, ctx.Err())
+			return s.finishWait(ctx, status, gap)
 		case <-ticker.C:
 		}
 	}
+}
+
+func (s *Service) finishWait(ctx context.Context, status OperationStatus, gap string) (WaitResult, error) {
+	// The caller's context has expired. A separate, short read can still
+	// capture custody committed at the deadline without extending the wait
+	// indefinitely or discarding authoritative terminal evidence.
+	finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 250*time.Millisecond)
+	defer cancel()
+	if fresh, err := s.lookupCustodyContext(finalCtx, status.MessageID); err == nil {
+		status = fresh
+	}
+	if terminalWaitState(status.State) {
+		return s.waitResult(status, false, gap), waitStateError(status)
+	}
+	return s.waitIncomplete(status, gap, ctx.Err())
+}
+
+func (s *Service) waitIncomplete(status OperationStatus, gap string, cause error) (WaitResult, error) {
+	var details map[string]any
+	if gap != "" {
+		details = map[string]any{"gap": gap}
+	}
+	return s.waitResult(status, true, gap), semantic(mektup.ErrWaitIncomplete, "wait ended before correlated reply evidence was complete", details, cause)
 }
 
 func (s *Service) observeCandidate(ctx context.Context, status OperationStatus, item ObservedItem, seen map[string]struct{}, historical bool) error {
@@ -289,6 +326,9 @@ func (s *Service) waitResult(status OperationStatus, incomplete bool, gap string
 		message.ReplyAt = now
 	}
 	details := map[string]any{"replyStatus": status.ReplyStatus, "custodyRoute": status.CustodyRoute, "custodyStoreId": status.CustodyStoreID}
+	if gap != "" {
+		details["gap"] = gap
+	}
 	if status.ReplyID != "" {
 		details["replyDigest"] = status.ReplyDigest
 		details["replyBodyBytes"] = status.ReplyBodySize

@@ -322,14 +322,20 @@ func (e *Executor) sendInvocation(ctx context.Context, inv cli.Invocation) (Mess
 	if err != nil {
 		return nil, service.SendRequest{}, err
 	}
+	setupCtx, cancel := service.AdmissionContext(ctx, request.DeliveryTimeout, request.DisableDeliveryTimeout)
+	defer cancel()
+	request.DeliveryDeadline, _ = setupCtx.Deadline()
 	if request.RequestReply && e.ports.PrepareCustody != nil {
-		if err := e.ports.PrepareCustody(ctx, inv); err != nil {
-			return nil, service.SendRequest{}, err
+		if err := e.ports.PrepareCustody(setupCtx, inv); err != nil {
+			return nil, service.SendRequest{}, setupError(setupCtx, err)
 		}
 	}
-	svc, err := e.service(ctx, inv)
+	svc, err := e.service(setupCtx, inv)
 	if err != nil {
-		return nil, service.SendRequest{}, err
+		return nil, service.SendRequest{}, setupError(setupCtx, err)
+	}
+	if err := setupCtx.Err(); err != nil {
+		return nil, service.SendRequest{}, setupError(setupCtx, err)
 	}
 	return svc, request, nil
 }
@@ -365,14 +371,17 @@ func (e *Executor) replyInvocation(ctx context.Context, inv cli.Invocation) (Mes
 	if err != nil {
 		return nil, nil, service.ReplyRequest{}, err
 	}
+	setupCtx, cancel := service.AdmissionContext(ctx, request.DeliveryTimeout, request.DisableDeliveryTimeout)
+	defer cancel()
+	request.DeliveryDeadline, _ = setupCtx.Deadline()
 	if request.Wait && e.ports.PrepareCustody != nil {
-		if err := e.ports.PrepareCustody(ctx, inv); err != nil {
-			return nil, nil, service.ReplyRequest{}, err
+		if err := e.ports.PrepareCustody(setupCtx, inv); err != nil {
+			return nil, nil, service.ReplyRequest{}, setupError(setupCtx, err)
 		}
 	}
-	svc, err := e.service(ctx, inv)
+	svc, err := e.service(setupCtx, inv)
 	if err != nil {
-		return nil, nil, service.ReplyRequest{}, err
+		return nil, nil, service.ReplyRequest{}, setupError(setupCtx, err)
 	}
 	if e.ports.Original == nil {
 		if inv.Option("receipt-file") == "" || e.ports.ImportResolver == nil {
@@ -387,19 +396,22 @@ func (e *Executor) replyInvocation(ctx context.Context, inv cli.Invocation) (Mes
 		if e.ports.ImportResolver == nil {
 			return nil, nil, service.ReplyRequest{}, cliErr("route_unavailable", "receipt-file requires an injected untrusted receipt resolver", "not_sent", cli.ExitRejected)
 		}
-		imported, importErr := e.importReceipt(ctx, inv)
+		imported, importErr := e.importReceipt(setupCtx, inv)
 		if importErr != nil {
-			return nil, nil, service.ReplyRequest{}, importErr
+			return nil, nil, service.ReplyRequest{}, setupError(setupCtx, importErr)
 		}
-		original, err = e.ports.ImportResolver.ResolveOriginal(ctx, inv, imported)
+		original, err = e.ports.ImportResolver.ResolveOriginal(setupCtx, inv, imported)
 	} else {
-		original, err = e.ports.Original(ctx, inv)
+		original, err = e.ports.Original(setupCtx, inv)
 	}
 	if err != nil {
-		return nil, nil, service.ReplyRequest{}, mapError(err)
+		return nil, nil, service.ReplyRequest{}, setupError(setupCtx, mapError(err))
 	}
 	if original == nil {
 		return nil, nil, service.ReplyRequest{}, cliErr("message_not_found", "original message resolver factory returned nil", "not_sent", cli.ExitInternal)
+	}
+	if err := setupCtx.Err(); err != nil {
+		return nil, nil, service.ReplyRequest{}, setupError(setupCtx, err)
 	}
 	return svc, original, request, nil
 }
@@ -752,7 +764,15 @@ func attachError(event map[string]any, err error) {
 		if details == nil {
 			details = map[string]any{}
 		}
-		data["error"] = map[string]any{"code": ce.Code, "message": ce.Message, "retryable": ce.Retryable, "effectState": ce.Effect, "details": details}
+		effect := ce.Effect
+		if receipt, ok := data["receipt"].(mektup.Receipt); ok && receipt.State.Valid() {
+			effect = string(receipt.State)
+		}
+		// Body non-dispatch does not prove that a remote claim was not committed.
+		if details["claimState"] == string(mektup.StateOutcomeUnknown) {
+			effect = "unknown"
+		}
+		data["error"] = map[string]any{"code": ce.Code, "message": ce.Message, "retryable": ce.Retryable, "effectState": effect, "details": details}
 	}
 }
 
@@ -875,14 +895,7 @@ func errorExit(err error) cli.ExitCode {
 	}
 	var se *service.Error
 	if errors.As(err, &se) {
-		switch se.Code {
-		case mektup.ErrWaitIncomplete:
-			return cli.ExitIncomplete
-		case mektup.ErrReplyOutcomeUnknown, mektup.ErrOutcomeUnknown:
-			return cli.ExitUnknown
-		case mektup.ErrDeliveryRejected:
-			return cli.ExitRejected
-		}
+		return serviceExit(se.Code)
 	}
 	return cli.ExitInternal
 }
