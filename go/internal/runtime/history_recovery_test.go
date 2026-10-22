@@ -109,7 +109,7 @@ func TestHistoryRecoversOversizedSocketPageWithoutPoisoningDelivery(t *testing.T
 				return endpoint.Endpoint{ID: testTargetEndpoint, Alias: "target", Herdr: endpoint.HerdrDisabled, Route: endpoint.Route{Kind: endpoint.RouteUnix, UnixSocket: "/unused.sock"}}, nil
 			})
 			defer pool.Close(context.Background())
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 			defer cancel()
 			delivery, err := pool.session(ctx, testTarget())
 			if err != nil {
@@ -124,7 +124,11 @@ func TestHistoryRecoversOversizedSocketPageWithoutPoisoningDelivery(t *testing.T
 					t.Fatalf("history item %d lost exact identity or content", i)
 				}
 			}
-			if _, err := delivery.StartOrSteer(ctx, "thread-1", "healthy delivery", "client-delivery"); err != nil {
+			// Comparing the large exact payload under the race detector may consume
+			// the history budget. Probe transport health with its own fresh budget.
+			deliveryCtx, deliveryCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer deliveryCancel()
+			if _, err := delivery.StartOrSteer(deliveryCtx, "thread-1", "healthy delivery", "client-delivery"); err != nil {
 				t.Fatalf("delivery poisoned: %v", err)
 			}
 			mu.Lock()
@@ -137,10 +141,12 @@ func TestHistoryRecoversOversizedSocketPageWithoutPoisoningDelivery(t *testing.T
 			if gotConnections != wantConnections || fmt.Sprint(gotLimits) != wantLimits {
 				t.Fatalf("connections=%d limits=%v", gotConnections, gotLimits)
 			}
-			if err := pool.Close(ctx); err != nil {
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cleanupCancel()
+			if err := pool.Close(cleanupCtx); err != nil {
 				t.Fatal(err)
 			}
-			for ctx.Err() == nil {
+			for cleanupCtx.Err() == nil {
 				mu.Lock()
 				done := closes == connections
 				mu.Unlock()
