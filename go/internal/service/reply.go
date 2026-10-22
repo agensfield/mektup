@@ -422,6 +422,12 @@ func (s *Service) joinPreparedReply(ctx, admissionCtx context.Context, op Operat
 		defer cancel()
 	}
 	lookupCtx := admissionCtx
+	if deadline, bounded := waitCtx.Deadline(); bounded {
+		// The initial admission snapshot is also part of a bounded join wait.
+		var cancel context.CancelFunc
+		lookupCtx, cancel = context.WithDeadline(admissionCtx, deadline)
+		defer cancel()
+	}
 	var previous *ReplyResult
 	for {
 		snapshotCtx, snapshotCancel := context.WithTimeout(lookupCtx, 5*time.Second)

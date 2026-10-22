@@ -621,6 +621,7 @@ type joinSnapshotJournal struct {
 	lookups     int
 	claimCalls  int
 	expiryCalls int
+	blockLookup bool
 }
 
 func (j *joinSnapshotJournal) Prepare(ctx context.Context, op Operation) (Prepared, error) {
@@ -629,6 +630,10 @@ func (j *joinSnapshotJournal) Prepare(ctx context.Context, op Operation) (Prepar
 	return p, err
 }
 func (j *joinSnapshotJournal) Lookup(ctx context.Context, ref string) (OperationStatus, error) {
+	if j.blockLookup {
+		<-ctx.Done()
+		return OperationStatus{}, ctx.Err()
+	}
 	op, err := j.fakeJournal.Lookup(ctx, ref)
 	index := j.lookups
 	if index >= len(j.states) {
@@ -697,5 +702,23 @@ func TestTokenlessPendingReplyCanObserveOwnerAcceptance(t *testing.T) {
 	}
 	if j.claimCalls != 0 || d.count() != 0 {
 		t.Fatalf("joiner sent: claims=%d bodies=%d", j.claimCalls, d.count())
+	}
+}
+
+func TestTokenlessInitialSnapshotHonorsWaitDeadline(t *testing.T) {
+	r := baseResolver()
+	j := &joinSnapshotJournal{fakeJournal: newFakeJournal(), blockLookup: true}
+	d := &fakeDelivery{}
+	original := admissionOriginalFor(r)
+	started := time.Now()
+	out, err := (&Service{Resolver: &r, Journal: j, Delivery: d}).Reply(context.Background(), original, ReplyRequest{Reference: original.original.Envelope.MessageID, Body: "answer", Wait: true, WaitTimeout: 25 * time.Millisecond})
+	if !errors.Is(err, context.DeadlineExceeded) || out.Receipt.State != mektup.StateOutcomeUnknown {
+		t.Fatalf("result=%+v error=%v", out, err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("initial lookup exceeded wait budget: %s", elapsed)
+	}
+	if j.claimCalls != 0 || j.expiryCalls != 0 || d.count() != 0 {
+		t.Fatal("initial snapshot mutated custody or dispatched body")
 	}
 }
