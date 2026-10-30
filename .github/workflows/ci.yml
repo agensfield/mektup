@@ -35,6 +35,8 @@ jobs:
           persist-credentials: false
       - name: Install pinned contract validator
         run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Audit pinned contract validator
+        run: npm audit --audit-level=moderate
       - run: ./scripts/validate-contract-json.sh
 
   notices:
