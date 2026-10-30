@@ -11,7 +11,8 @@ security gates must be green on the intended merge commit. At minimum, record
 the results of:
 
 - `make fmt-check`, `make test`, `make test-race`, `make vet`, and the contract
-  JSON validation (Draft 2020-12 positive and negative fixtures through the
+  JSON validation plus the locked-validator `npm audit` (moderate or higher)
+  gate (Draft 2020-12 positive and negative fixtures through the
   pinned `ajv-cli@5.0.0` validator);
 - `make notices` and the pinned `make govulncheck` result, with the dependency
   inventory and license policy in [dependencies.md](dependencies.md);

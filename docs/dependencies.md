@@ -94,12 +94,15 @@ networked `npm ci` installation as a distinct step before running validation.
 
 The Ajv CLI dependency on `fast-json-patch` is overridden to patched 3.1.1
 for [GHSA-8gh8-hqwg-xf34](https://github.com/advisories/GHSA-8gh8-hqwg-xf34).
-The remaining npm audit finding, `sprintf-js` through `argparse`, has no
-published fix. That dependency is used by the standalone `js-yaml` executable;
-Mektup's validator calls Ajv directly, and Ajv's YAML library path does not
-load `argparse`. It is not part of the Go executable. Retain this explicit
-build-tool exception until an upstream fix is available; do not replace
-js-yaml 3 with its incompatible version 4 API to silence the audit.
+The lockfile pins `fast-uri` 3.1.9, the patched 3.x release for four URI
+parsing/normalization advisories. It is a transitive Ajv build-tool dependency,
+not part of the Go executable. See the [upstream security release](https://github.com/fastify/fast-uri/releases/tag/v3.1.9).
+
+The prior `sprintf-js` exception is retired: [GHSA-hp3w-g68c-fv3c](https://github.com/advisories/GHSA-hp3w-g68c-fv3c)
+was withdrawn upstream on October 22, 2026. No incompatible js-yaml override
+was introduced. The October 30 lockfile audit reports zero vulnerabilities.
+CI audits this locked validator graph at moderate severity or above before
+running the offline contract fixtures.
 
 ## Vulnerability scanning
 
