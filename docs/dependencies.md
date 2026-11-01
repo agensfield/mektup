@@ -102,7 +102,8 @@ Ajv CLI's `glob` dependency is scoped to 14.0.3, which selects patched
 `minimatch` 11.0.3 rather than the old advisory-reported chain. Ajv CLI uses
 only the retained CommonJS `hasMagic` and `sync` exports. Full contract fixtures
 and quoted-glob positive/negative CLI smoke checks pass with this override.
-The validator tooling requires Node 18/20 or 22+, matching glob's engine range.
+The locked validator graph requires Node 20 or 22+; some transitive packages
+have a stricter engine range than glob itself.
 See [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249).
 This is a build-tool dependency update; no exploit of Mektup was reproduced.
 
