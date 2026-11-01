@@ -98,9 +98,17 @@ The lockfile pins `fast-uri` 3.1.9, the patched 3.x release for four URI
 parsing/normalization advisories. It is a transitive Ajv build-tool dependency,
 not part of the Go executable. See the [upstream security release](https://github.com/fastify/fast-uri/releases/tag/v3.1.9).
 
+Ajv CLI's `glob` dependency is scoped to 14.0.3, which selects patched
+`minimatch` 11.0.3 rather than the old advisory-reported chain. Ajv CLI uses
+only the retained CommonJS `hasMagic` and `sync` exports. Full contract fixtures
+and quoted-glob positive/negative CLI smoke checks pass with this override.
+The validator tooling requires Node 18/20 or 22+, matching glob's engine range.
+See [GHSA-g3hv-75wg-m249](https://github.com/advisories/GHSA-g3hv-75wg-m249).
+This is a build-tool dependency update; no exploit of Mektup was reproduced.
+
 The prior `sprintf-js` exception is retired: [GHSA-hp3w-g68c-fv3c](https://github.com/advisories/GHSA-hp3w-g68c-fv3c)
 was withdrawn upstream on October 22, 2026. No incompatible js-yaml override
-was introduced. The October 30 lockfile audit reports zero vulnerabilities.
+was introduced. The November 2 lockfile audit reports zero vulnerabilities.
 CI audits this locked validator graph at moderate severity or above before
 running the offline contract fixtures.
 
