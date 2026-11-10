@@ -4,6 +4,9 @@ This is the planned release procedure. A green source build, a green test
 suite, or a locally built archive is not a published or installed release.
 Keep those evidence classes separate in the release record.
 
+For unattended metadata-only Codex compatibility releases, see
+[release automation](release-automation.md). Host updates are outside that pipeline.
+
 ## Preconditions
 
 Before creating any tag, the acceptance-v1 distribution, performance, and
