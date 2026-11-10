@@ -1,9 +1,15 @@
 name: CI
+run-name: CI ${{ inputs.release_run_id || github.ref_name }}
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      release_run_id:
+        description: Publication correlation (optional)
+        type: string
 
 permissions:
   contents: read
@@ -13,6 +19,15 @@ defaults:
     shell: bash
 
 jobs:
+  automation:
+    name: Release automation tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s tests/automation -v
+
   format:
     name: Go formatting
     runs-on: ubuntu-latest

@@ -1,9 +1,19 @@
 name: Release
+run-name: Release ${{ inputs.release_run_id || github.ref_name }}
 
 on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing paired stable release tag
+        required: true
+        type: string
+      release_run_id:
+        description: Publication correlation (optional)
+        type: string
 
 # The release job is the only job allowed to create GitHub release metadata.
 permissions:
@@ -13,26 +23,23 @@ jobs:
   release:
     name: Package and publish release artifacts
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
     permissions:
       contents: write
       actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version-file: go/go.mod
-          cache-dependency-path: go/go.sum
-      - name: Prefetch pinned Go modules
-        working-directory: go
-        run: go mod download all
       - name: Verify the repository and Go module tags agree
-        env:
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$GITHUB_REF" = "refs/tags/$RELEASE_TAG"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
           git show-ref --verify --quiet "refs/remotes/origin/main"
           repository_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
           module_commit="$(git rev-parse "refs/tags/go/${RELEASE_TAG}^{commit}")"
@@ -41,19 +48,40 @@ jobs:
       - name: Require successful main CI on the exact release commit
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           release_commit="$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
           gh api -X GET "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs" \
-            -f head_sha="$release_commit" -f event=push -f per_page=20 \
+            -f head_sha="$release_commit" -f branch=main -f per_page=100 \
             | jq -e --arg sha "$release_commit" \
-              '[.workflow_runs[] | select(.conclusion == "success" and .head_sha == $sha)] | length > 0'
+              '[.workflow_runs[] | select(.conclusion == "success" and .head_sha == $sha and .head_branch == "main" and (.event == "push" or .event == "workflow_dispatch"))] | length > 0'
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go/go.mod
+          cache-dependency-path: go/go.sum
+      - name: Prefetch pinned Go modules
+        working-directory: go
+        run: go mod download all
       - name: Install Syft for the GoReleaser SBOM step
         uses: anchore/sbom-action/download-syft@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
         with:
           syft-version: v1.51.1
+      - name: Preserve an already published release on recovery
+        id: published
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" > "$RUNNER_TEMP/release.json"; then
+            jq -e --arg tag "$RELEASE_TAG" '.tag_name == $tag and .draft == false and .prerelease == false' "$RUNNER_TEMP/release.json"
+            echo 'exists=true' >> "$GITHUB_OUTPUT"
+          elif jq -e '.status == "404"' "$RUNNER_TEMP/release.json"; then
+            echo 'exists=false' >> "$GITHUB_OUTPUT"
+          else
+            exit 1
+          fi
       - name: Release with GoReleaser
+        if: steps.published.outputs.exists == 'false'
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
           distribution: goreleaser
@@ -61,3 +89,7 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify published archives, SBOMs and public Go installation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/verify_published_release.py "$RELEASE_TAG"

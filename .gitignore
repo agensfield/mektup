@@ -3,5 +3,6 @@
 dist/
 coverage/
 node_modules/
+__pycache__/
 *.test
 THIRD_PARTY_NOTICES.md
