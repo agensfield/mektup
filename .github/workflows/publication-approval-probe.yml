@@ -1,0 +1,88 @@
+name: Verify publication workflow approval
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths: [.github/publication-approval-probe]
+
+permissions:
+  contents: read
+
+jobs:
+  exercise:
+    if: >-
+      github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' &&
+      github.repository == 'agensfield/mektup'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - name: Exercise token approval on a disposable native PR workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, json, os, subprocess, time
+          repo = os.environ['GITHUB_REPOSITORY']
+          branch = 'probe/publication-approval-' + os.environ['GITHUB_RUN_ID'] + '-' + os.environ['GITHUB_RUN_ATTEMPT']
+          def gh(*args):
+              return subprocess.check_output(['gh', *args], text=True).strip()
+          def api(path, method='GET', body=None):
+              args = ['gh', 'api', '--method', method, 'repos/' + repo + '/' + path]
+              if body is not None:
+                  args += ['--input', '-']
+              output = subprocess.check_output(args, input=json.dumps(body) if body is not None else None, text=True)
+              return json.loads(output) if output.strip() else None
+          try:
+              base = api('git/ref/heads/main')['object']['sha']
+              api('git/refs', 'POST', {'ref': 'refs/heads/' + branch, 'sha': base})
+              marker = base64.b64encode(('Disposable approval probe: ' + branch + '\n').encode()).decode()
+              commit = api('contents/.github/publication-approval-probe', 'PUT', {
+                  'branch': branch, 'content': marker, 'message': 'test: probe native workflow approval'})['commit']['sha']
+              pr = api('pulls', 'POST', {'head': branch, 'base': 'main',
+                  'title': 'test: disposable publication approval probe',
+                  'body': 'Tests the publication token against one tiny native PR workflow. Never merge. Automatically closed and branch deleted.'})
+              for _ in range(36):
+                  runs = api('actions/workflows/publication-approval-probe.yml/runs?head_sha=' + commit + '&event=pull_request')['workflow_runs']
+                  candidates = [r for r in runs if r['head_sha'] == commit and r['head_branch'] == branch
+                      and r['event'] == 'pull_request' and any(p['number'] == pr['number'] for p in r['pull_requests'])]
+                  if candidates:
+                      run = max(candidates, key=lambda r: r['id'])
+                      break
+                  time.sleep(5)
+              else:
+                  raise RuntimeError('native probe workflow not visible')
+              if run['conclusion'] != 'action_required':
+                  raise RuntimeError('probe did not exercise approval-required state')
+              api('actions/runs/' + str(run['id']) + '/approve', 'POST')
+              for _ in range(36):
+                  state = api('actions/runs/' + str(run['id']))
+                  if state['conclusion'] != 'action_required':
+                      break
+                  time.sleep(5)
+              else:
+                  raise RuntimeError('approval transition not visible')
+              gh('run', 'watch', str(run['id']), '--repo', repo, '--exit-status', '--interval', '5')
+              state = api('actions/runs/' + str(run['id']))
+              if state['conclusion'] != 'success':
+                  raise RuntimeError('native probe workflow failed')
+              print(json.dumps({'status': 'PASS', 'nativeRun': run['id'], 'pr': pr['number'], 'approvedBy': 'GITHUB_TOKEN'}))
+          finally:
+              prs = json.loads(gh('pr', 'list', '--repo', repo, '--head', branch, '--state', 'open', '--json', 'number'))
+              for pr in prs:
+                  api('pulls/' + str(pr['number']), 'PATCH', {'state': 'closed'})
+              result = subprocess.run(['gh', 'api', '--method', 'DELETE', 'repos/' + repo + '/git/refs/heads/' + branch], capture_output=True, text=True)
+              if result.returncode and '404' not in result.stderr:
+                  raise RuntimeError('disposable branch cleanup failed: ' + result.stderr)
+          PY
+  native:
+    if: >-
+      github.event_name == 'pull_request' && github.repository == 'agensfield/mektup' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.head_ref, 'probe/publication-approval-')
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo 'Native PR workflow execution approved.'

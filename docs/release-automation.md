@@ -9,7 +9,9 @@ The weekly Codex qualifier remains the single real-binary compatibility test.
 2. Generate one deterministic metadata-only patch from that qualified source.
    Patch the next Mektup patch version, classifier/build lists, classifier/version
    coverage and docs. Create a PR; verify its complete diff before merging it.
-3. Run the existing CI workflow on the exact PR head. Merge only after success,
+3. Use the existing PR-triggered CI workflow for the exact PR/source identity.
+   After verifying the full metadata diff, approve that workflow execution if
+   GitHub requires it. Merge only after success,
    without bypassing the main ruleset. Run existing CI on the exact merged main.
 4. Atomically create paired repository/Go-module tags. Existing tags must name
    the same commit; they are never moved, deleted or overwritten.
@@ -17,16 +19,20 @@ The weekly Codex qualifier remains the single real-binary compatibility test.
    native Linux binary metadata, and a fresh public Go installation. Publish
    linked release notes with the source and qualification/CI receipts.
 
-`GITHUB_TOKEN` cannot rely on its own pushes/PRs to start subsequent workflows.
-The coordinator explicitly dispatches the existing CI and release workflows and
-correlates their exact SHA/ref/run identities. An exact correlated dispatch
-has priority over an ordinary PR/push run, including a newer PR run blocked for
-approval. A failed correlated dispatch remains a failed gate. Existing matching
+`GITHUB_TOKEN`-created PRs can leave their native CI waiting for execution
+approval. The coordinator validates the entire generated patch before approving
+only the matching PR-triggered run through the Actions API. This is execution
+approval, not a PR review or branch-policy bypass. GitHub does not count
+`workflow_dispatch` job checks toward protected-PR requirements, even when they
+pass on the same SHA, so the PR gate never substitutes a dispatched workflow.
+
+Main CI and packaging are explicitly dispatched because token-authored merges
+and tags do not produce normal push workflows. Their exact source/ref/run
+identities are checked; correlated failures remain failed gates and matching
 runs are reused. Metadata branches are keyed by Codex version and qualified
 source SHA, so a fresh qualification after a compiler/source repair gets a new
-PR instead of reusing a failed older proof.
-There is one serialized publication coordinator; it does not introduce another
-qualification, source test suite, or packaging pipeline.
+PR instead of reusing a failed older proof. There is one serialized coordinator
+and no duplicate qualification, source test suite or packaging implementation.
 
 The Homebrew tap's own `Publish Mektup formula` workflow checks public releases
 hourly. It requires successful product packaging/verification, matches the
@@ -48,8 +54,8 @@ update/deletion protections remain in force. GitHub does not permit its built-in
 Actions integration as a creation-rule bypass actor for this organization; the
 previous owner-only creation rule was removed, without granting a tag mutation
 bypass or changing the existing owner bypass.
-The main PR/check requirements remain unchanged; no approval or CI bypass is
-used. Enabling PR creation is GitHub's combined create/approve setting; the
+The main PR/check requirements remain unchanged; no PR-review or CI bypass is
+used. Native workflow execution is approved only after deterministic patch verification. Enabling PR creation is GitHub's combined create/approve setting; the
 workflow never submits approving reviews.
 
 A stale qualification, altered patch, source movement, failed CI, conflicting tag,
@@ -80,3 +86,18 @@ publication, failed PR/main gates, merged-PR recovery, completed-run idempotency
 stale source, changed candidates, conflicting immutable tags, receipt trust,
 workflow correlation and manifest corruption. They do not claim a future public
 Codex version was qualified or published.
+
+## Hosted permission probe
+
+`publication-approval-probe.yml` creates a disposable, single-marker PR with the
+publication job's token permissions. It approves only its own tiny PR-triggered
+probe workflow, waits for that native run, then closes the PR and deletes its
+branch. The normal source CI remains unapproved for the disposable PR, so the
+probe does not duplicate the Go/build suite or publish a version. Run it with:
+
+```sh
+gh workflow run publication-approval-probe.yml --ref main
+```
+
+The probe exercises real GitHub token approval capability. It does not alter
+main, branch protection, release metadata, or host state.

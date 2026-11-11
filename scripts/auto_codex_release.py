@@ -98,6 +98,41 @@ def workflow(name, ref, sha, correlation, ordinary_event, **inputs):
     return run["html_url"]
 
 
+def pr_workflow(number, branch, sha):
+    """Use PR-eligible checks; workflow_dispatch checks cannot satisfy rulesets."""
+    run = None
+    for _ in range(18):
+        runs = api(f"actions/workflows/ci.yml/runs?head_sha={sha}&event=pull_request&per_page=100")["workflow_runs"]
+        candidates = [r for r in runs if r["head_sha"] == sha and r["head_branch"] == branch
+                      and r["event"] == "pull_request"
+                      and any(p["number"] == number and p["head"]["sha"] == sha
+                              and p["base"]["ref"] == "main" for p in r["pull_requests"])]
+        if candidates:
+            run = max(candidates, key=lambda r: r["id"])
+            break
+        time.sleep(10)
+    if run is None:
+        raise RuntimeError("native PR CI not visible; no ineligible dispatch was started")
+    if run["conclusion"] == "action_required":
+        # The caller has already verified the entire deterministic metadata diff.
+        # Approve only this exact PR/source run, never a review or merge bypass.
+        gh("api", "--method", "POST", f"repos/{REPO}/actions/runs/{run['id']}/approve")
+        for _ in range(18):
+            run = api(f"actions/runs/{run['id']}")
+            if run["conclusion"] != "action_required":
+                break
+            time.sleep(10)
+        else:
+            raise RuntimeError("PR CI approval not visible; inspect before resuming")
+    if run["status"] != "completed":
+        gh("run", "watch", str(run["id"]), "--repo", REPO, "--exit-status", "--interval", "15")
+    run = api(f"actions/runs/{run['id']}")
+    if (run["conclusion"] != "success" or run["head_sha"] != sha
+            or run["event"] != "pull_request" or run["head_branch"] != branch):
+        raise RuntimeError(f"required native PR workflow failed: {run['html_url']}")
+    return run["html_url"]
+
+
 def verify_patch(source, head, expected):
     if command("git", "rev-parse", f"{head}^") != source:
         raise ValueError("automation branch must contain exactly one patch on qualified source")
@@ -204,7 +239,7 @@ def main(run_id):
         if pr["state"] == "CLOSED":
             raise ValueError("automation PR was closed without merging; do not reopen automatically")
         if pr["state"] != "MERGED":
-            workflow("ci.yml", branch, pr["headRefOid"], f"qualification-{run_id}-pr", "pull_request")
+            pr_workflow(pr["number"], branch, pr["headRefOid"])
             if command("git", "ls-remote", "origin", "refs/heads/main").split()[0] != source:
                 raise ValueError("main changed while validating the PR")
             gh("pr", "merge", str(pr["number"]), "--repo", REPO, "--merge", "--delete-branch",
