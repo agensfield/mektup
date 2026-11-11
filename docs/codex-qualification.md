@@ -1,6 +1,6 @@
 # Qualifying a Codex app-server release
 
-Run `scripts/qualify-codex-release.sh 0.167.0` from any checkout with Docker,
+Run `scripts/qualify-codex-release.sh 0.167.1` from any checkout with Docker,
 `curl`, and `jq`. The argument may be any published Codex version with Linux
 release assets, including prereleases. The optional GitHub Actions workflow
 accepts the same version through `workflow_dispatch`; its weekly run selects
@@ -56,14 +56,12 @@ that binary or suppress its honest `untested_server_version` warning. A
 Mektup release is needed only when product behavior or embedded metadata is
 intentionally changed, not to perform the qualification itself.
 
-## Codex 0.167.0 receipt
+## Latest receipt
 
-The [scheduled qualification run](https://github.com/agensfield/mektup/actions/runs/42629924887)
-on November 9, 2026 passed for exact Codex 0.167.0 on clean Mektup source
-`a0363188367a19c7155d9af77a0863834fb24a62` (Linux x86_64). Its
-`mektup/codex-qualification/v1` receipt reports `status: PASS`,
-`qualified: true`, `checksPassed: true`, and `sourceDirty: false`.
-The official Linux asset SHA-256 is
-`9d64836106d5b374e90ee4454c7ebcde7ca7106558bd7e41a34b9f26ebda251a`.
-Mektup v1.0.18 records this exact version as tested; its messaging behavior
-and contract revision 1.0.9 are unchanged.
+[Qualification run 43039673229](https://github.com/agensfield/mektup/actions/runs/43039673229)
+returned `PASS`, `qualified=true`, `checksPassed=true`, `sourceDirty=false`
+for exact Codex 0.167.1 on clean Mektup source `2932c90901ae7aeca50954ee1991257703464046`.
+Platform: `linux/x86_64`. Official asset SHA-256:
+`sha256:64bcc99c32e434b4bcb0508a97df9b7aeecdb97e956d976fb13661096ec4e3e2`.
+Mektup v1.0.19 records this version as tested. Contract and messaging
+behavior are unchanged.
