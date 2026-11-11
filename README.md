@@ -21,7 +21,7 @@ With Homebrew:
 brew install agensfield/tap/mektup
 ```
 
-Or with patched Go 1.26.10 or Go 1.27.3 and later patched releases:
+Or with patched Go 1.26.11 or Go 1.27.4 and later patched releases:
 
 ```sh
 go install github.com/agensfield/mektup/go/cmd/mektup@v1.0.18

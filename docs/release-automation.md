@@ -19,7 +19,12 @@ The weekly Codex qualifier remains the single real-binary compatibility test.
 
 `GITHUB_TOKEN` cannot rely on its own pushes/PRs to start subsequent workflows.
 The coordinator explicitly dispatches the existing CI and release workflows and
-correlates their exact SHA/ref/run identities. Existing matching runs are reused.
+correlates their exact SHA/ref/run identities. An exact correlated dispatch
+has priority over an ordinary PR/push run, including a newer PR run blocked for
+approval. A failed correlated dispatch remains a failed gate. Existing matching
+runs are reused. Metadata branches are keyed by Codex version and qualified
+source SHA, so a fresh qualification after a compiler/source repair gets a new
+PR instead of reusing a failed older proof.
 There is one serialized publication coordinator; it does not introduce another
 qualification, source test suite, or packaging pipeline.
 
