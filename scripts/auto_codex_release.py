@@ -57,9 +57,14 @@ def validate_receipt(run, receipt, official):
 
 
 def matching_run(runs, sha, label, branch, ordinary_event):
-    candidates = [r for r in runs if r["head_sha"] == sha and r["head_branch"] == branch
-                  and ((r["event"] == "workflow_dispatch" and r["display_title"] == label)
-                       or r["event"] == ordinary_event)]
+    exact_source = [r for r in runs if r["head_sha"] == sha and r["head_branch"] == branch]
+    correlated = [r for r in exact_source if r["event"] == "workflow_dispatch"
+                  and r["display_title"] == label]
+    # A PR opened by GITHUB_TOKEN can create a newer approval-required run.
+    # It is not the CI dispatch we own and must neither shadow it nor suppress
+    # dispatch. A correlated failure still wins and remains a real failed gate.
+    candidates = correlated or [r for r in exact_source if r["event"] == ordinary_event
+                                and r.get("conclusion") != "action_required"]
     return max(candidates, key=lambda r: r["id"]) if candidates else None
 
 
@@ -142,7 +147,8 @@ def main(run_id):
             print("No publication: qualification is not the latest stable Codex.")
             return
         command("git", "fetch", "origin", "main")
-        branch = f"automation/codex-{version}"
+        source = receipt["mektupSourceCommit"]
+        branch = f"automation/codex-{version}-{source[:12]}"
         prs = json.loads(gh("pr", "list", "--repo", REPO, "--head", branch,
                             "--base", "main", "--state", "all", "--json",
                             "number,state,headRefOid,mergeCommit,baseRefOid,headRepositoryOwner"))
@@ -151,7 +157,6 @@ def main(run_id):
         if not prs and version in tested(Path.cwd()):
             print(f"No publication: Codex {version} is already recorded as tested.")
             return
-        source = receipt["mektupSourceCommit"]
         base = scratch / "source"
         for name in FILES:
             target = base / name

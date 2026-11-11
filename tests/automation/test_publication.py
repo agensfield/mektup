@@ -205,6 +205,38 @@ class Publication(unittest.TestCase):
         with self.assertRaises(ValueError):
             auto.validate_receipt(self.run, self.receipt, wrong)
 
+    def test_correlated_dispatch_wins_over_newer_approval_required_pr_run(self):
+        runs = [
+            {'id': 10, 'head_sha': 'a', 'head_branch': 'automation/codex-x',
+             'event': 'workflow_dispatch', 'display_title': 'CI qualification-100-pr',
+             'status': 'in_progress', 'conclusion': None},
+            {'id': 11, 'head_sha': 'a', 'head_branch': 'automation/codex-x',
+             'event': 'pull_request', 'display_title': 'CI automation/codex-x',
+             'status': 'completed', 'conclusion': 'action_required'},
+        ]
+        selected = auto.matching_run(runs, 'a', 'CI qualification-100-pr',
+                                     'automation/codex-x', 'pull_request')
+        self.assertEqual(selected['id'], 10)
+
+    def test_approval_required_pr_run_does_not_suppress_dispatch(self):
+        runs = [{'id': 11, 'head_sha': 'a', 'head_branch': 'automation/codex-x',
+                 'event': 'pull_request', 'display_title': 'CI automation/codex-x',
+                 'status': 'completed', 'conclusion': 'action_required'}]
+        self.assertIsNone(auto.matching_run(runs, 'a', 'CI qualification-100-pr',
+                                            'automation/codex-x', 'pull_request'))
+
+    def test_failed_correlated_dispatch_cannot_be_hidden_by_newer_ordinary_success(self):
+        runs = [
+            {'id': 10, 'head_sha': 'a', 'head_branch': 'main',
+             'event': 'workflow_dispatch', 'display_title': 'CI qualification-100-main',
+             'status': 'completed', 'conclusion': 'failure'},
+            {'id': 11, 'head_sha': 'a', 'head_branch': 'main',
+             'event': 'push', 'display_title': 'CI main',
+             'status': 'completed', 'conclusion': 'success'},
+        ]
+        selected = auto.matching_run(runs, 'a', 'CI qualification-100-main', 'main', 'push')
+        self.assertEqual(selected['id'], 10)
+
     def test_exact_run_correlation(self):
         runs = [{'id': 1, 'head_sha': 'a', 'head_branch': 'main', 'event': 'workflow_dispatch',
                  'display_title': 'CI qualification-100-main'},
