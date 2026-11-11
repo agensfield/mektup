@@ -77,9 +77,10 @@ class Publication(unittest.TestCase):
         if args[0] == 'api' and args[1].startswith('repos/openai/codex/'):
             return json.dumps(self.official)
         if args[:2] == ('pr', 'list'):
-            return json.dumps([self.pr] if self.pr else [])
+            branch = args[args.index('--head') + 1]
+            return json.dumps([self.pr] if self.pr and self.pr['branch'] == branch else [])
         if args[:2] == ('pr', 'create'):
-            self.pr = {'number': 1, 'state': 'OPEN', 'headRefOid': self.git('rev-parse', 'HEAD'),
+            self.pr = {'branch': args[args.index('--head') + 1], 'number': 1, 'state': 'OPEN', 'headRefOid': self.git('rev-parse', 'HEAD'),
                        'baseRefOid': self.source, 'headRepositoryOwner': {'login': 'agensfield'},
                        'mergeCommit': None}
             return 'https://github.com/agensfield/mektup/pull/1'
@@ -129,6 +130,26 @@ class Publication(unittest.TestCase):
         self.execute()
         self.assertEqual(self.git('ls-remote', '--tags', 'origin'), refs)
         self.assertEqual(self.git('rev-parse', 'HEAD'), merged)
+
+    def test_new_qualified_source_gets_distinct_pr_after_old_source_failed(self):
+        self.fail_phase = 'pr'
+        with self.assertRaises(RuntimeError):
+            self.execute()
+        old_pr = self.pr
+        old_pr['state'] = 'CLOSED'
+        self.git('checkout', 'main')
+        (self.root / 'compiler-version.txt').write_text('patched compiler')
+        self.git('add', 'compiler-version.txt')
+        self.git('commit', '-m', 'patch compiler')
+        self.git('push', 'origin', 'main')
+        self.source = self.git('rev-parse', 'HEAD')
+        self.run['head_sha'] = self.source
+        self.receipt['mektupSourceCommit'] = self.source
+        self.fail_phase = None
+        self.execute()
+        self.assertNotEqual(self.pr['branch'], old_pr['branch'])
+        self.assertEqual(old_pr['state'], 'CLOSED')
+        self.assertEqual(self.pr['state'], 'MERGED')
 
     def test_failed_pr_ci_cannot_merge_or_tag(self):
         self.fail_phase = 'pr'
