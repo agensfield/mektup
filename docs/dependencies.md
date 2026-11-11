@@ -117,13 +117,13 @@ running the offline contract fixtures.
 
 Vulnerability scanning is intentionally separate from archive generation. CI
 and the local Make target use `golang.org/x/vuln` `v1.7.0`, the latest pinned
-scanner release. Mektup requires patched Go 1.26.10 or Go 1.27.3 and later
+scanner release. Mektup requires patched Go 1.26.11 or Go 1.27.4 and later
 patched releases. These versions include the October 2026 standard-library
 fixes and the compromised-intermediate blocklist for
 [GO-2026-6809 / CVE-2026-111943](https://pkg.go.dev/vuln/GO-2026-6809).
 Go 1.27.0 through 1.27.2 remain affected despite satisfying the module's
 minimum Go version. CI, release packaging, and the isolated qualification
-image use Go 1.26.10. The image also requires Debian's corrected
+image use Go 1.26.11. The image also requires Debian's corrected
 `ca-certificates` package before its HTTPS download, because updating Go
 does not update curl's trust store:
 
@@ -136,3 +136,8 @@ reproducibility input for `THIRD_PARTY_NOTICES.md` or GoReleaser archives. A
 release record should retain the scan version, database observation date, exit
 status, and any accepted findings. A green scan does not prove runtime or
 physical app-server acceptance.
+
+The November 2026 build floor includes the standard-library patch for
+[GO-2026-6859](https://pkg.go.dev/vuln/GO-2026-6859), reported by the required
+symbol-level scan on Go 1.26.10. Go 1.26.11 / 1.27.4 are the patched releases;
+compatibility qualification must use the patched image before publication.

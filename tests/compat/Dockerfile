@@ -1,4 +1,4 @@
-FROM golang:1.26.10-bookworm
+FROM golang:1.26.11-bookworm
 
 ARG CODEX_VERSION
 ARG CODEX_ARCH
