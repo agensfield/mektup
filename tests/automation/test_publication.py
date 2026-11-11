@@ -102,6 +102,8 @@ class Publication(unittest.TestCase):
     def workflow(self, name, ref, sha, correlation, ordinary_event, **inputs):
         phase = 'pr' if correlation.endswith('-pr') else 'main' if correlation.endswith('-main') else 'release'
         self.calls.append(phase)
+        if phase == 'pr':
+            self.assertEqual(ordinary_event, 'native_pull_request', 'PR gate used ineligible dispatch CI')
         if phase != 'release' and 'release' not in self.calls[:-1]:
             self.assertEqual(self.git('ls-remote', '--tags', 'origin'), '')
         else:
@@ -113,7 +115,9 @@ class Publication(unittest.TestCase):
 
     def execute(self):
         with patch.object(auto, 'gh', side_effect=self.gh), patch.object(auto, 'api', side_effect=self.api), \
-             patch.object(auto, 'workflow', side_effect=self.workflow):
+             patch.object(auto, 'workflow', side_effect=self.workflow), \
+             patch.object(auto, 'pr_workflow', create=True, side_effect=lambda n, b, s: self.workflow(
+                 'ci.yml', b, s, 'qualification-100-pr', 'native_pull_request')):
             auto.main(100)
 
     def test_complete_publication_and_exact_patch(self):
@@ -264,6 +268,52 @@ class Publication(unittest.TestCase):
                 {'id': 2, 'head_sha': 'a', 'head_branch': 'other', 'event': 'push', 'display_title': ''}]
         self.assertEqual(auto.matching_run(runs, 'a', 'CI qualification-100-main', 'main', 'push')['id'], 1)
         self.assertIsNone(auto.matching_run(runs, 'b', 'CI qualification-100-main', 'main', 'push'))
+
+
+class NativePRWorkflow(unittest.TestCase):
+    def run_value(self, **updates):
+        value = {'id': 30, 'head_sha': 'a', 'head_branch': 'automation/example',
+                 'event': 'pull_request', 'status': 'completed', 'conclusion': 'success',
+                 'html_url': 'https://github.com/agensfield/mektup/actions/runs/30',
+                 'pull_requests': [{'number': 25, 'head': {'sha': 'a'}, 'base': {'ref': 'main'}}]}
+        return dict(value, **updates)
+
+    def test_reuses_successful_native_run_without_dispatch(self):
+        run = self.run_value()
+        with patch.object(auto, 'api', side_effect=[{'workflow_runs': [run]}, run]), \
+             patch.object(auto, 'gh') as gh:
+            auto.pr_workflow(25, 'automation/example', 'a')
+            gh.assert_not_called()
+
+    def test_approves_only_exact_native_run_then_waits_for_it(self):
+        waiting = self.run_value(conclusion='action_required')
+        queued = self.run_value(status='queued', conclusion=None)
+        done = self.run_value()
+        with patch.object(auto, 'api', side_effect=[{'workflow_runs': [waiting]}, queued, done]), \
+             patch.object(auto, 'gh') as gh:
+            auto.pr_workflow(25, 'automation/example', 'a')
+            self.assertEqual(gh.call_args_list[0].args,
+                             ('api', '--method', 'POST', 'repos/agensfield/mektup/actions/runs/30/approve'))
+            self.assertEqual(gh.call_args_list[1].args[:3], ('run', 'watch', '30'))
+            self.assertEqual(gh.call_count, 2)
+
+    def test_failed_native_run_stops_without_approval_or_dispatch(self):
+        run = self.run_value(conclusion='failure')
+        with patch.object(auto, 'api', side_effect=[{'workflow_runs': [run]}, run]), \
+             patch.object(auto, 'gh') as gh:
+            with self.assertRaisesRegex(RuntimeError, 'native PR workflow failed'):
+                auto.pr_workflow(25, 'automation/example', 'a')
+            gh.assert_not_called()
+
+    def test_other_pr_or_ineligible_event_cannot_satisfy_gate(self):
+        for run in [self.run_value(event='workflow_dispatch'),
+                    self.run_value(pull_requests=[{'number': 99, 'head': {'sha': 'a'}, 'base': {'ref': 'main'}}]),
+                    self.run_value(head_sha='b')]:
+            with self.subTest(run=run), patch.object(auto, 'api', return_value={'workflow_runs': [run]}), \
+                 patch.object(auto.time, 'sleep'), patch.object(auto, 'gh') as gh:
+                with self.assertRaisesRegex(RuntimeError, 'native PR CI not visible'):
+                    auto.pr_workflow(25, 'automation/example', 'a')
+                gh.assert_not_called()
 
 
 class PublishedArtifacts(unittest.TestCase):
