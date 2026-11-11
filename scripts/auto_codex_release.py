@@ -219,9 +219,10 @@ def main(run_id):
         url = workflow("release.yml", f"v{release}", sha, f"qualification-{run_id}-release", "push", tag=f"v{release}")
         notes = scratch / "release.md"
         notes.write_text(f"Mektup {release} records exact Codex {version} as tested. "
-                         "Runtime, dependencies and contract are unchanged.\n\n"
+                         "The qualification PR is metadata-only. Other changes since the previous release are linked below.\n\n"
                          f"- [Clean-source qualification]({run['html_url']})\n"
                          f"- [Metadata PR](https://github.com/{REPO}/pull/{pr['number']})\n"
+                         f"- [All changes since v{previous}](https://github.com/{REPO}/compare/v{previous}...v{release})\n"
                          f"- [Packaging, archive/SBOM verification and fresh Go install]({url})\n\n"
                          f"Release source: `{sha}`. Includes four platform archives, SHA-256 checksums "
                          "and one SBOM per archive. Host installation is outside this automation.\n")
