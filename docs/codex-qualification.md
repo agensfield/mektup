@@ -1,6 +1,6 @@
 # Qualifying a Codex app-server release
 
-Run `scripts/qualify-codex-release.sh 0.167.1` from any checkout with Docker,
+Run `scripts/qualify-codex-release.sh 0.169.0` from any checkout with Docker,
 `curl`, and `jq`. The argument may be any published Codex version with Linux
 release assets, including prereleases. The optional GitHub Actions workflow
 accepts the same version through `workflow_dispatch`; its weekly run selects
@@ -58,10 +58,22 @@ intentionally changed, not to perform the qualification itself.
 
 ## Latest receipt
 
-[Qualification run 43041938272](https://github.com/agensfield/mektup/actions/runs/43041938272)
-returned `PASS`, `qualified=true`, `checksPassed=true`, `sourceDirty=false`
-for exact Codex 0.167.1 on clean Mektup source `76fa5f8a5045854f445530461e62dba163fa83c2`.
-Platform: `linux/x86_64`. Official asset SHA-256:
-`sha256:64bcc99c32e434b4bcb0508a97df9b7aeecdb97e956d976fb13661096ec4e3e2`.
-Mektup v1.0.19 records this version as tested. Contract and messaging
-behavior are unchanged.
+Mektup v1.0.20 records two independent clean-source qualifications against
+`688f7118a63c8cac0cdf636348d443452e829242` (Linux x86_64, Go 1.26.11):
+
+| Codex | Hosted qualification | Official Linux asset SHA-256 |
+| --- | --- | --- |
+| 0.168.0 | [PASS / qualified=true](https://github.com/agensfield/mektup/actions/runs/43913042361) | `sha256:b983beb86dcc606cead6ee226ae2ab08e7e6eee07df4cb8d16f441f107b9e2ef` |
+| 0.169.0 | [PASS / qualified=true](https://github.com/agensfield/mektup/actions/runs/43913048604) | `sha256:9af4d751fce183faedea629437d5252dbf458eeb04130cf4f97be844621ea985` |
+
+Both receipts report `checksPassed=true` and `sourceDirty=false`. The qualification
+branch is an unchanged ref to the exact clean main commit above; it holds both
+results for one combined release rather than invoking latest-only publication.
+The app-server adapter, custody behavior, third-party dependencies and contract
+1.0.9 are unchanged. All previously tested versions remain listed.
+
+The earlier scheduled 0.169.0 run failed in Docker's dependency-download build
+step before any compatibility tests executed; it produced no qualification
+receipt. Successful complete runs above supersede that infrastructure failure.
+Docker progress is now retained in workflow output so a build failure exposes
+its dependency-download error instead of only the failing Dockerfile line.
