@@ -43,7 +43,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-docker build --quiet --file "$repo_root/tests/compat/Dockerfile" \
+docker build --progress=plain --file "$repo_root/tests/compat/Dockerfile" \
   --build-arg "CODEX_VERSION=$version" \
   --build-arg "CODEX_ARCH=$codex_arch" \
   --build-arg "CODEX_ASSET_URL=$asset_url" \
